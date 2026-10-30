@@ -124,8 +124,13 @@ CREATE TABLE [dbo].[IOT001](
     [chd3_value]    decimal(18, 4) NULL,
     [payload_json]  nvarchar(max) NULL,              -- payload original, como chegou
     [recebido_em]   datetime2(3) NOT NULL            -- DEFAULT sysutcdatetime(): UTC
+    -- [data_hora_local] (calculada, opcional): data_hora_utc em America/Sao_Paulo; ver sql/data_hora_local_iot001.sql
 );
 ```
+
+**Fuso:** tudo é gravado em UTC (`ts_unix`, `data_hora_utc`, `recebido_em`). A hora de Brasília é só para exibição,
+pela coluna calculada `data_hora_local` (`AT TIME ZONE 'E. South America Standard Time'`), decidida com o usuário
+em 30/10/2026. O app não muda por causa disso.
 
 Regras de mapeamento payload → linha:
 
