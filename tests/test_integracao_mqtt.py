@@ -211,3 +211,62 @@ def test_broker_inacessivel_avisa_e_desconecta_limpo(tmp_path):
     p.desconectar().result(5)
     assert ev.status[0][0] == "conectando" and ev.status[-1][0] == "desconectado"
     assert p.encerrar(2)
+
+
+def test_payload_real_novus_chega_ao_sink_com_as_8_colunas(broker, tmp_path):
+    """Payload real do NOVUS (timestamp e canais dentro de "channels") vira 1 linha completa no sink."""
+    from datetime import datetime, timezone
+
+    payload = ('{"pid":51387408,"device_id":"Teste_Alumbra","channels":{"timestamp":1793386748,'
+               '"chd1_value":67,"chd2_value":119,"chd3_value":0}}')
+    gravados = []
+
+    class Cursor:
+        fast_executemany = False
+
+        def executemany(self, sql, linhas):
+            gravados.extend(linhas)
+
+        def close(self):
+            pass
+
+    class Conexao:
+        def cursor(self):
+            return Cursor()
+
+        def commit(self):
+            pass
+
+        def rollback(self):
+            pass
+
+        def close(self):
+            pass
+
+    def fabrica(sql_cfg, config, logar):
+        return SinkSqlServer(sql_cfg, config.gravacao, logar, conectar=lambda cfg: Conexao())
+
+    ev = Eventos()
+    p = Pipeline(_config(tmp_path, SqlServerConfig(servidor="FALSO", banco="MQTT")), fabrica_sink=fabrica,
+                 sessao_persistente=False, **ev.kwargs())
+    antes = datetime.now(timezone.utc).replace(tzinfo=None)
+    try:
+        p.conectar("127.0.0.1", broker, "NOVUS/Teste_Alumbra/#", 2)
+        assert _esperar(lambda: ev.tem_log("Assinado NOVUS/Teste_Alumbra/# (QoS 2)")), ev.logs
+        _publicar(broker, [("NOVUS/Teste_Alumbra/events", payload.encode())])
+        assert _esperar(lambda: len(gravados) == 1), (gravados, ev.logs)
+        assert _esperar(lambda: p.contadores == (1, 1, 0)), p.contadores
+    finally:
+        assert p.encerrar(5)
+    depois = datetime.now(timezone.utc).replace(tzinfo=None)
+
+    (linha,) = gravados
+    assert len(linha) == 8
+    pid, device_id, ts_unix, chd1, chd2, chd3, payload_json, recebido_em = linha
+    assert (pid, device_id, ts_unix) == (51387408, "Teste_Alumbra", 1793386748)
+    assert (chd1, chd2, chd3) == (Decimal("67.0000"), Decimal("119.0000"), Decimal("0.0000"))
+    assert payload_json == payload
+    assert isinstance(recebido_em, datetime) and recebido_em.tzinfo is None
+    assert antes.replace(microsecond=0) <= recebido_em <= depois                 # UTC, hora do recebimento
+    assert not any(n == "ERRO" for n, _ in ev.logs), ev.logs
+    assert not (tmp_path / "contingencia").exists()

@@ -3,14 +3,36 @@
 Colunas inseridas (``LinhaIot.COLUNAS``): ``pid, device_id, ts_unix, chd1_value, chd2_value, chd3_value,
 payload_json, recebido_em``. Nunca ``id`` (identity) nem ``data_hora_utc`` (calculada).
 
-O formato exato do payload NOVUS ainda não foi confirmado com um exemplo real, então o mapeamento é tolerante. As
-chaves aceitas para cada coluna vêm de ``[mapeamento]`` no ``config.toml`` (``MapeamentoConfig``). A busca não
+Payload real do NOVUS (tópico ``NOVUS/Teste_Alumbra/events``, confirmado pelo usuário): ``timestamp`` e os
+canais vêm aninhados em ``channels``; ``timestamp`` é epoch em segundos UTC::
+
+    {"pid":51387408,"device_id":"Teste_Alumbra","channels":{"timestamp":1793386748,"chd1_value":67,"chd2_value":119,"chd3_value":0}}
+
+    → pid=51387408, device_id='Teste_Alumbra', ts_unix=1793386748 (2026-10-30T18:59:08Z),
+      chd1=67.0000, chd2=119.0000, chd3=0.0000
+
+As chaves aceitas para cada coluna vêm de ``[mapeamento]`` no ``config.toml`` (``MapeamentoConfig``). A busca não
 diferencia maiúsculas, e ``a.b`` é um caminho aninhado.
+
+Como cada coluna é procurada
+----------------------------
+1. **Nível do item**: as chaves configuradas, na ordem da configuração (``ts_unix``, ``ts``, ``timestamp``...).
+   Inclui caminhos com ponto a partir do item (``chd1.value`` = ``{"chd1": {"value": x}}``) e a chave literal
+   ``"chd1.value"``.
+2. **Objetos aninhados**, em qualquer profundidade (não entra em listas): a chave casa pelo final do caminho,
+   então ``channels.timestamp`` casa com ``timestamp`` e ``channels.chd1_value`` com ``chd1_value``; ``chd1.value``
+   casa com ``x.chd1.value``. Nada é amarrado ao nome ``channels``.
+
+O nível de cima sempre vence o aninhado. Se duas chaves aninhadas diferentes casarem com a mesma coluna (ex.:
+``channels.timestamp`` e ``meta.ts``), vale a primeira na ordem do JSON e um aviso é registrado uma única vez (por
+coluna e conjunto de chaves, durante a execução). Com envelope de leituras (formato 3), o item inteiro (topo e
+aninhados) é procurado antes do envelope.
 
 Formatos aceitos
 ----------------
 1. **Objeto JSON = uma leitura**::
 
+       {"pid": 51387408, "device_id": "Teste_Alumbra", "channels": {"timestamp": 1793386748, "chd1_value": 67}}
        {"pid": 17, "device_id": "N1", "ts": 1730000000, "chd1_value": 23.5, "chd2_value": 40, "chd3_value": null}
        {"pid": 17, "device": "N1", "timestamp": 1730000000123, "chd1": {"value": 23.5}, "chd2": "40,1"}
 
@@ -56,6 +78,7 @@ import base64
 import csv
 import math
 import re
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import ROUND_FLOOR, ROUND_HALF_UP, Decimal, InvalidOperation
@@ -183,13 +206,92 @@ def _resolver(d: dict, caminho: str) -> tuple[bool, Any]:
     return True, atual
 
 
-def _buscar(fontes: list[dict], caminhos: list[str]) -> tuple[str | None, Any]:
-    """Primeira fonte (item antes do envelope) e, nela, o primeiro caminho com valor não vazio."""
+def _vazio(valor: Any) -> bool:
+    return valor is None or (isinstance(valor, str) and not valor.strip())
+
+
+def _buscar_topo(fonte: dict, caminhos: list[str]) -> tuple[str | None, Any]:
+    """No nível do próprio objeto: o primeiro caminho (na ordem da configuração) com valor não vazio."""
+    for c in caminhos:
+        achou, valor = _resolver(fonte, c)
+        if achou and not _vazio(valor):
+            return c, valor
+    return None, None
+
+
+def _buscar_aninhado(fonte: dict, caminhos: list[str]) -> list[tuple[str, Any]]:
+    """Dentro dos objetos aninhados de ``fonte`` (qualquer profundidade, sem entrar em listas).
+
+    Um caminho casa pelo final: ``timestamp`` casa com ``channels.timestamp``; ``chd1.value`` casa com
+    ``channels.chd1.value``. Devolve ``[(caminho_completo, valor), ...]`` na ordem do JSON (busca em
+    profundidade), no máximo um por chave (o primeiro caminho da configuração que casar com ela).
+    """
+    alvos = [(c, _norm(c), _norm(c.split(".", 1)[0]) if "." in c else None) for c in caminhos]
+    achados: list[tuple[str, Any]] = []
+
+    def visitar(d: dict, prefixo: str) -> None:
+        for k, v in d.items():
+            nk = _norm(k)
+            casou = False
+            for c, literal, primeiro in alvos:
+                if nk == literal:
+                    achou, valor = True, v
+                elif primeiro is not None and nk == primeiro:
+                    achou, valor = _resolver({k: v}, c)
+                else:
+                    continue
+                if achou and not _vazio(valor):
+                    achados.append((f"{prefixo}{k}" if nk == literal else f"{prefixo}{c}", valor))
+                    casou = True
+                    break
+            if not casou and isinstance(v, dict):
+                visitar(v, f"{prefixo}{k}.")
+
+    for k, v in fonte.items():
+        if isinstance(v, dict):
+            visitar(v, f"{k}.")
+    return achados
+
+
+_avisos_ambiguos: set[tuple[str, tuple[str, ...]]] = set()
+_avisos_lock = threading.Lock()
+
+
+def _aviso_ambiguo_novo(coluna: str, caminhos: tuple[str, ...]) -> bool:
+    """Verdadeiro só na primeira vez (no processo) para a mesma coluna e o mesmo conjunto de chaves."""
+    with _avisos_lock:
+        if (coluna, caminhos) in _avisos_ambiguos:
+            return False
+        _avisos_ambiguos.add((coluna, caminhos))
+        return True
+
+
+def _esquecer_avisos() -> None:
+    """Para testes: volta a emitir os avisos de chave ambígua."""
+    with _avisos_lock:
+        _avisos_ambiguos.clear()
+
+
+def _buscar(fontes: list[dict], caminhos: list[str], coluna: str = "",
+            avisos: list[str] | None = None) -> tuple[str | None, Any]:
+    """Procura o valor de uma coluna. Devolve (chave achada, valor) ou (None, None).
+
+    Ordem: para cada fonte (item antes do envelope), primeiro o nível do próprio objeto (na ordem dos caminhos
+    configurados), depois os objetos aninhados (na ordem do JSON). Se mais de uma chave aninhada diferente casar,
+    vale a primeira e um aviso é registrado (uma única vez por coluna e conjunto de chaves).
+    """
     for fonte in fontes:
-        for c in caminhos:
-            achou, valor = _resolver(fonte, c)
-            if achou and valor is not None and not (isinstance(valor, str) and not valor.strip()):
-                return c, valor
+        chave, valor = _buscar_topo(fonte, caminhos)
+        if chave is not None:
+            return chave, valor
+        achados = _buscar_aninhado(fonte, caminhos)
+        if achados:
+            if len(achados) > 1 and avisos is not None:
+                nomes = tuple(c for c, _ in achados)
+                if _aviso_ambiguo_novo(coluna, nomes):
+                    avisos.append(f"{coluna}: várias chaves aninhadas casam ({', '.join(nomes)}); usando "
+                                  f"'{nomes[0]}' (primeira no JSON). Este aviso não se repete.")
+            return achados[0]
     return None, None
 
 
@@ -329,7 +431,7 @@ class _Montador:
         cfg = self.cfg
         motivos: list[str] = []
 
-        chave, bruto = _buscar(fontes, _lista(cfg.pid))
+        chave, bruto = _buscar(fontes, _lista(cfg.pid), "pid", self.avisos)
         pid = None
         if chave is None:
             motivos.append("sem pid")
@@ -338,7 +440,7 @@ class _Montador:
             if pid is None:
                 motivos.append(f"pid inválido em '{chave}': {trecho(str(bruto), 30)!r}")
 
-        chave, bruto = _buscar(fontes, _lista(cfg.device_id))
+        chave, bruto = _buscar(fontes, _lista(cfg.device_id), "device_id", self.avisos)
         device = None
         if chave is None:
             device = self.device_topico or None
@@ -354,7 +456,7 @@ class _Montador:
             motivos.append(f"device_id com mais de {MAX_DEVICE_ID} caracteres")
             device = None
 
-        chave, bruto = _buscar(fontes, _lista(cfg.ts_unix))
+        chave, bruto = _buscar(fontes, _lista(cfg.ts_unix), "ts_unix", self.avisos)
         ts = None
         if chave is None:
             motivos.append("sem ts_unix")
@@ -365,7 +467,7 @@ class _Montador:
 
         canais: list[Decimal | None] = []
         for n, caminhos in enumerate((cfg.chd1, cfg.chd2, cfg.chd3), start=1):
-            chave, bruto = _buscar(fontes, _lista(caminhos))
+            chave, bruto = _buscar(fontes, _lista(caminhos), f"chd{n}_value", self.avisos)
             valor, aviso = (None, None) if chave is None else converter_chd(bruto)
             if aviso:
                 self.avisos.append(f"chd{n}_value em '{chave}' (pid={pid}): {aviso}; gravado como NULL.")

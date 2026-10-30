@@ -198,3 +198,84 @@ def test_recebido_em_ingenuo_e_tratado_como_local_e_vai_para_utc():
     esperado = local.astimezone(timezone.utc).replace(tzinfo=None)
     assert r.linhas[0].recebido_em == esperado
     assert abs(r.linhas[0].recebido_em - esperado) < timedelta(seconds=1)
+
+
+# ------------------------------------------------------------------ payload real do NOVUS (chaves aninhadas)
+
+NOVUS_REAL = ('{"pid":51387408,"device_id":"Teste_Alumbra","channels":{"timestamp":1793386748,'
+              '"chd1_value":67,"chd2_value":119,"chd3_value":0}}')
+TOP_NOVUS = "NOVUS/Teste_Alumbra/events"
+
+
+@pytest.fixture(autouse=True)
+def _avisos_limpos():
+    from app.core.mapeamento import _esquecer_avisos
+    _esquecer_avisos()
+    yield
+    _esquecer_avisos()
+
+
+def _confere_novus(l, payload):
+    assert l.motivo is None and l.completa
+    assert (l.pid, l.device_id, l.ts_unix) == (51387408, "Teste_Alumbra", 1793386748)
+    assert (l.chd1_value, l.chd2_value, l.chd3_value) == (_d("67.0000"), _d("119.0000"), _d("0.0000"))
+    assert l.payload_json == payload
+    assert l.recebido_em == datetime(2026, 10, 30, 15, 0, 0, 123000)
+
+
+def test_payload_real_novus_com_channels():
+    r = _m(NOVUS_REAL, topico=TOP_NOVUS)
+    assert r.formato == "JSON" and r.avisos == []
+    (l,) = r.linhas
+    _confere_novus(l, NOVUS_REAL)
+    assert datetime.fromtimestamp(l.ts_unix, timezone.utc) == datetime(2026, 10, 30, 18, 59, 8, tzinfo=timezone.utc)
+
+
+def test_payload_real_novus_em_lista():
+    payload = f"[{NOVUS_REAL}, {NOVUS_REAL}]"
+    r = _m(payload, topico=TOP_NOVUS)
+    assert r.formato == "JSON lista" and r.avisos == []
+    assert len(r.linhas) == 2
+    for l in r.linhas:
+        _confere_novus(l, payload)
+
+
+def test_payload_novus_em_envelope_de_leituras():
+    payload = ('{"device_id":"Teste_Alumbra","leituras":[{"pid":1,"channels":{"timestamp":1793386748,"chd1_value":1}},'
+               '{"pid":2,"channels":{"timestamp":1793386749,"chd1_value":2}}]}')
+    r = _m(payload, topico=TOP_NOVUS)
+    assert [(l.pid, l.device_id, l.ts_unix, l.chd1_value, l.motivo) for l in r.linhas] == [
+        (1, "Teste_Alumbra", 1793386748, _d("1.0000"), None), (2, "Teste_Alumbra", 1793386749, _d("2.0000"), None)]
+
+
+def test_nivel_de_cima_vence_o_aninhado():
+    r = _m('{"pid":1,"device_id":"N1","timestamp":1730000000,"chd1_value":5,'
+           '"channels":{"timestamp":1793386748,"chd1_value":67,"chd2_value":119,"pid":999}}')
+    (l,) = r.linhas
+    assert l.completa
+    assert (l.pid, l.ts_unix, l.chd1_value, l.chd2_value) == (1, TS, _d("5.0000"), _d("119.0000"))
+    assert r.avisos == []
+
+
+def test_aninhado_em_qualquer_profundidade_e_formas_antigas():
+    r = _m('{"pid":1,"device_id":"N1","a":{"b":{"c":{"ts":1730000000}}},'
+           '"canais":{"chd1":{"value":1.5},"chd2.value":2,"chd3":3}}')
+    (l,) = r.linhas
+    assert l.completa and l.ts_unix == TS
+    assert (l.chd1_value, l.chd2_value, l.chd3_value) == (_d("1.5000"), _d("2.0000"), _d("3.0000"))
+    assert r.avisos == []
+
+
+def test_duas_chaves_aninhadas_usa_a_primeira_do_json_e_avisa_uma_vez():
+    payload = '{"pid":1,"device_id":"N1","meta":{"timestamp":1730000000},"channels":{"ts":1793386748}}'
+    r = _m(payload)
+    assert r.linhas[0].ts_unix == TS                      # primeira no JSON, mesmo "ts" vindo antes na config
+    assert len(r.avisos) == 1
+    assert "ts_unix" in r.avisos[0] and "meta.timestamp" in r.avisos[0] and "channels.ts" in r.avisos[0]
+    r2 = _m(payload)
+    assert r2.linhas[0].ts_unix == TS and r2.avisos == []  # não repete
+
+
+def test_aninhado_nao_entra_em_listas_nem_inventa():
+    r = _m('{"pid":1,"device_id":"N1","historico":[{"timestamp":1730000000}]}')
+    assert "sem ts_unix" in r.linhas[0].motivo

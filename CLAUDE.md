@@ -137,7 +137,14 @@ Regras de mapeamento payload → linha:
   linha sem algum deles não é inventada; vai para a contingência com o motivo no log.
 - `chdN_value`: aceitar `chdN_value`, `chdN.value` (JSON aninhado) ou `chdN`; `decimal(18,4)` — arredondar para 4
   casas, valor fora da faixa vai como NULL com aviso.
-- Formato exato do payload NOVUS ainda **a confirmar com um exemplo real**. As chaves aceitas para cada coluna
+- **Payload real do NOVUS** (tópico `NOVUS/Teste_Alumbra/events`, uma mensagem a cada ~10 s), confirmado em 30/10/2026:
+
+  ```json
+  {"pid":51387408,"device_id":"Teste_Alumbra","channels":{"timestamp":1793386748,"chd1_value":67,"chd2_value":119,"chd3_value":0}}
+  ```
+
+  `timestamp` e `chdN_value` vêm **aninhados em `channels`**; `timestamp` é epoch em segundos UTC. O mapeador procura
+  cada chave primeiro no nível de cima e depois nos objetos aninhados (pelo último segmento do nome). As chaves aceitas para cada coluna
   ficam na seção `[mapeamento]` do `config.toml` (`MapeamentoConfig` em `app/config.py`); os formatos aceitos estão
   documentados no topo de `app/core/mapeamento.py`.
 - Leitura incompleta não conta como gravada: conta como erro e vai para a contingência com o motivo.
