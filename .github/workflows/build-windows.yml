@@ -5,6 +5,9 @@ on:
     branches: [main, "claude/**"]
   workflow_dispatch:
 
+permissions:
+  contents: write  # publicar o .zip na página Releases
+
 jobs:
   build:
     runs-on: windows-latest
@@ -37,3 +40,20 @@ jobs:
           name: MQTT-SQLServer-windows
           path: dist/MQTT-SQLServer/
           retention-days: 30
+
+      - name: Compactar
+        shell: pwsh
+        run: Compress-Archive -Path dist/MQTT-SQLServer/* -DestinationPath MQTT-SQLServer-windows.zip
+
+      - name: Publicar em Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v0.1.${{ github.run_number }}
+          name: MQTT → SQL Server v0.1.${{ github.run_number }}
+          target_commitish: ${{ github.sha }}
+          make_latest: true
+          body: |
+            Versão de teste gerada a partir de `${{ github.ref_name }}` (${{ github.sha }}).
+            Baixe **MQTT-SQLServer-windows.zip**, descompacte e abra `MQTT-SQLServer.exe`.
+            Requer o ODBC Driver 18 (ou 17) for SQL Server no computador.
+          files: MQTT-SQLServer-windows.zip
