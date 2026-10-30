@@ -68,7 +68,7 @@ def validar_tabela(nome: str) -> tuple[str, str]:
 
 
 def tabela_citada(nome: str) -> str:
-    """``dbo.LeiturasMqtt`` -> ``[dbo].[LeiturasMqtt]`` (já validado)."""
+    """``dbo.IOT001`` -> ``[dbo].[IOT001]`` (já validado)."""
     schema, tabela = validar_tabela(nome)
     return f"[{schema}].[{tabela}]"
 
@@ -196,11 +196,13 @@ def testar_conexao(sql: SqlServerConfig) -> tuple[bool, str]:
             else:
                 ok = False
                 linhas.append(f"✗ Sem permissão de INSERT em {nome_tabela}. Peça ao DBA: "
-                              f"GRANT INSERT, SELECT ON {nome_tabela} TO [{login}];")
+                              f"GRANT INSERT, SELECT ON {nome_tabela} TO [{login}]; "
+                              "(script sql/permissoes_iot001.sql)")
         else:
             ok = False
-            linhas.append(f"✗ Tabela {nome_tabela} não existe no banco {banco}. "
-                          "Rode sql/criar_tabela.sql (como dbo/sysadmin) no banco.")
+            linhas.append(f"✗ Tabela {nome_tabela} não existe no banco {banco} (ou o login não a enxerga). "
+                          "O app não cria a tabela: confira o nome da tabela e do banco na configuração; "
+                          "as permissões ficam em sql/permissoes_iot001.sql.")
         cur.close()
     except Exception as exc:  # noqa: BLE001
         ok = False
@@ -266,7 +268,8 @@ def traduzir_erro(exc: Exception) -> str:
     elif sqlstate.startswith("08"):
         acao = "Falha de comunicação com o servidor. Verifique nome do servidor, rede e firewall."
     elif sqlstate == "42S02" or _contem(t, "invalid object name", "nome de objeto inválido"):
-        acao = "Tabela não encontrada. Rode sql/criar_tabela.sql no banco configurado."
+        acao = ("Tabela não encontrada. Confira o nome da tabela (dbo.IOT001) e do banco na configuração; o app "
+                "não cria a tabela.")
     elif sqlstate == "42000" and _contem(t, "permission", "permissão"):
         acao = "Permissão negada. Peça ao DBA: GRANT INSERT, SELECT na tabela para o login do app."
     else:

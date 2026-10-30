@@ -1,4 +1,4 @@
-"""Auto-detecção e normalização dos payloads MQTT em registros da tabela ``LeiturasMqtt`` (formato longo).
+"""Auto-detecção e normalização dos payloads MQTT (JSON, tabular, texto, binário); usado por ``mapeamento``.
 
 Cada mensagem vira uma lista de ``Registro`` (uma linha por campo medido). Ordem de detecção:
 
@@ -85,7 +85,7 @@ _FORMATOS_BR = ("%d/%m/%Y %H:%M:%S.%f", "%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M", "
 
 @dataclass
 class Registro:
-    """Uma linha da tabela ``LeiturasMqtt``."""
+    """Um campo medido extraído do payload (o mapeamento monta as linhas da IOT001)."""
 
     RecebidoEm: datetime
     Topico: str

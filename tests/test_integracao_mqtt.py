@@ -1,4 +1,4 @@
-"""Integração: broker amqtt local → Pipeline (paho) → parser → sink (contingência e SQL falso)."""
+"""Integração: broker amqtt local → Pipeline (paho) → mapeamento IOT001 → sink (contingência e SQL falso)."""
 from __future__ import annotations
 
 import asyncio
@@ -6,6 +6,7 @@ import json
 import socket
 import threading
 import time
+from decimal import Decimal
 
 import pytest
 
@@ -106,32 +107,38 @@ def test_sem_sql_mensagens_vao_para_contingencia(broker, tmp_path):
         assert ("conectado", f"Conectado a 127.0.0.1:{broker}") in ev.status
 
         _publicar(broker, [
-            ("NOVUS/Teste_Alumbra/logger01", b'{"ts": 1730000000, "T1": 23.5, "T2": 40, "status": "ok"}'),
-            ("NOVUS/Teste_Alumbra/logger02/csv", "T1;T2\n1,5;2".encode()),
+            ("NOVUS/Teste_Alumbra/logger01", b'{"pid": 1, "ts": 1730000000, "chd1": 23.5, "chd2": 40}'),
+            ("NOVUS/Teste_Alumbra/logger02/csv", "pid;device_id;ts;chd1\n2;L2;1730000001;1,5\n3;L2;1730000002;2".encode()),
             ("NOVUS/Teste_Alumbra/logger03", b"\xff\xfe\x00"),
             ("NOVUS/Teste_Alumbra/logger04", b'{"quebrado": '),
+            ("NOVUS/Teste_Alumbra/logger05", b'{"T1": 23.5}'),
             ("OUTRO/topico", b"1"),
         ])
-        assert _esperar(lambda: p.contadores == (4, 6, 1)), p.contadores
+        # 5 recebidas; 3 leituras completas guardadas; 3 mensagens sem pid/ts/JSON válido = 3 erros
+        assert _esperar(lambda: p.contadores == (5, 3, 3)), p.contadores
     finally:
         assert p.encerrar(5)
 
     assert ev.tem_log(f"Conectado a 127.0.0.1:{broker}")
-    assert ev.tem_log("Mensagem de NOVUS/Teste_Alumbra/logger01: JSON, 3 campos")
-    assert ev.tem_log("Mensagem de NOVUS/Teste_Alumbra/logger02/csv: tabular, 2 campos")
-    assert any(n == "AVISO" and "binário" in m for n, m in ev.logs)
-    assert any(n == "ERRO" and "logger04 ignorada" in m for n, m in ev.logs)
+    assert ev.tem_log("Mensagem de NOVUS/Teste_Alumbra/logger01: JSON, 1 leitura")
+    assert ev.tem_log("Mensagem de NOVUS/Teste_Alumbra/logger02/csv: tabular, 2 leituras")
+    assert any(n == "ERRO" and "logger03" in m and "binário" in m for n, m in ev.logs)
+    assert any(n == "ERRO" and "logger04" in m and "JSON inválido" in m for n, m in ev.logs)
+    assert any(n == "ERRO" and "logger05" in m and "sem pid" in m for n, m in ev.logs)
     assert sum("SQL Server não configurado" in m for _, m in ev.logs) == 1
     assert ev.status[-1][0] == "desconectado"
-    assert ev.contadores[-1] == (4, 6, 1)
+    assert ev.contadores[-1] == (5, 3, 3)
 
     arquivo, = (tmp_path / "contingencia").glob("leituras_*.jsonl")
     linhas = [json.loads(l) for l in arquivo.read_text(encoding="utf-8").splitlines()]
-    por_campo = {(l["Dispositivo"], l["Campo"]): l for l in linhas}
-    assert por_campo[("logger01", "T1")]["ValorNumerico"] == 23.5
-    assert por_campo[("logger01", "status")]["ValorTexto"] == "ok"
-    assert por_campo[("logger02", "T1")]["ValorNumerico"] == 1.5
-    assert por_campo[("logger03", "payload_base64")]["ValorTexto"] == "//4A"
+    assert len(linhas) == 6
+    completas = {l["pid"]: l for l in linhas if l["motivo"] is None}
+    assert completas[1]["device_id"] == "logger01" and completas[1]["chd1_value"] == "23.5000"
+    assert completas[2]["device_id"] == "L2" and completas[2]["ts_unix"] == 1730000001
+    assert completas[3]["chd1_value"] == "2.0000"
+    rejeitadas = [l for l in linhas if l["motivo"] is not None]
+    assert {l["topico"] for l in rejeitadas} == {f"NOVUS/Teste_Alumbra/logger0{i}" for i in (3, 4, 5)}
+    assert any(l["payload_json"] == "base64://4A" for l in rejeitadas)
 
 
 def test_com_sql_falso_grava_em_lote(broker, tmp_path):
@@ -171,13 +178,15 @@ def test_com_sql_falso_grava_em_lote(broker, tmp_path):
         assert _esperar(lambda: ev.tem_log("Assinado NOVUS/Teste_Alumbra/+ (QoS 1)")), ev.logs
         n = 300
         inicio = time.perf_counter()
-        _publicar(broker, [(f"NOVUS/Teste_Alumbra/d{i % 3}", f'{{"v": {i}}}'.encode()) for i in range(n)], qos=1)
+        _publicar(broker, [(f"NOVUS/Teste_Alumbra/d{i % 3}", f'{{"pid": {i}, "ts": {1730000000 + i}, "chd1": {i}}}'.encode()) for i in range(n)], qos=1)
         assert _esperar(lambda: len(gravados) == n, 15), len(gravados)
         duracao = time.perf_counter() - inicio
     finally:
         assert p.encerrar(5)
-    assert sorted(r[6 - 1] for r in gravados) == [float(i) for i in range(n)]
-    assert {r[2] for r in gravados} == {"d0", "d1", "d2"}
+    assert sorted(r[0] for r in gravados) == list(range(n))                       # pid
+    assert sorted(r[3] for r in gravados) == [Decimal(i).quantize(Decimal("0.0001")) for i in range(n)]
+    assert {r[1] for r in gravados} == {"d0", "d1", "d2"}                         # device_id do tópico
+    assert all(len(r) == 8 for r in gravados)
     assert ev.tem_log("registros no SQL Server")
     assert not (tmp_path / "contingencia").exists()
     print(f"\n{n} mensagens publicadas e gravadas (SQL falso) em {duracao:.2f}s")

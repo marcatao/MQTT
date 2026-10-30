@@ -1,8 +1,8 @@
-"""Liga MQTT → fila → parser → sink e expõe eventos (status, log, contadores) por callbacks.
+"""Liga MQTT → fila → mapeamento (dbo.IOT001) → sink e expõe eventos (status, log, contadores) por callbacks.
 
 Threads:
 - rede do paho: só enfileira a mensagem (``queue.Queue`` limitada) e retorna;
-- processamento (uma por conexão): parsing, lote e gravação; manda os contadores no máx. ~5x/s;
+- processamento (uma por conexão): mapeamento, lote e gravação; manda os contadores no máx. ~5x/s;
 - controle (``ThreadPoolExecutor`` de 1 worker): executa conectar/desconectar em ordem, sem bloquear quem chama.
 
 Os callbacks são chamados de qualquer uma dessas threads; o ``bridge`` os transforma em Signals do Qt.
@@ -15,13 +15,14 @@ import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import replace
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
 from app.config import Config, SqlServerConfig, pasta_base
 from app.core.mqtt_client import ClienteMqtt, validar_parametros
-from app.core.parser import analisar, trecho
+from app.core.mapeamento import mapear
+from app.core.parser import trecho
 from app.core.sink_sqlserver import Sink, criar_sink
 
 logger = logging.getLogger("app.core")
@@ -214,7 +215,7 @@ class Pipeline:
         self._somar(recebidas=1)
         try:
             # bloqueia a rede um pouco se a fila encher (contrapressão) em vez de perder a mensagem
-            fila.put((topico, payload, datetime.now(), retida), timeout=5)
+            fila.put((topico, payload, datetime.now(timezone.utc), retida), timeout=5)
         except queue.Full:
             self._somar(erros=1)
             self._log("ERRO", f"Fila de processamento cheia: mensagem de {topico} descartada "
@@ -240,24 +241,31 @@ class Pipeline:
                 terminar = True
             elif item is not None:
                 topico, payload, recebido_em, retida = item
-                res = analisar(topico, payload, recebido_em, self._assinatura)
+                res = mapear(topico, payload, recebido_em, self._assinatura, self.config.mapeamento)
                 agora = time.monotonic()
                 if agora - janela_inicio >= 1.0:
                     if suprimidos:
                         self._log("INFO", f"… e mais {suprimidos} mensagens no último segundo")
                     janela_inicio, logs_na_janela, suprimidos = agora, 0, 0
                 if res.ok:
+                    rejeitadas = res.rejeitadas
+                    if rejeitadas:  # sem pid/device_id/ts_unix: vão para a contingência, contam como erro
+                        self._somar(erros=len(rejeitadas))
                     if logs_na_janela < self.LOGS_POR_SEGUNDO:
                         logs_na_janela += 1
-                        n = len(res.registros)
+                        n = len(res.linhas) - len(rejeitadas)
                         extra = " (retida)" if retida else ""
-                        self._log("INFO", f"Mensagem de {topico}{extra}: {res.formato}, "
-                                          f"{n} campo{'s' if n != 1 else ''}")
+                        if n:
+                            self._log("INFO", f"Mensagem de {topico}{extra}: {res.formato}, "
+                                              f"{n} leitura{'s' if n != 1 else ''}")
+                        for linha in rejeitadas:
+                            self._log("ERRO", f"Mensagem de {topico}{extra} ({res.formato}) não vai para o banco: "
+                                              f"{linha.motivo}. Guardada na contingência.")
                         for aviso in res.avisos:
                             self._log("AVISO", f"{topico}: {aviso}")
                     else:
                         suprimidos += 1
-                    sink.adicionar(res.registros)
+                    sink.adicionar(res.linhas)
                 else:
                     self._somar(erros=1)
                     self._log("ERRO" if res.formato != "vazio" else "AVISO",

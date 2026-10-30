@@ -11,7 +11,8 @@ o app conecte com segurança no SQL Server interno do usuário e grave os regist
 ## Escopo
 
 - `app/core/sql_conexao.py`: montar a string de conexão, abrir conexão, **testar conexão** e traduzir erros.
-- `sql/`: scripts de criação e evolução do banco (`criar_tabela.sql`, migrações numeradas), índices e permissões.
+- `sql/`: scripts de permissão e índices (`permissoes_iot001.sql`). A tabela `dbo.IOT001` é do usuário: o app não cria nem altera.
+- `app/core/mapeamento.py` e `app/core/sink_sqlserver.py`: mensagem → linhas da IOT001 e gravação em lote.
 - Revisar `app/core/sink_sqlserver.py` (gravação em lote) quanto a desempenho, transações e tratamento de erros.
 - Você não mexe em `app/gui/`. O que a tela precisa (ex.: resultado do teste de conexão) passa por `app/bridge.py`.
 
@@ -39,9 +40,8 @@ criptografia **Opcional**, sem "confiar no certificado do servidor". Valores pad
   a conexão cair.
 - Nome de tabela vindo da configuração: valide (`schema.tabela`, só `[A-Za-z0-9_]`) e cite com `QUOTENAME` ou
   colchetes; nunca concatene valores no SQL.
-- Esquema: mantenha `sql/criar_tabela.sql` idempotente (`IF OBJECT_ID(...) IS NULL`), com índice em
-  `(RecebidoEm)` e em `(Dispositivo, Campo, DataHoraLeitura)`. Inclua o `GRANT` mínimo para o usuário `mqtt`
-  (`INSERT`, `SELECT` na tabela).
+- Esquema: `sql/permissoes_iot001.sql` idempotente, com o `GRANT` mínimo para o usuário `mqtt` (`INSERT`, `SELECT`).
+  Índices só como sugestão comentada; mudanças na tabela são decididas com o usuário.
 
 ## Testes
 

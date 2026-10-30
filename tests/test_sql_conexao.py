@@ -133,10 +133,10 @@ def test_mascarar_password_sem_chaves_e_maiusculas():
 
 
 def test_validar_tabela():
-    assert sc.validar_tabela("dbo.LeiturasMqtt") == ("dbo", "LeiturasMqtt")
-    assert sc.validar_tabela("[dbo].[LeiturasMqtt]") == ("dbo", "LeiturasMqtt")
+    assert sc.validar_tabela("dbo.IOT001") == ("dbo", "IOT001")
+    assert sc.validar_tabela("[dbo].[IOT001]") == ("dbo", "IOT001")
     assert sc.validar_tabela("Leituras") == ("dbo", "Leituras")
-    assert sc.tabela_citada("dbo.LeiturasMqtt") == "[dbo].[LeiturasMqtt]"
+    assert sc.tabela_citada("dbo.IOT001") == "[dbo].[IOT001]"
     for ruim in ("dbo.Leit;uras", "a.b.c", "dbo.]x", "", "dbo.x--"):
         with pytest.raises(ValueError):
             sc.validar_tabela(ruim)
@@ -171,7 +171,7 @@ def test_validar_tabela():
         (ErroOdbcFalso("HYT00", "[Microsoft][ODBC Driver 18 for SQL Server]Login timeout expired (0) "
                                 "(SQLDriverConnect)"), "Tempo esgotado"),
         (ErroOdbcFalso("42S02", "[Microsoft][ODBC Driver 18 for SQL Server][SQL Server]Invalid object name "
-                                "'dbo.LeiturasMqtt'. (208) (SQLExecDirectW)"), "criar_tabela.sql"),
+                                "'dbo.IOT001'. (208) (SQLExecDirectW)"), "não cria a tabela"),
     ],
 )
 def test_traduzir_erro(exc, trecho):
@@ -275,21 +275,21 @@ def test_testar_conexao_ok(monkeypatch):
     assert "existe" in msg and "INSERT" in msg
     assert con.fechada
     # nome da tabela vai como parâmetro, não concatenado
-    assert any(p == ("[dbo].[LeiturasMqtt]",) for _, p in con._cursor.consultas)
+    assert any(p == ("[dbo].[IOT001]",) for _, p in con._cursor.consultas)
 
 
 def test_testar_conexao_tabela_inexistente(monkeypatch):
     monkeypatch.setattr(sc, "conectar", lambda sql: ConexaoFalsa(CursorFalso(existe=False)))
     ok, msg = sc.testar_conexao(_cfg())
     assert ok is False
-    assert "não existe" in msg and "criar_tabela.sql" in msg
+    assert "dbo.IOT001 não existe" in msg and "não cria a tabela" in msg
 
 
 def test_testar_conexao_sem_insert(monkeypatch):
     monkeypatch.setattr(sc, "conectar", lambda sql: ConexaoFalsa(CursorFalso(insert=0)))
     ok, msg = sc.testar_conexao(_cfg())
     assert ok is False
-    assert "Sem permissão de INSERT" in msg and "GRANT" in msg
+    assert "Sem permissão de INSERT" in msg and "GRANT INSERT, SELECT ON dbo.IOT001" in msg
 
 
 def test_testar_conexao_falha_login(monkeypatch):

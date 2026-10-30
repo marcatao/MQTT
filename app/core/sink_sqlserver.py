@@ -1,4 +1,8 @@
-"""Destinos dos registros: SQL Server (em lote) e arquivo de contingência (JSON Lines).
+"""Destinos das linhas da ``dbo.IOT001``: SQL Server (em lote) e arquivo de contingência (JSON Lines).
+
+Recebe ``LinhaIot`` (``app.core.mapeamento``). Linhas incompletas (``motivo`` preenchido: sem pid, device_id ou
+ts_unix) nunca vão ao banco: seguem direto para a contingência e não contam como gravadas (o pipeline já as contou
+como erro). Só as colunas ``pid, device_id, ts_unix, chd1..3_value, payload_json, recebido_em`` são inseridas.
 
 ``SinkSqlServer`` junta registros e grava quando o lote chega a ``lote_max`` ou passa ``lote_segundos`` (o que vier
 primeiro), numa transação, com ``executemany`` parametrizado e ``fast_executemany``. Erros são classificados pelo
@@ -28,7 +32,7 @@ from typing import Callable, Iterable, Protocol
 from app.config import GravacaoConfig, SqlServerConfig
 from app.core import sql_conexao
 from app.core.sql_conexao import DriverOdbcAusente
-from app.core.parser import Registro
+from app.core.mapeamento import LinhaIot
 
 try:
     import orjson as _orjson
@@ -52,7 +56,7 @@ def _sem_log(nivel: str, msg: str) -> None:
 class Sink(Protocol):
     descricao: str
 
-    def adicionar(self, registros: Iterable[Registro]) -> None: ...
+    def adicionar(self, registros: Iterable[LinhaIot]) -> None: ...
     def pendentes(self) -> int: ...
     def deve_descarregar(self) -> bool: ...
     def descarregar(self) -> int: ...   # devolve quantos registros foram persistidos (SQL ou contingência)
@@ -62,8 +66,8 @@ class Sink(Protocol):
 def montar_insert(tabela: str) -> str:
     """INSERT parametrizado; o nome da tabela é validado (só ``[A-Za-z0-9_]``, ``.`` e colchetes)."""
     alvo = sql_conexao.tabela_citada(tabela)
-    colunas = ", ".join(f"[{c}]" for c in Registro.COLUNAS)
-    marcadores = ", ".join("?" for _ in Registro.COLUNAS)
+    colunas = ", ".join(f"[{c}]" for c in LinhaIot.COLUNAS)
+    marcadores = ", ".join("?" for _ in LinhaIot.COLUNAS)
     return f"INSERT INTO {alvo} ({colunas}) VALUES ({marcadores})"
 
 
@@ -80,7 +84,7 @@ class Contingencia:
     def arquivo_do_dia(self) -> Path:
         return self.pasta / f"leituras_{datetime.now():%Y%m%d}.jsonl"
 
-    def gravar(self, registros: list[Registro]) -> Path:
+    def gravar(self, registros: list[LinhaIot]) -> Path:
         if not registros:
             return self.arquivo_do_dia()
         dados = b"".join(_linha_json(r.como_json()) for r in registros)
@@ -100,10 +104,10 @@ class _Lote:
     def __init__(self, lote_max: int, lote_segundos: float) -> None:
         self.lote_max = max(1, int(lote_max))
         self.lote_segundos = max(0.05, float(lote_segundos))
-        self.itens: list[Registro] = []
+        self.itens: list[LinhaIot] = []
         self._inicio: float | None = None
 
-    def adicionar(self, registros: Iterable[Registro]) -> None:
+    def adicionar(self, registros: Iterable[LinhaIot]) -> None:
         antes = len(self.itens)
         self.itens.extend(registros)
         if antes == 0 and self.itens:
@@ -114,7 +118,7 @@ class _Lote:
             return False
         return len(self.itens) >= self.lote_max or (time.monotonic() - (self._inicio or 0)) >= self.lote_segundos
 
-    def retirar(self) -> list[Registro]:
+    def retirar(self) -> list[LinhaIot]:
         itens, self.itens, self._inicio = self.itens, [], None
         return itens
 
@@ -132,7 +136,7 @@ class SinkContingencia:
         self._lote = _Lote(gravacao.lote_max, gravacao.lote_segundos)
         self._logar = logar
 
-    def adicionar(self, registros: Iterable[Registro]) -> None:
+    def adicionar(self, registros: Iterable[LinhaIot]) -> None:
         self._lote.adicionar(registros)
 
     def pendentes(self) -> int:
@@ -142,6 +146,7 @@ class SinkContingencia:
         return self._lote.pronto()
 
     def descarregar(self) -> int:
+        """Grava tudo na contingência; devolve quantas linhas **completas** foram guardadas."""
         itens = self._lote.retirar()
         if not itens:
             return 0
@@ -152,7 +157,7 @@ class SinkContingencia:
             self._logar("ERRO", f"Falha ao gravar a contingência: {exc}")
             raise
         self._logar("INFO", f"Guardados {len(itens)} registros na contingência ({caminho.name})")
-        return len(itens)
+        return sum(1 for i in itens if i.completa)
 
     def fechar(self) -> int:
         return self.descarregar()
@@ -221,7 +226,7 @@ class SinkSqlServer:
 
     # -- interface Sink --------------------------------------------------------------------------------
 
-    def adicionar(self, registros: Iterable[Registro]) -> None:
+    def adicionar(self, registros: Iterable[LinhaIot]) -> None:
         self._lote.adicionar(registros)
 
     def pendentes(self) -> int:
@@ -233,7 +238,11 @@ class SinkSqlServer:
     def descarregar(self, ultima: bool = False) -> int:
         """Grava o lote pendente. ``ultima=True`` (fechamento): uma única tentativa, para caber no timeout."""
         self._aplicar_config_nova()
-        itens = self._lote.retirar()
+        todos = self._lote.retirar()
+        incompletas = [i for i in todos if not i.completa]
+        if incompletas:
+            self._para_contingencia(incompletas)  # sem pid/device_id/ts_unix: não vão ao banco
+        itens = [i for i in todos if i.completa]
         if not itens:
             return 0
         if time.monotonic() < self._indisponivel_ate:
@@ -284,7 +293,7 @@ class SinkSqlServer:
 
     # -- internos -------------------------------------------------------------------------------------
 
-    def _pausar_e_contingencia(self, itens: list[Registro], exc: Exception, motivo: str) -> int:
+    def _pausar_e_contingencia(self, itens: list[LinhaIot], exc: Exception, motivo: str) -> int:
         self._indisponivel_ate = time.monotonic() + self.pausa_apos_falha
         self._erros_lote += 1
         self._logar("ERRO", f"SQL Server {motivo}: {len(itens)} registros enviados para a contingência; "
@@ -292,17 +301,17 @@ class SinkSqlServer:
                             + sql_conexao.traduzir_erro(exc).replace("\n", " "))
         return self._para_contingencia(itens)
 
-    def _para_contingencia(self, itens: list[Registro]) -> int:
+    def _para_contingencia(self, itens: list[LinhaIot]) -> int:
         self._fallback.adicionar(itens)
         self._fallback.descarregar()
         return len(itens)
 
-    def _isolar_linhas_ruins(self, itens: list[Registro], exc: Exception) -> int:
+    def _isolar_linhas_ruins(self, itens: list[LinhaIot], exc: Exception) -> int:
         """Erro de dados (22xxx/23xxx): bissecção para gravar as linhas boas e mandar só as ruins à contingência."""
         self._logar("AVISO", f"Lote de {len(itens)} registros recusado por erro de dados; isolando as linhas "
                              f"com problema. {sql_conexao.traduzir_erro(exc).splitlines()[-1]}")
         boas = 0
-        ruins: list[Registro] = []
+        ruins: list[LinhaIot] = []
         pilha = [itens[len(itens) // 2:], itens[:len(itens) // 2]] if len(itens) > 1 else []
         if len(itens) == 1:
             ruins.append(itens[0])
@@ -326,8 +335,8 @@ class SinkSqlServer:
                     return len(itens)
                 if len(parte) == 1:
                     ruins.append(parte[0])
-                    self._logar("ERRO", f"Registro recusado pelo SQL Server (campo {parte[0].Campo!r}, "
-                                        f"tópico {parte[0].Topico}): "
+                    self._logar("ERRO", f"Registro recusado pelo SQL Server ({parte[0].descricao()}, "
+                                        f"tópico {parte[0].topico}): "
                                         + sql_conexao.traduzir_erro(exc_parte).replace("\n", " "))
                 else:
                     meio = len(parte) // 2
@@ -345,7 +354,7 @@ class SinkSqlServer:
         n, self._erros_lote = self._erros_lote, 0
         return n
 
-    def _inserir(self, itens: list[Registro]) -> None:
+    def _inserir(self, itens: list[LinhaIot]) -> None:
         if self._conexao is None:
             self._conexao = (self._conectar or sql_conexao.conectar)(self._sql)
         cursor = self._conexao.cursor()
@@ -393,21 +402,24 @@ def classificar_erro(exc: BaseException) -> tuple[str, str]:
 
 
 def _tipos_parametros():
-    """Tipos explícitos para o fast_executemany (evita erro de conversão quando a 1ª linha tem NULL).
+    """Tipos explícitos para o fast_executemany, na ordem de ``LinhaIot.COLUNAS``.
 
-    Só quando o pyodbc já foi carregado por ``sql_conexao.conectar``; com conexões falsas (testes) devolve None.
+    Evita conversões implícitas (ex.: NVARCHAR → VARCHAR no device_id, que impede uso de índice) e erro quando a
+    1ª linha do lote tem NULL. Só quando o pyodbc já foi carregado por ``sql_conexao.conectar``; com conexões
+    falsas (testes) devolve None.
     """
     pyodbc = sys.modules.get("pyodbc")
-    if pyodbc is None or not hasattr(pyodbc, "SQL_WVARCHAR"):
+    if pyodbc is None or not hasattr(pyodbc, "SQL_VARCHAR"):
         return None
     return [
-        (pyodbc.SQL_TYPE_TIMESTAMP, 23, 3),   # RecebidoEm DATETIME2(3)
-        (pyodbc.SQL_WVARCHAR, 255, 0),        # Topico
-        (pyodbc.SQL_WVARCHAR, 128, 0),        # Dispositivo
-        (pyodbc.SQL_TYPE_TIMESTAMP, 23, 3),   # DataHoraLeitura
-        (pyodbc.SQL_WVARCHAR, 128, 0),        # Campo
-        (pyodbc.SQL_DOUBLE, 0, 0),            # ValorNumerico FLOAT
-        (pyodbc.SQL_WVARCHAR, 4000, 0),       # ValorTexto
+        (pyodbc.SQL_BIGINT, 0, 0),            # pid bigint
+        (pyodbc.SQL_VARCHAR, 100, 0),         # device_id varchar(100)
+        (pyodbc.SQL_BIGINT, 0, 0),            # ts_unix bigint
+        (pyodbc.SQL_DECIMAL, 18, 4),          # chd1_value decimal(18,4)
+        (pyodbc.SQL_DECIMAL, 18, 4),          # chd2_value
+        (pyodbc.SQL_DECIMAL, 18, 4),          # chd3_value
+        (pyodbc.SQL_WVARCHAR, 0, 0),          # payload_json nvarchar(max) (tamanho 0 = max)
+        (pyodbc.SQL_TYPE_TIMESTAMP, 23, 3),   # recebido_em datetime2(3), UTC
     ]
 
 

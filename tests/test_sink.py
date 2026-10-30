@@ -3,12 +3,13 @@ from __future__ import annotations
 
 import json
 from datetime import datetime
+from decimal import Decimal
 
 import pytest
 
 from app.config import GravacaoConfig, SqlServerConfig
 from app.core import sink_sqlserver
-from app.core.parser import Registro
+from app.core.mapeamento import LinhaIot
 from app.core.sink_sqlserver import SinkContingencia, SinkSqlServer, criar_sink, montar_insert
 
 
@@ -26,7 +27,7 @@ class CursorFalso:
         if self.conexao.falhas_restantes > 0:
             self.conexao.falhas_restantes -= 1
             raise ErroOdbc(self.conexao.sqlstate, f"[{self.conexao.sqlstate}] falha simulada")
-        ruins = [l for l in linhas if l[4] in self.conexao.campos_ruins]
+        ruins = [l for l in linhas if l[1] in self.conexao.campos_ruins]
         if ruins:
             raise ErroOdbc("22003", "[22003] Numeric value out of range")
         assert self.fast_executemany is True
@@ -61,9 +62,13 @@ class ConexaoFalsa:
         self.fechada = True
 
 
+RECEBIDO = datetime(2026, 10, 30, 12, 0, 0)
+
+
 def registros(n, campo="t"):
-    agora = datetime(2026, 10, 30, 12, 0, 0)
-    return [Registro(agora, "NOVUS/Teste_Alumbra/x", "x", None, f"{campo}{i}", float(i), None) for i in range(n)]
+    """n linhas completas da IOT001; device_id = f"{campo}{i}" (usado para marcar linhas ruins)."""
+    return [LinhaIot(i, f"{campo}{i}", 1730000000 + i, Decimal(i).quantize(Decimal("0.0001")), None, None,
+                     f'{{"pid": {i}}}', RECEBIDO, "NOVUS/Teste_Alumbra/x") for i in range(n)]
 
 
 @pytest.fixture
@@ -90,9 +95,10 @@ def novo_sink(sql, grav, conexoes, logs=None, **kw):
 
 
 def test_montar_insert_e_validacao_da_tabela():
-    assert montar_insert("dbo.LeiturasMqtt") == (
-        "INSERT INTO [dbo].[LeiturasMqtt] ([RecebidoEm], [Topico], [Dispositivo], [DataHoraLeitura], [Campo], "
-        "[ValorNumerico], [ValorTexto]) VALUES (?, ?, ?, ?, ?, ?, ?)")
+    assert montar_insert("dbo.IOT001") == (
+        "INSERT INTO [dbo].[IOT001] ([pid], [device_id], [ts_unix], [chd1_value], [chd2_value], [chd3_value], "
+        "[payload_json], [recebido_em]) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+    assert "[id]" not in montar_insert("dbo.IOT001") and "data_hora_utc" not in montar_insert("dbo.IOT001")
     assert montar_insert("[dbo].[Leituras_2]").startswith("INSERT INTO [dbo].[Leituras_2]")
     for ruim in ["dbo.Leituras; DROP TABLE x", "dbo.[a]]b]", "a b", "x.y.z.w", ""]:
         with pytest.raises(ValueError):
@@ -107,8 +113,8 @@ def test_lote_por_quantidade(sql, grav):
     assert sink.deve_descarregar()
     assert sink.descarregar() == 3
     (sql_insert, linhas), = abertas[0].gravado
-    assert sql_insert.startswith("INSERT INTO [dbo].[LeiturasMqtt]")
-    assert linhas[0] == (datetime(2026, 10, 30, 12), "NOVUS/Teste_Alumbra/x", "x", None, "t0", 0.0, None)
+    assert sql_insert.startswith("INSERT INTO [dbo].[IOT001]")
+    assert linhas[0] == (0, "t0", 1730000000, Decimal("0.0000"), None, None, '{"pid": 0}', RECEBIDO)
     assert sink.pendentes() == 0
 
 
@@ -151,8 +157,9 @@ def test_falha_persistente_vai_para_contingencia(sql, grav, tmp_path):
     arquivos = list((tmp_path / "cont").glob("leituras_*.jsonl"))
     assert len(arquivos) == 1
     linhas = [json.loads(l) for l in arquivos[0].read_text(encoding="utf-8").splitlines()]
-    assert [l["Campo"] for l in linhas] == ["t0", "t1", "t2"]
-    assert linhas[0]["RecebidoEm"] == "2026-10-30T12:00:00.000"
+    assert [l["device_id"] for l in linhas] == ["t0", "t1", "t2"]
+    assert linhas[0]["recebido_em"] == "2026-10-30T12:00:00.000Z"
+    assert linhas[0]["chd1_value"] == "0.0000" and linhas[0]["motivo"] is None
     assert any(n == "ERRO" and "contingência" in m for n, m in logs)
     assert not any("segredo" in m for _, m in logs)
 
@@ -247,9 +254,9 @@ def test_erro_de_dados_isola_so_as_linhas_ruins(sql, grav, tmp_path):
     sink, abertas = novo_sink(sql, grav, [conexao], logs)
     sink.adicionar(registros(8))
     assert sink.descarregar() == 8
-    gravados = sorted(l[4] for _, linhas in conexao.gravado for l in linhas)
+    gravados = sorted(l[1] for _, linhas in conexao.gravado for l in linhas)
     assert gravados == ["t0", "t1", "t2", "t4", "t5", "t7"]
-    cont = [json.loads(l)["Campo"] for l in next((tmp_path / "cont").glob("*.jsonl")).read_text().splitlines()]
+    cont = [json.loads(l)["device_id"] for l in next((tmp_path / "cont").glob("*.jsonl")).read_text().splitlines()]
     assert sorted(cont) == ["t3", "t6"]
     assert sink.falhas() == 2
     assert sink._indisponivel_ate == 0.0  # erro de dados não pausa o banco
@@ -257,7 +264,7 @@ def test_erro_de_dados_isola_so_as_linhas_ruins(sql, grav, tmp_path):
     # próximo lote vai ao banco normalmente
     sink.adicionar(registros(1, "ok"))
     sink.descarregar()
-    assert conexao.gravado[-1][1][0][4] == "ok0"
+    assert conexao.gravado[-1][1][0][1] == "ok0"
 
 
 def test_fechar_faz_uma_unica_tentativa(sql, grav, tmp_path):
@@ -280,3 +287,62 @@ def test_fechar_chama_fechar_da_contingencia(sql, grav):
     sink._dormir = lambda s: None
     sink.fechar()
     assert chamado == [1]
+
+
+# ------------------------------------------------------------------------------------------ IOT001
+
+
+def _incompleta(motivo="sem pid"):
+    return LinhaIot(None, "N1", None, None, None, None, "x", RECEBIDO, "NOVUS/Teste_Alumbra/N1", motivo)
+
+
+def test_linhas_incompletas_vao_para_contingencia_e_nao_ao_banco(sql, grav, tmp_path):
+    conexao = ConexaoFalsa()
+    sink, _ = novo_sink(sql, grav, [conexao])
+    sink.adicionar(registros(2) + [_incompleta()])
+    assert sink.descarregar() == 2          # só as completas contam como gravadas
+    assert [l[1] for _, ls in conexao.gravado for l in ls] == ["t0", "t1"]
+    cont = [json.loads(l) for l in next((tmp_path / "cont").glob("*.jsonl")).read_text().splitlines()]
+    assert len(cont) == 1 and cont[0]["motivo"] == "sem pid" and cont[0]["payload_json"] == "x"
+    assert sink.falhas() == 0               # o pipeline já contou a rejeição
+
+
+def test_lote_so_com_incompletas_nao_abre_conexao(sql, grav, tmp_path):
+    sink, abertas = novo_sink(sql, grav, [ConexaoFalsa()])
+    sink.adicionar([_incompleta(), _incompleta("sem ts_unix")])
+    assert sink.descarregar() == 0
+    assert abertas == []
+    assert len(next((tmp_path / "cont").glob("*.jsonl")).read_text().splitlines()) == 2
+
+
+def test_contingencia_sem_sql_conta_so_completas(grav, tmp_path):
+    sink = criar_sink(SqlServerConfig(servidor="", banco=""), grav)
+    sink.adicionar(registros(1) + [_incompleta()])
+    assert sink.fechar() == 1
+    assert len(next((tmp_path / "cont").glob("*.jsonl")).read_text().splitlines()) == 2
+
+
+class PyodbcFalso:
+    SQL_BIGINT, SQL_VARCHAR, SQL_WVARCHAR, SQL_DECIMAL, SQL_TYPE_TIMESTAMP = -5, 12, -9, 3, 93
+
+
+def test_setinputsizes_com_tipos_da_iot001(sql, grav, monkeypatch):
+    monkeypatch.setitem(sink_sqlserver.sys.modules, "pyodbc", PyodbcFalso)
+    p = PyodbcFalso
+    assert sink_sqlserver._tipos_parametros() == [
+        (p.SQL_BIGINT, 0, 0), (p.SQL_VARCHAR, 100, 0), (p.SQL_BIGINT, 0, 0),
+        (p.SQL_DECIMAL, 18, 4), (p.SQL_DECIMAL, 18, 4), (p.SQL_DECIMAL, 18, 4),
+        (p.SQL_WVARCHAR, 0, 0), (p.SQL_TYPE_TIMESTAMP, 23, 3),
+    ]
+    tamanhos = []
+
+    class CursorComTipos(CursorFalso):
+        def setinputsizes(self, tipos):
+            tamanhos.append(tipos)
+
+    conexao = ConexaoFalsa()
+    conexao.cursor = lambda: CursorComTipos(conexao)
+    sink, _ = novo_sink(sql, grav, [conexao])
+    sink.adicionar(registros(1))
+    sink.descarregar()
+    assert len(tamanhos) == 1 and len(tamanhos[0]) == len(LinhaIot.COLUNAS)

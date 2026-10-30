@@ -137,8 +137,16 @@ Regras de mapeamento payload → linha:
   linha sem algum deles não é inventada; vai para a contingência com o motivo no log.
 - `chdN_value`: aceitar `chdN_value`, `chdN.value` (JSON aninhado) ou `chdN`; `decimal(18,4)` — arredondar para 4
   casas, valor fora da faixa vai como NULL com aviso.
-- Formato exato do payload NOVUS ainda **a confirmar com um exemplo real**; o mapeamento fica configurável em
-  `config.toml`.
+- Formato exato do payload NOVUS ainda **a confirmar com um exemplo real**. As chaves aceitas para cada coluna
+  ficam na seção `[mapeamento]` do `config.toml` (`MapeamentoConfig` em `app/config.py`); os formatos aceitos estão
+  documentados no topo de `app/core/mapeamento.py`.
+- Leitura incompleta não conta como gravada: conta como erro e vai para a contingência com o motivo.
+- Permissões para o usuário `mqtt`: `sql/permissoes_iot001.sql` (rodar como dbo/sysadmin).
+
+## Build
+
+`.github/workflows/build-windows.yml` roda os testes e gera o `.exe` (PyInstaller via `build_exe.bat`) em
+`windows-latest` a cada push; o `.zip` fica nos artifacts do GitHub Actions por 30 dias.
 
 Sem `[sqlserver]` configurado, o app roda do mesmo jeito: mostra os registros no log e guarda em `contingencia/`
 (JSON Lines) para gravar depois.

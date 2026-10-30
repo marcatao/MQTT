@@ -26,3 +26,18 @@ timeout_conexao = 5
 lote_max = 500           # grava quando juntar esta quantidade...
 lote_segundos = 1.0      # ...ou quando passar este tempo, o que vier primeiro
 pasta_contingencia = "contingencia"
+
+[mapeamento]
+# Como achar cada coluna da dbo.IOT001 no payload (JSON ou tabular com cabeçalho). A primeira chave encontrada
+# vence; maiúsculas não importam; "a.b" é caminho aninhado no JSON ({"a": {"b": ...}}).
+# pid, device_id e ts_unix são obrigatórios: sem eles a leitura vai para contingencia/ com o motivo no log.
+pid = ["pid", "packet_id", "id_pacote", "seq", "sequencia"]
+device_id = ["device_id", "deviceid", "device", "dispositivo", "id_dispositivo", "serial", "serial_number", "sn"]
+ts_unix = ["ts_unix", "ts", "timestamp", "time", "epoch", "unix", "datahora", "data_hora", "datetime"]  # s, ms, µs, ns ou ISO 8601
+chd1 = ["chd1_value", "chd1.value", "chd1"]
+chd2 = ["chd2_value", "chd2.value", "chd2"]
+chd3 = ["chd3_value", "chd3.value", "chd3"]
+leituras = ["leituras", "readings", "dados", "data", "registros"]  # lista de leituras dentro de um objeto
+device_do_topico = true      # sem device_id no payload, usa o nível do tópico após o prefixo assinado
+fuso_sem_offset = "local"    # data/hora ISO sem fuso: "local" (do PC) ou "utc"
+colunas_sem_cabecalho = []   # tabular sem cabeçalho: ex. ["pid", "device_id", "ts", "chd1", "chd2", "chd3"]
