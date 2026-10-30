@@ -155,7 +155,20 @@ def mascarar(connection_string: str) -> str: ...          # PWD=*** para logs
 def conectar(sql: SqlServerConfig) -> "pyodbc.Connection": ...  # importa pyodbc só aqui (import preguiçoso)
 def testar_conexao(sql: SqlServerConfig) -> tuple[bool, str]: ...  # bloqueante; o bridge roda em thread
 def traduzir_erro(exc: Exception) -> str: ...
+def validar_tabela(nome: str) -> tuple[str, str]: ...      # (schema, tabela); ValueError se inválido
+def tabela_citada(nome: str) -> str: ...                   # "[dbo].[LeiturasMqtt]"
+def normalizar_criptografia(valor: str) -> str: ...        # aceita também Opcional/Obrigatório/Estrito
+class DriverOdbcAusente(RuntimeError): ...
 ```
+
+`testar_conexao` devolve `False` também quando conecta mas falta a tabela ou a permissão de INSERT; a tela mostra a
+mensagem inteira, não só o booleano.
+
+## Pendências conhecidas
+
+- Reprocessar os arquivos de `contingencia/` (`.jsonl`) no SQL Server quando o banco voltar.
+- Possível duplicação de um lote se o `commit` chegar ao servidor e a resposta se perder (exigiria id de lote ou
+  chave única — decidir com o usuário).
 
 ## Estado atual
 
