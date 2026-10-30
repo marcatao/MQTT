@@ -1,0 +1,26 @@
+# Copie para config.toml e ajuste. config.toml não vai para o git.
+
+[mqtt]
+# Valores que já aparecem preenchidos na tela (o broker Mosquitto da Alumbra).
+broker = "192.168.100.162"
+porta = 1883
+topico = "NOVUS/Teste_Alumbra/#"
+qos = 2
+usuario = ""
+senha = ""
+
+[sqlserver]
+# Deixe servidor vazio para rodar sem banco: os registros vão para contingencia/ e aparecem no log.
+servidor = ""            # ex.: "SRV-SQL01\\SQLEXPRESS" ou "192.168.100.10,1433"
+banco = ""
+tabela = "dbo.LeiturasMqtt"
+driver = "ODBC Driver 18 for SQL Server"
+autenticacao_windows = true
+usuario = ""
+senha = ""
+trust_server_certificate = true
+
+[gravacao]
+lote_max = 500           # grava quando juntar esta quantidade...
+lote_segundos = 1.0      # ...ou quando passar este tempo, o que vier primeiro
+pasta_contingencia = "contingencia"

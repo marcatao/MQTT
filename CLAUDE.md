@@ -71,10 +71,62 @@ Fluxo: thread do paho recebe a mensagem → coloca numa `queue.Queue` → thread
 lote → eventos (status, log, contadores) chegam à GUI **só por Signals do Qt**. Nunca atualizar widget fora da
 thread principal; nunca bloquear a thread da GUI com rede ou banco.
 
+## Valores padrão (broker Mosquitto da Alumbra)
+
+Vindos da configuração que o usuário já usa (nó MQTT do Node-RED). A tela abre com eles preenchidos:
+
+| Campo | Valor |
+| --- | --- |
+| BROKER | `192.168.100.162` |
+| PORTA | `1883` |
+| TÓPICO | `NOVUS/Teste_Alumbra/#` (dispositivos NOVUS publicando abaixo desse prefixo) |
+| QoS | `2` |
+| Saída | auto-detecção: objeto JSON, texto (inclusive tabular) ou binário |
+
+A tela também tem um seletor de **QoS** (0, 1, 2). Os padrões ficam em `app/config.py` e podem ser sobrescritos em
+`config.toml` (modelo em `config.example.toml`); o último valor digitado na tela vale mais que ambos (`QSettings`).
+
+## Tabela no SQL Server (proposta, a confirmar com o usuário)
+
+Formato "longo": uma linha por campo medido. Aceita qualquer JSON ou tabela vinda dos dispositivos sem mudar o
+esquema quando aparece um canal novo.
+
+```sql
+CREATE TABLE dbo.LeiturasMqtt (
+    Id              BIGINT IDENTITY(1,1) PRIMARY KEY,
+    RecebidoEm      DATETIME2(3)   NOT NULL,  -- quando o app recebeu a mensagem (hora local)
+    Topico          NVARCHAR(255)  NOT NULL,
+    Dispositivo     NVARCHAR(128)  NULL,
+    DataHoraLeitura DATETIME2(3)   NULL,      -- carimbo de tempo vindo no payload, se houver
+    Campo           NVARCHAR(128)  NOT NULL,  -- nome do canal/campo (JSON aninhado vira "a.b.c")
+    ValorNumerico   FLOAT          NULL,
+    ValorTexto      NVARCHAR(4000) NULL
+);
+```
+
+Sem `[sqlserver]` configurado, o app roda do mesmo jeito: mostra os registros no log e guarda em `contingencia/`
+(JSON Lines) para gravar depois.
+
+## Contrato core ↔ gui (`app/bridge.py`)
+
+```python
+class PipelineBridge(QObject):
+    status_alterado = Signal(str, str)      # (estado, detalhe); estado: "desconectado" | "conectando" | "conectado" | "erro"
+    log = Signal(str, str, str)             # (hora "HH:MM:SS", nivel "INFO" | "AVISO" | "ERRO", mensagem)
+    contadores = Signal(int, int, int)      # (mensagens recebidas, registros gravados, erros), no máx. ~5x por segundo
+
+    def __init__(self, config: Config, parent=None): ...
+    def conectar(self, broker: str, porta: int, topico: str, qos: int) -> None: ...  # não bloqueia
+    def desconectar(self) -> None: ...                                              # não bloqueia
+    def encerrar(self, timeout: float = 5.0) -> None: ...  # ao fechar a janela: para, grava o último lote, desconecta
+```
+
+Os sinais são emitidos de outras threads; o Qt entrega na thread da GUI (conexão enfileirada). A GUI só usa isso.
+
 ## Estado atual
 
-- O repositório ainda contém um protótipo antigo em **Node.js** (`package.json`, `src/`). Ele foi só um teste de
-  conexão e **será substituído** pelo app em Python; não evolua esse código.
+- Estrutura Python criada (`app/config.py`, `requirements*.txt`, `config.example.toml`). O protótipo Node.js foi
+  removido.
 
 ## Idioma
 
