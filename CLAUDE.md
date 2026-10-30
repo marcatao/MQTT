@@ -26,7 +26,8 @@ Aplicativo **desktop para Windows**, escrito em **Python**, que:
 | Agente | Quando delegar |
 | --- | --- |
 | `python-gui` | Tudo que é tela: layout, estilo, tema, componentes, caixa de logs, ícones, empacotamento do `.exe`. |
-| `mqtt-python` | Conexão MQTT, assinatura, reconexão, parsing de JSON/tabular, fila de processamento, gravação no SQL Server e desempenho. |
+| `mqtt-python` | Conexão MQTT, assinatura, reconexão, parsing de JSON/tabular, fila de processamento, pipeline e `bridge.py`. |
+| `sqlserver` | Conexão com o SQL Server, teste de conexão, tabela e scripts em `sql/`, gravação em lote e erros do banco. |
 
 Regras do orquestrador:
 
@@ -61,7 +62,8 @@ app/
   core/              # (agente mqtt-python) sem dependência de Qt
     mqtt_client.py   # conexão, assinatura, reconexão
     parser.py        # detecta JSON x tabular e normaliza em registros (list[dict])
-    sink_sqlserver.py# fila + gravação em lote via pyodbc
+    sql_conexao.py   # (agente sqlserver) string de conexão, teste, tradução de erros
+    sink_sqlserver.py# fila + gravação em lote via pyodbc (usa sql_conexao)
     pipeline.py      # liga mqtt → parser → sink, expõe eventos
   bridge.py          # adaptador: eventos do core viram Signals do Qt
 tests/
@@ -85,6 +87,25 @@ Vindos da configuração que o usuário já usa (nó MQTT do Node-RED). A tela a
 
 A tela também tem um seletor de **QoS** (0, 1, 2). Os padrões ficam em `app/config.py` e podem ser sobrescritos em
 `config.toml` (modelo em `config.example.toml`); o último valor digitado na tela vale mais que ambos (`QSettings`).
+
+## SQL Server do usuário
+
+| Campo | Valor |
+| --- | --- |
+| Servidor | `TERRA\SOLO` (instância nomeada) |
+| Autenticação | SQL Server |
+| Usuário | `mqtt` |
+| Banco | `MQTT` |
+| Criptografar | Opcional (`Encrypt=Optional`) |
+| Confiar no certificado | não |
+
+**A senha não fica no repositório** (nem em código, testes, logs ou commits). O usuário digita na tela; com
+"Lembrar senha" marcado ela vai para o Gerenciador de Credenciais do Windows via `keyring`
+(serviço `"MQTT SQL Server"`, usuário = login do SQL).
+
+A tela tem uma seção **Banco de dados** com: Servidor, Autenticação (Windows / SQL Server), Usuário, Senha,
+Lembrar senha, Banco, Criptografar (Opcional / Obrigatório / Estrito), Confiar no certificado, e o botão
+**Testar conexão**.
 
 ## Tabela no SQL Server (proposta, a confirmar com o usuário)
 
@@ -114,14 +135,27 @@ class PipelineBridge(QObject):
     status_alterado = Signal(str, str)      # (estado, detalhe); estado: "desconectado" | "conectando" | "conectado" | "erro"
     log = Signal(str, str, str)             # (hora "HH:MM:SS", nivel "INFO" | "AVISO" | "ERRO", mensagem)
     contadores = Signal(int, int, int)      # (mensagens recebidas, registros gravados, erros), no máx. ~5x por segundo
+    teste_sql_concluido = Signal(bool, str) # (sucesso, mensagem multilinha em português)
 
     def __init__(self, config: Config, parent=None): ...
+    def definir_sql(self, sql: SqlServerConfig) -> None: ...   # a GUI chama antes de conectar e quando o usuário altera
+    def testar_sql(self, sql: SqlServerConfig) -> None: ...    # não bloqueia; responde em teste_sql_concluido
     def conectar(self, broker: str, porta: int, topico: str, qos: int) -> None: ...  # não bloqueia
     def desconectar(self) -> None: ...                                              # não bloqueia
     def encerrar(self, timeout: float = 5.0) -> None: ...  # ao fechar a janela: para, grava o último lote, desconecta
 ```
 
 Os sinais são emitidos de outras threads; o Qt entrega na thread da GUI (conexão enfileirada). A GUI só usa isso.
+
+Funções do SQL (`app/core/sql_conexao.py`, agente `sqlserver`), usadas pelo bridge e pelo sink:
+
+```python
+def montar_connection_string(sql: SqlServerConfig, driver: str | None = None) -> str: ...
+def mascarar(connection_string: str) -> str: ...          # PWD=*** para logs
+def conectar(sql: SqlServerConfig) -> "pyodbc.Connection": ...  # importa pyodbc só aqui (import preguiçoso)
+def testar_conexao(sql: SqlServerConfig) -> tuple[bool, str]: ...  # bloqueante; o bridge roda em thread
+def traduzir_erro(exc: Exception) -> str: ...
+```
 
 ## Estado atual
 

@@ -26,14 +26,16 @@ class MqttConfig:
 
 @dataclass
 class SqlServerConfig:
-    servidor: str = ""
-    banco: str = ""
+    servidor: str = "TERRA\\SOLO"
+    banco: str = "MQTT"
     tabela: str = "dbo.LeiturasMqtt"
     driver: str = "ODBC Driver 18 for SQL Server"
-    autenticacao_windows: bool = True
-    usuario: str = ""
-    senha: str = ""
-    trust_server_certificate: bool = True
+    autenticacao_windows: bool = False
+    usuario: str = "mqtt"
+    senha: str = ""  # nunca no git: vem da tela (Gerenciador de Credenciais do Windows) ou do config.toml local
+    criptografar: str = "Optional"  # Optional | Mandatory | Strict (ODBC Driver 18)
+    trust_server_certificate: bool = False
+    timeout_conexao: int = 5
 
     @property
     def habilitado(self) -> bool:

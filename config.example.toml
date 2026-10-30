@@ -11,14 +11,16 @@ senha = ""
 
 [sqlserver]
 # Deixe servidor vazio para rodar sem banco: os registros vão para contingencia/ e aparecem no log.
-servidor = ""            # ex.: "SRV-SQL01\\SQLEXPRESS" ou "192.168.100.10,1433"
-banco = ""
+servidor = "TERRA\\SOLO"   # instância nomeada: precisa do serviço SQL Server Browser (UDP 1434)
+banco = "MQTT"
 tabela = "dbo.LeiturasMqtt"
 driver = "ODBC Driver 18 for SQL Server"
-autenticacao_windows = true
-usuario = ""
-senha = ""
-trust_server_certificate = true
+autenticacao_windows = false
+usuario = "mqtt"
+senha = ""                 # prefira digitar na tela e marcar "Lembrar senha" (fica no Windows, não aqui)
+criptografar = "Optional"  # Optional | Mandatory | Strict
+trust_server_certificate = false
+timeout_conexao = 5
 
 [gravacao]
 lote_max = 500           # grava quando juntar esta quantidade...
