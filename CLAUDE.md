@@ -153,7 +153,12 @@ Regras de mapeamento payload → linha:
 ## Build
 
 `.github/workflows/build-windows.yml` roda os testes e gera o `.exe` (PyInstaller via `build_exe.bat`) em
-`windows-latest` a cada push; o `.zip` fica nos artifacts do GitHub Actions por 30 dias.
+`windows-latest` a cada push e publica `MQTT-SQLServer-windows.zip` na página **Releases** (tag `v0.1.<n>`).
+
+**Entrega ao usuário (sempre):** depois de cada push que gera versão, espere o build terminar, baixe o `.zip` da
+release (`https://github.com/marcatao/MQTT/releases/download/v0.1.<n>/MQTT-SQLServer-windows.zip`) para o scratchpad,
+confira que contém `MQTT-SQLServer.exe` e **envie o arquivo na conversa** (SendUserFile, `display: attach`), junto
+com o link da release. O usuário não deve precisar procurar o `.exe` no GitHub.
 
 Sem `[sqlserver]` configurado, o app roda do mesmo jeito: mostra os registros no log e guarda em `contingencia/`
 (JSON Lines) para gravar depois.

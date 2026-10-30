@@ -3,6 +3,9 @@ name: Gerar .exe para Windows
 on:
   push:
     branches: [main, "claude/**"]
+    paths-ignore:  # mudanças só de documentação/agentes não geram versão nova
+      - "**.md"
+      - ".claude/**"
   workflow_dispatch:
 
 permissions:
