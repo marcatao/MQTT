@@ -13,7 +13,7 @@ senha = ""
 # Deixe servidor vazio para rodar sem banco: os registros vão para contingencia/ e aparecem no log.
 servidor = "TERRA\\SOLO"   # instância nomeada: precisa do serviço SQL Server Browser (UDP 1434)
 banco = "MQTT"
-tabela = "dbo.LeiturasMqtt"
+tabela = "dbo.IOT001"
 driver = "ODBC Driver 18 for SQL Server"
 autenticacao_windows = false
 usuario = "mqtt"

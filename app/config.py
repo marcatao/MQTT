@@ -28,7 +28,7 @@ class MqttConfig:
 class SqlServerConfig:
     servidor: str = "TERRA\\SOLO"
     banco: str = "MQTT"
-    tabela: str = "dbo.LeiturasMqtt"
+    tabela: str = "dbo.IOT001"
     driver: str = "ODBC Driver 18 for SQL Server"
     autenticacao_windows: bool = False
     usuario: str = "mqtt"

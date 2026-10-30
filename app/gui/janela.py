@@ -1,0 +1,727 @@
+"""Janela principal: seções "Broker MQTT" e "Banco de dados", status, contadores e caixa de logs.
+
+A janela não sabe nada de MQTT nem de SQL: recebe um objeto que segue o contrato de `app/bridge.py`
+(Signals `status_alterado`, `log`, `contadores`, `teste_sql_concluido`; métodos `definir_sql`, `testar_sql`,
+`conectar`, `desconectar`, `encerrar`).
+"""
+from __future__ import annotations
+
+import dataclasses
+import re
+from datetime import datetime
+from typing import Any
+
+from PySide6.QtCore import QSettings, QTimer, Qt
+from PySide6.QtGui import QCloseEvent, QGuiApplication, QKeySequence, QShortcut
+from PySide6.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QGridLayout,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QPushButton,
+    QScrollArea,
+    QSizePolicy,
+    QSpinBox,
+    QVBoxLayout,
+    QWidget,
+)
+
+from app.config import Config, SqlServerConfig
+
+from . import estilo
+from .credenciais import CofreSenhas
+from .recursos import icone_app, icone_olho, pixmap_app
+from .widgets import (
+    Cartao,
+    CartaoContador,
+    IndicadorStatus,
+    PainelLogs,
+    ResultadoTeste,
+    SeletorQoS,
+    SeletorSegmentado,
+    repolir,
+)
+
+TITULO = "MQTT → SQL Server"
+ORGANIZACAO = "Alumbra"
+APLICACAO = "MQTT SQL Server"
+
+_HOST = re.compile(r"^[A-Za-z0-9._\-:\[\]]+$")
+ESPERA_CANCELAR_MS = 3000
+TEMPO_ENCERRAR_S = 8.0  # a última gravação pode levar até timeout_conexao (5 s)
+ESPERA_DEFINIR_SQL_MS = 600
+
+CRIPTOGRAFIA = [
+    ("Optional", "Opcional", "Criptografa se o servidor oferecer (Encrypt=Optional)."),
+    ("Mandatory", "Obrigatório", "Exige criptografia TLS (Encrypt=Mandatory)."),
+    ("Strict", "Estrito", "TDS 8.0 com TLS estrito (Encrypt=Strict, SQL Server 2022+)."),
+]
+AUTENTICACAO = [
+    (False, "SQL Server", "Usuário e senha do próprio SQL Server."),
+    (True, "Windows", "Usa o usuário do Windows que está rodando o app (sem senha)."),
+]
+
+
+def configuracoes_padrao() -> QSettings:
+    return QSettings(ORGANIZACAO, APLICACAO)
+
+
+def validar_broker(texto: str) -> str | None:
+    if not texto:
+        return "Informe o endereço do broker (ex.: 192.168.0.10)."
+    if not _HOST.match(texto):
+        return "Broker inválido: use só o nome ou IP, sem espaços nem “mqtt://”."
+    return None
+
+
+def validar_topico(texto: str) -> str | None:
+    if not texto:
+        return "Informe o tópico (ex.: fabrica/+/sensores ou NOVUS/#)."
+    niveis = texto.split("/")
+    for i, nivel in enumerate(niveis):
+        if "#" in nivel and (nivel != "#" or i != len(niveis) - 1):
+            return "Tópico inválido: “#” só pode aparecer sozinho no último nível (ex.: NOVUS/#)."
+        if "+" in nivel and nivel != "+":
+            return "Tópico inválido: “+” deve ocupar um nível inteiro (ex.: fabrica/+/sensores)."
+    if "\x00" in texto or len(texto.encode()) > 65535:
+        return "Tópico inválido."
+    return None
+
+
+def _int(valor: Any, padrao: int) -> int:
+    try:
+        return int(valor)
+    except (TypeError, ValueError):
+        return padrao
+
+
+def _bool(valor: Any, padrao: bool) -> bool:
+    if valor is None:
+        return padrao
+    if isinstance(valor, str):
+        return valor.strip().lower() in ("1", "true", "sim", "yes")
+    return bool(valor)
+
+
+class BotaoPrincipal(QPushButton):
+    def __init__(self, texto: str, parent: QWidget | None = None):
+        super().__init__(texto, parent)
+        self.setObjectName("botaoPrincipal")
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+
+def _rotulo(texto: str, buddy: QWidget, parent: QWidget) -> QLabel:
+    rot = QLabel(texto.upper(), parent)
+    rot.setObjectName("rotuloCampo")
+    rot.setBuddy(buddy)
+    return rot
+
+
+def _cabecalho_cartao(cartao: Cartao, titulo: str, descricao: str) -> None:
+    t = QLabel(titulo, cartao)
+    t.setObjectName("tituloCartao")
+    t.setToolTip(descricao)
+    cartao.corpo.addWidget(t)
+    cartao.corpo.addSpacing(6)
+
+
+class JanelaPrincipal(QMainWindow):
+    def __init__(
+        self,
+        bridge,
+        config: Config,
+        settings: QSettings | None = None,
+        tema: str | None = None,
+        cofre: CofreSenhas | None = None,
+        parent: QWidget | None = None,
+    ):
+        """`tema`: None segue o sistema; "claro" ou "escuro" força um deles.
+        `cofre`: onde guardar a senha do SQL (padrão: keyring); testes passam um falso."""
+        super().__init__(parent)
+        self.bridge = bridge
+        self.config = config
+        self.settings = settings if settings is not None else configuracoes_padrao()
+        self.cofre = cofre if cofre is not None else CofreSenhas()
+        self._tema_forcado = tema
+        self._paleta = estilo.CLARA
+        self._estado = "desconectado"
+        self._encerrado = False
+        self._testando = False
+        self._senha_no_cofre: tuple[str, str] | None = None  # (usuario, senha) já gravados no cofre
+
+        self.setWindowTitle(TITULO)
+        self.setWindowIcon(icone_app())
+        self.setMinimumSize(980, 640)
+        self.resize(1200, 860)
+
+        self._montar()
+        self._carregar_valores()
+        self._ligar_bridge()
+        self._aplicar_tema()
+        if tema is None:
+            try:
+                QGuiApplication.styleHints().colorSchemeChanged.connect(lambda *_: self._aplicar_tema())
+            except AttributeError:
+                pass
+        self._atualizar_autenticacao()
+        self._aplicar_estado("desconectado", "")
+        self.bridge.definir_sql(self.sql_config())
+
+    # ================================================================== montagem
+    def _montar(self) -> None:
+        raiz = QWidget(self)
+        raiz.setObjectName("raiz")
+        self.setCentralWidget(raiz)
+        corpo = QVBoxLayout(raiz)
+        corpo.setContentsMargins(24, 20, 24, 24)
+        corpo.setSpacing(16)
+        corpo.addLayout(self._montar_cabecalho(raiz))
+
+        colunas = QHBoxLayout()
+        colunas.setSpacing(16)
+
+        # Coluna esquerda (configuração), com rolagem se a tela for baixa.
+        lateral = QScrollArea(raiz)
+        lateral.setObjectName("colunaLateral")
+        lateral.setWidgetResizable(True)
+        lateral.setFrameShape(QScrollArea.Shape.NoFrame)
+        lateral.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        lateral.setFixedWidth(400)
+        conteudo = QWidget()
+        conteudo.setObjectName("colunaLateralConteudo")
+        col = QVBoxLayout(conteudo)
+        col.setContentsMargins(0, 0, 4, 0)
+        col.setSpacing(16)
+        col.addWidget(self._montar_mqtt(conteudo))
+        col.addWidget(self._montar_sql(conteudo))
+        col.addStretch(1)
+        lateral.setWidget(conteudo)
+        self._lateral = lateral
+
+        # Coluna direita (acompanhamento).
+        direita = QVBoxLayout()
+        direita.setSpacing(16)
+        linha = QHBoxLayout()
+        linha.setSpacing(16)
+        self.contador_recebidas = CartaoContador("Recebidas", "mensagens MQTT", "recebidas", raiz)
+        self.contador_gravadas = CartaoContador("Gravadas", "registros no SQL Server", "gravadas", raiz)
+        self.contador_erros = CartaoContador("Erros", "leitura ou gravação", "erros", raiz)
+        for c in (self.contador_recebidas, self.contador_gravadas, self.contador_erros):
+            c.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            linha.addWidget(c)
+        direita.addLayout(linha)
+        self.logs = PainelLogs(parent=raiz)
+        direita.addWidget(self.logs, 1)
+
+        colunas.addWidget(lateral)
+        colunas.addLayout(direita, 1)
+        corpo.addLayout(colunas, 1)
+
+        self._montar_teclado()
+
+        self._timer_cancelar = QTimer(self)
+        self._timer_cancelar.setSingleShot(True)
+        self._timer_cancelar.setInterval(ESPERA_CANCELAR_MS)
+        self._timer_cancelar.timeout.connect(self._permitir_cancelar)
+
+        self._timer_sql = QTimer(self)
+        self._timer_sql.setSingleShot(True)
+        self._timer_sql.setInterval(ESPERA_DEFINIR_SQL_MS)
+        self._timer_sql.timeout.connect(self._enviar_sql)
+
+        self._timer_teste = QTimer(self)  # rede de segurança se a resposta do teste nunca chegar
+        self._timer_teste.setSingleShot(True)
+        self._timer_teste.timeout.connect(self._teste_sem_resposta)
+
+    def _montar_cabecalho(self, raiz: QWidget) -> QHBoxLayout:
+        cab = QHBoxLayout()
+        cab.setSpacing(12)
+        self._logo = QLabel(raiz)
+        self._logo.setFixedSize(40, 40)
+        self._logo.setPixmap(pixmap_app(40, self.devicePixelRatioF()))
+        titulos = QVBoxLayout()
+        titulos.setSpacing(0)
+        titulo = QLabel(TITULO, raiz)
+        titulo.setObjectName("titulo")
+        sub = QLabel("Recebe as leituras dos dispositivos via MQTT e grava no SQL Server.", raiz)
+        sub.setObjectName("subtitulo")
+        titulos.addWidget(titulo)
+        titulos.addWidget(sub)
+        self.status = IndicadorStatus(raiz)
+        self.detalhe_status = QLabel(raiz)
+        self.detalhe_status.setObjectName("detalheStatus")
+        self.detalhe_status.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.detalhe_status.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        lado = QVBoxLayout()
+        lado.setSpacing(4)
+        lado.addWidget(self.status, 0, Qt.AlignmentFlag.AlignRight)
+        lado.addWidget(self.detalhe_status, 0, Qt.AlignmentFlag.AlignRight)
+        cab.addWidget(self._logo, 0, Qt.AlignmentFlag.AlignTop)
+        cab.addLayout(titulos, 1)
+        cab.addLayout(lado)
+        return cab
+
+    def _montar_mqtt(self, parent: QWidget) -> Cartao:
+        c = Cartao(parent, margem=20, espaco=6)
+        c.corpo.setContentsMargins(20, 16, 20, 18)
+        _cabecalho_cartao(c, "Broker MQTT", "De onde chegam as leituras dos dispositivos.")
+        g = QGridLayout()
+        g.setHorizontalSpacing(12)
+        g.setVerticalSpacing(6)
+
+        self.campo_broker = QLineEdit(c)
+        self.campo_broker.setPlaceholderText("ex.: 192.168.0.10")
+        self.campo_broker.setToolTip("Nome ou IP do broker MQTT (Mosquitto).")
+        self.campo_broker.setAccessibleName("Broker")
+
+        self.campo_porta = QSpinBox(c)
+        self.campo_porta.setRange(1, 65535)
+        self.campo_porta.setGroupSeparatorShown(False)
+        self.campo_porta.setToolTip("Porta TCP do broker (padrão 1883; 8883 com TLS).")
+        self.campo_porta.setAccessibleName("Porta")
+        self.campo_porta.setFixedWidth(116)
+        self.campo_porta.lineEdit().setTextMargins(9, 0, 0, 0)
+
+        self.campo_topico = QLineEdit(c)
+        self.campo_topico.setPlaceholderText("ex.: fabrica/+/sensores")
+        self.campo_topico.setToolTip(
+            "Tópico a assinar. Curingas: “+” vale um nível, “#” vale todos os níveis abaixo (só no fim)."
+        )
+        self.campo_topico.setAccessibleName("Tópico")
+
+        self.seletor_qos = SeletorQoS(c)
+        self.seletor_qos.setFixedWidth(116)
+
+        self.botao_conectar = BotaoPrincipal("Conectar", c)
+        self.botao_conectar.clicked.connect(self._alternar)
+
+        g.addWidget(_rotulo("Broker", self.campo_broker, c), 0, 0)
+        g.addWidget(_rotulo("Porta", self.campo_porta, c), 0, 1)
+        g.addWidget(self.campo_broker, 1, 0)
+        g.addWidget(self.campo_porta, 1, 1)
+        g.addItem(_espaco(6), 2, 0)
+        g.addWidget(_rotulo("Tópico", self.campo_topico, c), 3, 0)
+        g.addWidget(_rotulo("QoS", self.seletor_qos, c), 3, 1)
+        g.addWidget(self.campo_topico, 4, 0)
+        g.addWidget(self.seletor_qos, 4, 1)
+        g.addItem(_espaco(10), 5, 0)
+        g.addWidget(self.botao_conectar, 6, 0, 1, 2)
+        g.setColumnStretch(0, 1)
+        c.corpo.addLayout(g)
+
+        self.erro_validacao = QLabel(c)
+        self.erro_validacao.setObjectName("erroValidacao")
+        self.erro_validacao.setWordWrap(True)
+        self.erro_validacao.hide()
+        c.corpo.addWidget(self.erro_validacao)
+
+        for campo in (self.campo_broker, self.campo_topico):
+            campo.returnPressed.connect(self._enter)
+            campo.textEdited.connect(self._limpar_validacao)
+        self.campo_porta.lineEdit().returnPressed.connect(self._enter)
+        return c
+
+    def _montar_sql(self, parent: QWidget) -> Cartao:
+        c = Cartao(parent, margem=20, espaco=6)
+        c.corpo.setContentsMargins(20, 16, 20, 18)
+        _cabecalho_cartao(c, "Banco de dados", "SQL Server onde as leituras são gravadas.")
+        g = QGridLayout()
+        g.setHorizontalSpacing(12)
+        g.setVerticalSpacing(6)
+
+        self.campo_servidor = QLineEdit(c)
+        self.campo_servidor.setPlaceholderText("ex.: SERVIDOR\\INSTANCIA")
+        self.campo_servidor.setToolTip("Servidor e instância (ex.: TERRA\\SOLO) ou “host,porta”.")
+        self.campo_servidor.setAccessibleName("Servidor")
+
+        self.campo_banco = QLineEdit(c)
+        self.campo_banco.setPlaceholderText("ex.: MQTT")
+        self.campo_banco.setToolTip("Nome do banco de dados.")
+        self.campo_banco.setAccessibleName("Banco")
+
+        self.seletor_autenticacao = SeletorSegmentado(AUTENTICACAO, False, c, largura_min=80, nome="Autenticação")
+        self.seletor_autenticacao.alterado.connect(lambda *_: self._atualizar_autenticacao())
+
+        self.campo_usuario = QLineEdit(c)
+        self.campo_usuario.setPlaceholderText("login do SQL")
+        self.campo_usuario.setToolTip("Login do SQL Server.")
+        self.campo_usuario.setAccessibleName("Usuário")
+
+        self.campo_senha = QLineEdit(c)
+        self.campo_senha.setEchoMode(QLineEdit.EchoMode.Password)
+        self.campo_senha.setPlaceholderText("senha")
+        self.campo_senha.setToolTip("Senha do login. Não é gravada em arquivo; veja “Lembrar senha”.")
+        self.campo_senha.setAccessibleName("Senha")
+        self._acao_olho = self.campo_senha.addAction(icone_olho(False, "#5B6576"), QLineEdit.ActionPosition.TrailingPosition)
+        self._acao_olho.setToolTip("Mostrar senha")
+        self._acao_olho.triggered.connect(self._alternar_senha_visivel)
+
+        self.opcao_lembrar = QCheckBox("Lembrar senha neste computador", c)
+        self.opcao_lembrar.setToolTip("Guarda a senha no Gerenciador de Credenciais do Windows.")
+
+        self.seletor_cripto = SeletorSegmentado(CRIPTOGRAFIA, "Optional", c, largura_min=80, nome="Criptografar")
+        self.opcao_confiar = QCheckBox("Confiar no certificado do servidor", c)
+        self.opcao_confiar.setToolTip(
+            "Aceita certificado autoassinado (TrustServerCertificate=yes). Use só em rede interna confiável."
+        )
+
+        self.botao_testar = QPushButton("Testar conexão", c)
+        self.botao_testar.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.botao_testar.setToolTip("Abre e fecha uma conexão com o SQL Server usando os dados acima.")
+        self.botao_testar.clicked.connect(self._testar_sql)
+        self.resultado_sql = ResultadoTeste(c)
+
+        r = 0
+        g.addWidget(_rotulo("Servidor", self.campo_servidor, c), r, 0)
+        g.addWidget(_rotulo("Banco", self.campo_banco, c), r, 1)
+        g.addWidget(self.campo_servidor, r + 1, 0)
+        g.addWidget(self.campo_banco, r + 1, 1)
+        g.addItem(_espaco(6), r + 2, 0)
+        r = 3
+        g.addWidget(_rotulo("Autenticação", self.seletor_autenticacao, c), r, 0, 1, 2)
+        g.addWidget(self.seletor_autenticacao, r + 1, 0, 1, 2)
+        g.addItem(_espaco(6), r + 2, 0)
+        r = 6
+        g.addWidget(_rotulo("Usuário", self.campo_usuario, c), r, 0)
+        g.addWidget(_rotulo("Senha", self.campo_senha, c), r, 1)
+        g.addWidget(self.campo_usuario, r + 1, 0)
+        g.addWidget(self.campo_senha, r + 1, 1)
+        g.addWidget(self.opcao_lembrar, r + 2, 0, 1, 2)
+        g.addItem(_espaco(6), r + 3, 0)
+        r = 10
+        g.addWidget(_rotulo("Criptografar", self.seletor_cripto, c), r, 0, 1, 2)
+        g.addWidget(self.seletor_cripto, r + 1, 0, 1, 2)
+        g.addWidget(self.opcao_confiar, r + 2, 0, 1, 2)
+        g.addItem(_espaco(10), r + 3, 0)
+        g.addWidget(self.botao_testar, r + 4, 0, 1, 2)
+        g.setColumnStretch(0, 1)
+        g.setColumnStretch(1, 1)
+        c.corpo.addLayout(g)
+        c.corpo.addWidget(self.resultado_sql)
+
+        for campo in (self.campo_servidor, self.campo_banco, self.campo_usuario, self.campo_senha):
+            campo.textEdited.connect(self._sql_alterado)
+        for opcao in (self.opcao_lembrar, self.opcao_confiar):
+            opcao.toggled.connect(self._sql_alterado)
+        self.seletor_autenticacao.alterado.connect(self._sql_alterado)
+        self.seletor_cripto.alterado.connect(self._sql_alterado)
+        return c
+
+    def _montar_teclado(self) -> None:
+        ordem = [self.campo_broker, self.campo_porta, self.campo_topico, *self.seletor_qos.botoes,
+                 self.botao_conectar, self.campo_servidor, self.campo_banco, *self.seletor_autenticacao.botoes,
+                 self.campo_usuario, self.campo_senha, self.opcao_lembrar, *self.seletor_cripto.botoes,
+                 self.opcao_confiar, self.botao_testar, self.logs.botao_limpar, self.logs.botao_copiar,
+                 self.logs.botao_salvar, self.logs.caixa]
+        for a, b in zip(ordem, ordem[1:]):
+            QWidget.setTabOrder(a, b)
+        QShortcut(QKeySequence("Ctrl+L"), self, activated=self.logs.limpar)
+        QShortcut(QKeySequence.StandardKey.Save, self, activated=self.logs.salvar_dialogo)
+
+    # ================================================================== valores
+    def _carregar_valores(self) -> None:
+        m = self.config.mqtt
+        s = self.settings
+        self.campo_broker.setText(str(s.value("mqtt/broker", m.broker) or m.broker))
+        self.campo_porta.setValue(_int(s.value("mqtt/porta", m.porta), m.porta))
+        self.campo_topico.setText(str(s.value("mqtt/topico", m.topico) or m.topico))
+        self.seletor_qos.definir(_int(s.value("mqtt/qos", m.qos), m.qos))
+
+        q = self.config.sqlserver
+        self.campo_servidor.setText(str(s.value("sql/servidor", q.servidor) or ""))
+        self.campo_banco.setText(str(s.value("sql/banco", q.banco) or ""))
+        self.seletor_autenticacao.definir(_bool(s.value("sql/autenticacao_windows"), q.autenticacao_windows))
+        self.campo_usuario.setText(str(s.value("sql/usuario", q.usuario) or ""))
+        self.seletor_cripto.definir(str(s.value("sql/criptografar", q.criptografar) or q.criptografar))
+        self.opcao_confiar.setChecked(_bool(s.value("sql/trust_server_certificate"), q.trust_server_certificate))
+        lembrar = _bool(s.value("sql/lembrar_senha"), False)
+        self._lembrava = lembrar
+        self.opcao_lembrar.setChecked(lembrar)
+        # Senha: config.toml local (se o usuário pôs lá) ou cofre do sistema. Nunca QSettings.
+        senha = q.senha or ""
+        usuario = self.campo_usuario.text().strip()
+        if lembrar and usuario:
+            salva, erro = self.cofre.ler(usuario)
+            if erro:
+                self._log_local("AVISO", f"Não foi possível ler a senha salva ({erro}). Digite a senha.")
+            elif salva is not None:
+                senha = salva
+                self._senha_no_cofre = (usuario, salva)
+        self.campo_senha.setText(senha)
+
+        geo = s.value("janela/geometria")
+        if geo is not None:
+            self.restoreGeometry(geo)
+
+    def _salvar_valores(self) -> None:
+        s = self.settings
+        s.setValue("mqtt/broker", self.campo_broker.text().strip())
+        s.setValue("mqtt/porta", self.campo_porta.value())
+        s.setValue("mqtt/topico", self.campo_topico.text().strip())
+        s.setValue("mqtt/qos", self.seletor_qos.valor())
+        s.setValue("sql/servidor", self.campo_servidor.text().strip())
+        s.setValue("sql/banco", self.campo_banco.text().strip())
+        s.setValue("sql/autenticacao_windows", bool(self.seletor_autenticacao.valor()))
+        s.setValue("sql/usuario", self.campo_usuario.text().strip())
+        s.setValue("sql/criptografar", self.seletor_cripto.valor())
+        s.setValue("sql/trust_server_certificate", self.opcao_confiar.isChecked())
+        s.setValue("sql/lembrar_senha", self.opcao_lembrar.isChecked())
+        s.remove("sql/senha")  # garantia: a senha nunca fica no QSettings
+        s.setValue("janela/geometria", self.saveGeometry())
+        s.sync()
+        self._sincronizar_cofre()
+
+    def _sincronizar_cofre(self) -> None:
+        usuario = self.campo_usuario.text().strip()
+        senha = self.campo_senha.text()
+        windows = bool(self.seletor_autenticacao.valor())
+        anterior = self._senha_no_cofre
+        if self.opcao_lembrar.isChecked() and not windows and usuario and senha:
+            if anterior == (usuario, senha):
+                return
+            if anterior and anterior[0] != usuario:
+                self.cofre.apagar(anterior[0])
+            erro = self.cofre.salvar(usuario, senha)
+            if erro:
+                self._log_local("AVISO", f"Não foi possível guardar a senha no cofre do sistema ({erro}).")
+                self._senha_no_cofre = None
+            else:
+                self._senha_no_cofre = (usuario, senha)
+        elif not self.opcao_lembrar.isChecked() and (anterior or self._lembrava):
+            alvos = {u for u in (usuario, anterior[0] if anterior else "") if u}
+            for alvo in alvos:
+                erro = self.cofre.apagar(alvo)
+                if erro:
+                    self._log_local("AVISO", f"Não foi possível apagar a senha do cofre do sistema ({erro}).")
+            self._senha_no_cofre = None
+        self._lembrava = self.opcao_lembrar.isChecked()
+
+    def sql_config(self) -> SqlServerConfig:
+        """SqlServerConfig com os campos da tela (tabela, driver e timeout vêm do config)."""
+        windows = bool(self.seletor_autenticacao.valor())
+        return dataclasses.replace(
+            self.config.sqlserver,
+            servidor=self.campo_servidor.text().strip(),
+            banco=self.campo_banco.text().strip(),
+            autenticacao_windows=windows,
+            usuario="" if windows else self.campo_usuario.text().strip(),
+            senha="" if windows else self.campo_senha.text(),
+            criptografar=str(self.seletor_cripto.valor()),
+            trust_server_certificate=self.opcao_confiar.isChecked(),
+        )
+
+    def _ligar_bridge(self) -> None:
+        self.bridge.status_alterado.connect(self._ao_status)
+        self.bridge.log.connect(self.logs.adicionar)
+        self.bridge.contadores.connect(self._ao_contadores)
+        self.bridge.teste_sql_concluido.connect(self._ao_teste_sql)
+
+    def _log_local(self, nivel: str, mensagem: str) -> None:
+        self.logs.adicionar(datetime.now().strftime("%H:%M:%S"), nivel, mensagem)
+
+    # ================================================================== tema
+    def _aplicar_tema(self) -> None:
+        if self._tema_forcado is not None:
+            escuro = self._tema_forcado == "escuro"
+        else:
+            escuro = estilo.sistema_esta_escuro()
+        paleta = estilo.aplicar(QApplication.instance(), escuro)
+        self._paleta = paleta
+        self.logs.definir_paleta(paleta)
+        self._atualizar_icone_olho()
+        self.tema_escuro = escuro
+
+    # ================================================================== MQTT
+    def _enter(self) -> None:
+        if self._estado in ("desconectado", "erro"):
+            self._alternar()
+
+    def _alternar(self) -> None:
+        if self._estado in ("desconectado", "erro"):
+            self._conectar()
+        else:
+            self.botao_conectar.setEnabled(False)
+            self.botao_conectar.setText("Desconectando…")
+            self.bridge.desconectar()
+
+    def _conectar(self) -> None:
+        broker = self.campo_broker.text().strip()
+        topico = self.campo_topico.text().strip()
+        self.campo_broker.setText(broker)
+        self.campo_topico.setText(topico)
+        for campo, erro in ((self.campo_broker, validar_broker(broker)), (self.campo_topico, validar_topico(topico))):
+            if erro:
+                self._mostrar_validacao(campo, erro)
+                return
+        self._limpar_validacao()
+        porta = self.campo_porta.value()
+        qos = self.seletor_qos.valor()
+        self._salvar_valores()
+        self._enviar_sql()
+        self._aplicar_estado("conectando", f"{broker}:{porta}")
+        self.bridge.conectar(broker, porta, topico, qos)
+
+    def _mostrar_validacao(self, campo: QWidget, mensagem: str) -> None:
+        self._limpar_validacao()
+        campo.setProperty("invalido", True)
+        repolir(campo)
+        self.erro_validacao.setText(mensagem)
+        self.erro_validacao.show()
+        campo.setFocus()
+
+    def _limpar_validacao(self, *_args) -> None:
+        for campo in (self.campo_broker, self.campo_topico):
+            if campo.property("invalido"):
+                campo.setProperty("invalido", False)
+                repolir(campo)
+        self.erro_validacao.hide()
+
+    def _permitir_cancelar(self) -> None:
+        if self._estado == "conectando":
+            self.botao_conectar.setText("Cancelar")
+            self.botao_conectar.setToolTip("Desistir da tentativa de conexão.")
+            self.botao_conectar.setEnabled(True)
+
+    # ================================================================== SQL
+    def _atualizar_autenticacao(self) -> None:
+        sql_auth = not bool(self.seletor_autenticacao.valor())
+        for w in (self.campo_usuario, self.campo_senha, self.opcao_lembrar):
+            w.setEnabled(sql_auth)
+
+    def _atualizar_icone_olho(self) -> None:
+        oculto = self.campo_senha.echoMode() == QLineEdit.EchoMode.Normal
+        self._acao_olho.setIcon(icone_olho(oculto, self._paleta.texto_sec))
+
+    def _alternar_senha_visivel(self) -> None:
+        visivel = self.campo_senha.echoMode() == QLineEdit.EchoMode.Password
+        self.campo_senha.setEchoMode(QLineEdit.EchoMode.Normal if visivel else QLineEdit.EchoMode.Password)
+        self._acao_olho.setToolTip("Ocultar senha" if visivel else "Mostrar senha")
+        self._atualizar_icone_olho()
+
+    def _sql_alterado(self, *_args) -> None:
+        if not self._testando:
+            self.resultado_sql.ocultar()
+        self._timer_sql.start()
+
+    def _enviar_sql(self) -> None:
+        self._timer_sql.stop()
+        self.bridge.definir_sql(self.sql_config())
+
+    def _validar_sql(self, cfg: SqlServerConfig) -> str | None:
+        if not cfg.servidor:
+            self.campo_servidor.setFocus()
+            return "Informe o servidor (ex.: TERRA\\SOLO)."
+        if not cfg.banco:
+            self.campo_banco.setFocus()
+            return "Informe o banco de dados."
+        if not cfg.autenticacao_windows and not cfg.usuario:
+            self.campo_usuario.setFocus()
+            return "Informe o usuário do SQL Server (ou escolha autenticação do Windows)."
+        return None
+
+    def _testar_sql(self) -> None:
+        if self._testando:
+            return
+        cfg = self.sql_config()
+        erro = self._validar_sql(cfg)
+        if erro:
+            self.resultado_sql.mostrar("falha", erro)
+            return
+        self._salvar_valores()
+        self._enviar_sql()
+        self._testando = True
+        self.botao_testar.setEnabled(False)
+        self.botao_testar.setText("Testando…")
+        self.resultado_sql.mostrar("testando", f"Conectando a {cfg.servidor} / {cfg.banco}…")
+        self._log_local("INFO", f"Testando conexão com o SQL Server {cfg.servidor} (banco {cfg.banco})…")
+        self._timer_teste.start((max(1, int(cfg.timeout_conexao)) + 30) * 1000)
+        self.bridge.testar_sql(cfg)
+
+    def _ao_teste_sql(self, sucesso: bool, mensagem: str) -> None:
+        self._timer_teste.stop()
+        self._testando = False
+        self.botao_testar.setEnabled(True)
+        self.botao_testar.setText("Testar conexão")
+        mensagem = mensagem.strip() or ("Conexão bem-sucedida." if sucesso else "Falha na conexão.")
+        self.resultado_sql.mostrar("ok" if sucesso else "falha", mensagem)
+        QTimer.singleShot(0, lambda: self._lateral.ensureWidgetVisible(self.resultado_sql, 0, 16))
+        for i, linha in enumerate(l for l in mensagem.splitlines() if l.strip()):
+            self._log_local("INFO" if sucesso else "ERRO", ("SQL Server: " if i == 0 else "") + linha)
+
+    def _teste_sem_resposta(self) -> None:
+        if self._testando:
+            self._ao_teste_sql(False, "O teste não respondeu a tempo. Verifique o servidor e tente de novo.")
+
+    # ================================================================== sinais do bridge
+    def _ao_status(self, estado: str, detalhe: str) -> None:
+        self._aplicar_estado(estado, detalhe)
+
+    def _ao_contadores(self, recebidas: int, gravadas: int, erros: int) -> None:
+        self.contador_recebidas.definir(recebidas)
+        self.contador_gravadas.definir(gravadas)
+        self.contador_erros.definir(erros)
+
+    def _aplicar_estado(self, estado: str, detalhe: str) -> None:
+        if estado not in IndicadorStatus.TEXTOS:
+            estado = "erro"
+        anterior = self._estado
+        self._estado = estado
+        self.status.definir(estado)
+        self.detalhe_status.setText(self.detalhe_status.fontMetrics().elidedText(
+            detalhe, Qt.TextElideMode.ElideMiddle, 360))
+        self.detalhe_status.setToolTip(detalhe)
+
+        livre = estado in ("desconectado", "erro")
+        for w in (self.campo_broker, self.campo_porta, self.campo_topico, self.seletor_qos):
+            w.setEnabled(livre)
+
+        b = self.botao_conectar
+        if estado == "conectado":
+            b.setText("Desconectar")
+            b.setEnabled(True)
+            b.setProperty("perigo", True)
+            b.setToolTip("Encerrar a conexão com o broker.")
+        elif estado == "conectando":
+            b.setProperty("perigo", True)
+            if anterior != "conectando":
+                b.setText("Conectando…")
+                b.setToolTip("")
+                b.setEnabled(False)
+                self._timer_cancelar.start()
+        else:
+            b.setText("Conectar")
+            b.setEnabled(True)
+            b.setProperty("perigo", False)
+            b.setToolTip("Conectar ao broker e assinar o tópico (Enter).")
+        if estado != "conectando":
+            self._timer_cancelar.stop()
+        repolir(b)
+
+    # ================================================================== fechamento
+    def closeEvent(self, evento: QCloseEvent) -> None:
+        if not self._encerrado:
+            self._encerrado = True
+            for t in (self._timer_cancelar, self._timer_sql, self._timer_teste):
+                t.stop()
+            self._salvar_valores()
+            self.detalhe_status.setText("Encerrando…")
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            QApplication.processEvents()
+            try:
+                self.bridge.encerrar(timeout=TEMPO_ENCERRAR_S)
+            finally:
+                QApplication.restoreOverrideCursor()
+        super().closeEvent(evento)
+
+    @property
+    def estado(self) -> str:
+        return self._estado
+
+
+def _espaco(altura: int):
+    from PySide6.QtWidgets import QSpacerItem
+
+    return QSpacerItem(0, altura, QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)

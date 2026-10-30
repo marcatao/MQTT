@@ -107,23 +107,38 @@ A tela tem uma seção **Banco de dados** com: Servidor, Autenticação (Windows
 Lembrar senha, Banco, Criptografar (Opcional / Obrigatório / Estrito), Confiar no certificado, e o botão
 **Testar conexão**.
 
-## Tabela no SQL Server (proposta, a confirmar com o usuário)
+## Tabela no SQL Server: `dbo.IOT001` (definida pelo usuário, já existe no banco `MQTT`)
 
-Formato "longo": uma linha por campo medido. Aceita qualquer JSON ou tabela vinda dos dispositivos sem mudar o
-esquema quando aparece um canal novo.
+**Formato largo: uma linha por leitura** (uma mensagem JSON com uma leitura = uma linha; uma lista de leituras =
+várias linhas). O app não cria nem altera esta tabela; só insere.
 
 ```sql
-CREATE TABLE dbo.LeiturasMqtt (
-    Id              BIGINT IDENTITY(1,1) PRIMARY KEY,
-    RecebidoEm      DATETIME2(3)   NOT NULL,  -- quando o app recebeu a mensagem (hora local)
-    Topico          NVARCHAR(255)  NOT NULL,
-    Dispositivo     NVARCHAR(128)  NULL,
-    DataHoraLeitura DATETIME2(3)   NULL,      -- carimbo de tempo vindo no payload, se houver
-    Campo           NVARCHAR(128)  NOT NULL,  -- nome do canal/campo (JSON aninhado vira "a.b.c")
-    ValorNumerico   FLOAT          NULL,
-    ValorTexto      NVARCHAR(4000) NULL
+CREATE TABLE [dbo].[IOT001](
+    [id]            bigint IDENTITY(1,1) NOT NULL,   -- PK_IOT001; nunca inserir
+    [pid]           bigint NOT NULL,
+    [device_id]     varchar(100) NOT NULL,
+    [ts_unix]       bigint NOT NULL,                 -- epoch em segundos (UTC)
+    [data_hora_utc] AS (dateadd(second, CONVERT(int, ts_unix), CONVERT(datetime2(0), '1970-01-01'))),  -- calculada; nunca inserir
+    [chd1_value]    decimal(18, 4) NULL,
+    [chd2_value]    decimal(18, 4) NULL,
+    [chd3_value]    decimal(18, 4) NULL,
+    [payload_json]  nvarchar(max) NULL,              -- payload original, como chegou
+    [recebido_em]   datetime2(3) NOT NULL            -- DEFAULT sysutcdatetime(): UTC
 );
 ```
+
+Regras de mapeamento payload → linha:
+
+- Colunas inseridas: `pid, device_id, ts_unix, chd1_value, chd2_value, chd3_value, payload_json, recebido_em`.
+- `recebido_em` em **UTC** (mesmo critério do DEFAULT da tabela), hora em que o app recebeu a mensagem.
+- `device_id` é `varchar` (não Unicode): enviar como `SQL_VARCHAR`; se faltar no payload, usar o dispositivo deduzido do
+  tópico (nível após o prefixo da assinatura).
+- `ts_unix` em segundos: converter de ms/µs/ISO 8601 se vier assim. `pid`, `device_id` e `ts_unix` são `NOT NULL`:
+  linha sem algum deles não é inventada; vai para a contingência com o motivo no log.
+- `chdN_value`: aceitar `chdN_value`, `chdN.value` (JSON aninhado) ou `chdN`; `decimal(18,4)` — arredondar para 4
+  casas, valor fora da faixa vai como NULL com aviso.
+- Formato exato do payload NOVUS ainda **a confirmar com um exemplo real**; o mapeamento fica configurável em
+  `config.toml`.
 
 Sem `[sqlserver]` configurado, o app roda do mesmo jeito: mostra os registros no log e guarda em `contingencia/`
 (JSON Lines) para gravar depois.
@@ -156,7 +171,7 @@ def conectar(sql: SqlServerConfig) -> "pyodbc.Connection": ...  # importa pyodbc
 def testar_conexao(sql: SqlServerConfig) -> tuple[bool, str]: ...  # bloqueante; o bridge roda em thread
 def traduzir_erro(exc: Exception) -> str: ...
 def validar_tabela(nome: str) -> tuple[str, str]: ...      # (schema, tabela); ValueError se inválido
-def tabela_citada(nome: str) -> str: ...                   # "[dbo].[LeiturasMqtt]"
+def tabela_citada(nome: str) -> str: ...                   # "[dbo].[IOT001]"
 def normalizar_criptografia(valor: str) -> str: ...        # aceita também Opcional/Obrigatório/Estrito
 class DriverOdbcAusente(RuntimeError): ...
 ```
