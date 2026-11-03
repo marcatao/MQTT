@@ -1,15 +1,19 @@
 """Janela principal: seções "Broker MQTT" e "Banco de dados", status, contadores e caixa de logs.
 
 A janela não sabe nada de MQTT nem de SQL: recebe um objeto que segue o contrato de `app/bridge.py`
-(Signals `status_alterado`, `log`, `contadores`, `teste_sql_concluido`; métodos `definir_sql`, `testar_sql`,
-`conectar`, `desconectar`, `encerrar`).
+(Signals `status_alterado`, `log`, `contadores`, `teste_sql_concluido`, `proxima_gravacao`, `ultima_gravacao_ok`,
+`ultima_leitura`; métodos `definir_sql`, `testar_sql`, `conectar`, `desconectar`, `encerrar`).
+
+Operação contínua (CLAUDE.md): contagem até a próxima gravação e última gravação no topo da caixa ATIVIDADE,
+limpeza da caixa à meia-noite (hora local) e o vigia, que reinicia o programa se faltar leitura ou gravação.
 """
 from __future__ import annotations
 
 import dataclasses
 import re
-from datetime import datetime
-from typing import Any
+import time
+from datetime import date, datetime
+from typing import Any, Callable
 
 from PySide6.QtCore import QSettings, QTimer, Qt
 from PySide6.QtGui import QCloseEvent, QGuiApplication, QKeySequence, QShortcut
@@ -31,7 +35,8 @@ from PySide6.QtWidgets import (
 
 from app.config import Config, SqlServerConfig
 
-from . import estilo
+from . import estilo, tempo
+from . import vigia as vigia_mod
 from .credenciais import CofreSenhas
 from .recursos import icone_app, icone_olho, pixmap_app
 from .widgets import (
@@ -53,6 +58,8 @@ _HOST = re.compile(r"^[A-Za-z0-9._\-:\[\]]+$")
 ESPERA_CANCELAR_MS = 3000
 TEMPO_ENCERRAR_S = 8.0  # a última gravação pode levar até timeout_conexao (5 s)
 ESPERA_DEFINIR_SQL_MS = 600
+TIQUE_MS = 1000  # contagem regressiva, virada do dia e vigia
+AVISO_LEMBRAR_SENHA = "Para o reinício automático continuar gravando no banco, marque Lembrar senha."
 
 CRIPTOGRAFIA = [
     ("Optional", "Opcional", "Criptografa se o servidor oferecer (Encrypt=Optional)."),
@@ -137,9 +144,13 @@ class JanelaPrincipal(QMainWindow):
         tema: str | None = None,
         cofre: CofreSenhas | None = None,
         parent: QWidget | None = None,
+        relogio: Callable[[], float] | None = None,
+        iniciar_processo: Callable[[vigia_mod.Comando], bool] | None = None,
+        sair: Callable[[], None] | None = None,
     ):
         """`tema`: None segue o sistema; "claro" ou "escuro" força um deles.
-        `cofre`: onde guardar a senha do SQL (padrão: keyring); testes passam um falso."""
+        `cofre`: onde guardar a senha do SQL (padrão: keyring); testes passam um falso.
+        `relogio` (epoch em s), `iniciar_processo` e `sair`: injetáveis para testar o vigia e o reinício."""
         super().__init__(parent)
         self.bridge = bridge
         self.config = config
@@ -151,6 +162,15 @@ class JanelaPrincipal(QMainWindow):
         self._encerrado = False
         self._testando = False
         self._senha_no_cofre: tuple[str, str] | None = None  # (usuario, senha) já gravados no cofre
+        self._relogio = relogio or time.time
+        self._iniciar_processo = iniciar_processo or vigia_mod.iniciar_processo
+        self._sair = sair or vigia_mod.sair_do_app
+        self._proxima: float | None = None       # epoch do próximo ciclo de gravação
+        self._ultima_gravacao: str | None = None  # ISO local da última gravação ok
+        self._dia_atividade: date = date.fromtimestamp(self._relogio())
+        minutos = getattr(getattr(config, "vigia", None), "minutos", 10)
+        self.vigia = vigia_mod.Vigia(minutos, self._reiniciar, sql_configurado=self._sql_configurado,
+                                     relogio=self._relogio)
 
         self.setWindowTitle(TITULO)
         self.setWindowIcon(icone_app())
@@ -168,6 +188,9 @@ class JanelaPrincipal(QMainWindow):
                 pass
         self._atualizar_autenticacao()
         self._aplicar_estado("desconectado", "")
+        self._atualizar_tempo()
+        self._agendar_meia_noite()
+        self._timer_tique.start()
         self.bridge.definir_sql(self.sql_config())
 
     # ================================================================== montagem
@@ -235,6 +258,17 @@ class JanelaPrincipal(QMainWindow):
         self._timer_teste = QTimer(self)  # rede de segurança se a resposta do teste nunca chegar
         self._timer_teste.setSingleShot(True)
         self._timer_teste.timeout.connect(self._teste_sem_resposta)
+
+        self._timer_tique = QTimer(self)
+        self._timer_tique.setTimerType(Qt.TimerType.PreciseTimer)
+        self._timer_tique.setInterval(TIQUE_MS)
+        self._timer_tique.timeout.connect(self._tique)
+
+        # Disparo único recalculado a cada dia (PreciseTimer: o CoarseTimer pode adiantar até 5%).
+        self._timer_meia_noite = QTimer(self)
+        self._timer_meia_noite.setSingleShot(True)
+        self._timer_meia_noite.setTimerType(Qt.TimerType.PreciseTimer)
+        self._timer_meia_noite.timeout.connect(self._ao_meia_noite)
 
     def _montar_cabecalho(self, raiz: QWidget) -> QHBoxLayout:
         cab = QHBoxLayout()
@@ -518,9 +552,12 @@ class JanelaPrincipal(QMainWindow):
         self.bridge.log.connect(self.logs.adicionar)
         self.bridge.contadores.connect(self._ao_contadores)
         self.bridge.teste_sql_concluido.connect(self._ao_teste_sql)
+        self.bridge.proxima_gravacao.connect(self._ao_proxima_gravacao)
+        self.bridge.ultima_gravacao_ok.connect(self._ao_ultima_gravacao)
+        self.bridge.ultima_leitura.connect(self._ao_ultima_leitura)
 
     def _log_local(self, nivel: str, mensagem: str) -> None:
-        self.logs.adicionar(datetime.now().strftime("%H:%M:%S"), nivel, mensagem)
+        self.logs.adicionar(datetime.fromtimestamp(self._relogio()).strftime("%H:%M:%S"), nivel, mensagem)
 
     # ================================================================== tema
     def _aplicar_tema(self) -> None:
@@ -543,9 +580,16 @@ class JanelaPrincipal(QMainWindow):
         if self._estado in ("desconectado", "erro"):
             self._conectar()
         else:
+            self.vigia.parar()  # o usuário não quer mais estar conectado
             self.botao_conectar.setEnabled(False)
             self.botao_conectar.setText("Desconectando…")
             self.bridge.desconectar()
+
+    def auto_conectar(self) -> None:
+        """--auto-conectar (reinício pelo vigia): conecta com os valores salvos, sem clique."""
+        self._log_local("INFO", "Início automático: conectando com os valores salvos.")
+        self._enviar_sql()
+        self._conectar()
 
     def _conectar(self) -> None:
         broker = self.campo_broker.text().strip()
@@ -562,7 +606,16 @@ class JanelaPrincipal(QMainWindow):
         self._salvar_valores()
         self._enviar_sql()
         self._aplicar_estado("conectando", f"{broker}:{porta}")
+        self.vigia.iniciar()
+        if self.vigia.ligado and self._precisa_lembrar_senha():
+            self._log_local("AVISO", AVISO_LEMBRAR_SENHA)
         self.bridge.conectar(broker, porta, topico, qos)
+
+    def _precisa_lembrar_senha(self) -> bool:
+        """SQL com login e senha, sem a senha salva: depois de um reinício automático o banco ficaria sem senha."""
+        cfg = self.sql_config()
+        return (cfg.habilitado and not cfg.autenticacao_windows and not self.opcao_lembrar.isChecked()
+                and not self.config.sqlserver.senha)
 
     def _mostrar_validacao(self, campo: QWidget, mensagem: str) -> None:
         self._limpar_validacao()
@@ -664,11 +717,94 @@ class JanelaPrincipal(QMainWindow):
         self.contador_gravadas.definir(gravadas)
         self.contador_erros.definir(erros)
 
+    # ================================================================== tempo: contagem, última gravação, dia
+    def _ao_proxima_gravacao(self, epoch: float) -> None:
+        try:
+            self._proxima = float(epoch) if epoch and epoch > 0 else None
+        except (TypeError, ValueError):
+            self._proxima = None
+        self._atualizar_tempo()
+
+    def _ao_ultima_gravacao(self, iso: str) -> None:
+        self._ultima_gravacao = iso or None
+        self.vigia.registrar_gravacao(vigia_mod.epoch_de_iso(iso, self._relogio()))
+        self._atualizar_tempo()
+
+    def _ao_ultima_leitura(self, iso: str) -> None:
+        self.vigia.registrar_leitura(vigia_mod.epoch_de_iso(iso, self._relogio()))
+
+    def _atualizar_tempo(self) -> None:
+        prefixo, valor = tempo.contagem_proxima(self._proxima, self._relogio())
+        estado = "neutro" if valor == tempo.SEM_VALOR else ("ocupado" if valor == tempo.GRAVANDO else "ativo")
+        self.logs.chip_proxima.definir(prefixo, valor, estado)
+        prefixo, valor = tempo.texto_ultima(self._ultima_gravacao)
+        self.logs.chip_ultima.definir(prefixo, valor, "ok" if self._ultima_gravacao else "neutro")
+
+    def _tique(self) -> None:
+        self._conferir_dia()
+        self._atualizar_tempo()
+        self.vigia.verificar()
+
+    def _agendar_meia_noite(self) -> None:
+        self._timer_meia_noite.start(tempo.ms_ate_meia_noite(self._relogio()))
+
+    def _ao_meia_noite(self) -> None:
+        self._conferir_dia()
+        self._agendar_meia_noite()
+
+    def _conferir_dia(self) -> None:
+        """Virou o dia (hora local)? Limpa a caixa ATIVIDADE. Também cobre o PC que dormiu na virada."""
+        hoje = date.fromtimestamp(self._relogio())
+        if hoje != self._dia_atividade:
+            self._dia_atividade = hoje
+            self.limpar_atividade_do_dia()
+
+    def limpar_atividade_do_dia(self) -> None:
+        """Limpa a caixa (o arquivo em logs/ não muda) e abre o dia com "Atividade de dd/mm/aaaa"."""
+        self.logs.limpar()
+        self._log_local("INFO", tempo.linha_do_dia(self._relogio()))
+        self.logs.descarregar()
+
+    # ================================================================== vigia
+    def _sql_configurado(self) -> bool:
+        return self.sql_config().habilitado
+
+    def _reiniciar(self, motivo: str) -> None:
+        if self._encerrado:
+            return
+        self._encerrado = True
+        for t in (self._timer_cancelar, self._timer_sql, self._timer_teste, self._timer_tique,
+                  self._timer_meia_noite):
+            t.stop()
+        self.detalhe_status.setText("Reiniciando…")
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            ok = vigia_mod.reiniciar_programa(
+                motivo,
+                registrar=self._registrar_agora,
+                salvar=self._salvar_valores,
+                encerrar=self.bridge.encerrar,
+                iniciar=self._iniciar_processo,
+                sair=self._sair,
+            )
+        finally:
+            QApplication.restoreOverrideCursor()
+        if not ok:
+            self._aplicar_estado("erro", "Reinício automático falhou")
+
+    def _registrar_agora(self, nivel: str, mensagem: str) -> None:
+        self._log_local(nivel, mensagem)
+        self.logs.descarregar()
+        QApplication.processEvents()
+
     def _aplicar_estado(self, estado: str, detalhe: str) -> None:
         if estado not in IndicadorStatus.TEXTOS:
             estado = "erro"
         anterior = self._estado
         self._estado = estado
+        if estado == "desconectado" and self._proxima is not None:
+            self._proxima = None
+            self._atualizar_tempo()
         self.status.definir(estado)
         self.detalhe_status.setText(self.detalhe_status.fontMetrics().elidedText(
             detalhe, Qt.TextElideMode.ElideMiddle, 360))
@@ -704,7 +840,9 @@ class JanelaPrincipal(QMainWindow):
     def closeEvent(self, evento: QCloseEvent) -> None:
         if not self._encerrado:
             self._encerrado = True
-            for t in (self._timer_cancelar, self._timer_sql, self._timer_teste):
+            self.vigia.parar()
+            for t in (self._timer_cancelar, self._timer_sql, self._timer_teste, self._timer_tique,
+                      self._timer_meia_noite):
                 t.stop()
             self._salvar_valores()
             self.detalhe_status.setText("Encerrando…")

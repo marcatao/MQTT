@@ -26,6 +26,9 @@ timeout_conexao = 5
 lote_max = 500           # grava quando juntar esta quantidade...
 lote_segundos = 1.0      # ...ou quando passar este tempo, o que vier primeiro
 pasta_contingencia = "contingencia"
+# Amostragem: a cada ciclo alinhado ao relógio (60 = hh:mm:00) grava só a leitura completa mais recente de cada
+# device_id; as outras do período são descartadas. 0 = grava todas (por lote_max/lote_segundos, como acima).
+intervalo_gravacao_segundos = 60
 
 [mapeamento]
 # Como achar cada coluna da dbo.IOT001 no payload (JSON ou tabular com cabeçalho). A primeira chave encontrada
@@ -41,3 +44,8 @@ leituras = ["leituras", "readings", "dados", "data", "registros"]  # lista de le
 device_do_topico = true      # sem device_id no payload, usa o nível do tópico após o prefixo assinado
 fuso_sem_offset = "local"    # data/hora ISO sem fuso: "local" (do PC) ou "utc"
 colunas_sem_cabecalho = []   # tabular sem cabeçalho: ex. ["pid", "device_id", "ts", "chd1", "chd2", "chd3"]
+
+[vigia]
+# Com o app conectado, se passar este tempo sem nenhuma leitura recebida (ou sem gravação com sucesso no
+# SQL Server, quando ele está configurado), o programa se reinicia sozinho e reconecta. 0 desliga.
+minutos = 10

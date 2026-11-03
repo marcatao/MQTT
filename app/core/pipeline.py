@@ -6,12 +6,20 @@ Threads:
 - controle (``ThreadPoolExecutor`` de 1 worker): executa conectar/desconectar em ordem, sem bloquear quem chama.
 
 Os callbacks são chamados de qualquer uma dessas threads; o ``bridge`` os transforma em Signals do Qt.
+
+Amostragem (``[gravacao] intervalo_gravacao_segundos``, padrão 60; 0 desliga): os ciclos são alinhados ao relógio
+local (14:31:00, 14:32:00…). A thread de processamento guarda, por ``device_id``, a leitura **completa** mais recente
+da janela (pela ``recebido_em``; empate: a última que chegou) e, na virada, manda só essas ao sink e descarrega. As
+demais são descartadas (não são erro nem gravadas). Leituras incompletas vão na hora para o sink (contingência). Ao
+desconectar/encerrar, o que estiver pendente da janela atual é gravado. Com 0, tudo vai ao sink como antes
+(lote por ``lote_max``/``lote_segundos``).
 """
 from __future__ import annotations
 
 import logging
 import queue
 import threading
+import math
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import replace
@@ -21,7 +29,7 @@ from typing import Callable
 
 from app.config import Config, SqlServerConfig, pasta_base
 from app.core.mqtt_client import ClienteMqtt, validar_parametros
-from app.core.mapeamento import mapear
+from app.core.mapeamento import LinhaIot, mapear
 from app.core.parser import trecho
 from app.core.sink_sqlserver import Sink, criar_sink
 
@@ -33,6 +41,7 @@ AoStatus = Callable[[str, str], None]
 AoLog = Callable[[str, str], None]
 AoContadores = Callable[[int, int, int], None]
 FabricaSink = Callable[[SqlServerConfig, "Config", Callable[[str, str], None]], Sink]
+Relogio = Callable[[], float]  # epoch em segundos (time.time)
 
 _FIM = object()  # sentinela da fila
 
@@ -41,10 +50,51 @@ def _nada(*_args) -> None:
     pass
 
 
+def proximo_ciclo(agora: float, intervalo: float) -> float:
+    """Próximo instante (epoch, estritamente depois de ``agora``) alinhado ao relógio **local**.
+
+    Múltiplos de ``intervalo`` contados na hora local: 60 → hh:mm:00; 3600 → hh:00:00; 86400 → meia-noite.
+    """
+    deslocamento = datetime.fromtimestamp(agora).astimezone().utcoffset()
+    off = deslocamento.total_seconds() if deslocamento is not None else 0.0
+    local = agora + off
+    return (math.floor(local / intervalo) + 1) * intervalo - off
+
+
+def iso_local(t: float) -> str:
+    """Epoch → "AAAA-MM-DDTHH:MM:SS" na hora local."""
+    return datetime.fromtimestamp(t).strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def _plural(n: int, singular: str, plural: str) -> str:
+    return f"{n} {singular if n == 1 else plural}"
+
+
+class _Amostragem:
+    """Leitura completa mais recente por device_id dentro da janela atual."""
+
+    def __init__(self) -> None:
+        self.pendentes: dict[str, LinhaIot] = {}
+        self.recebidas = 0
+
+    def adicionar(self, linhas: list[LinhaIot]) -> None:
+        for linha in linhas:
+            self.recebidas += 1
+            atual = self.pendentes.get(linha.device_id)
+            if atual is None or linha.recebido_em >= atual.recebido_em:  # empate: a última que chegou vence
+                self.pendentes[linha.device_id] = linha
+
+    def retirar(self) -> tuple[list[LinhaIot], int]:
+        linhas, recebidas = list(self.pendentes.values()), self.recebidas
+        self.pendentes, self.recebidas = {}, 0
+        return linhas, recebidas
+
+
 class Pipeline:
     TAMANHO_FILA = 20000
     INTERVALO_CONTADORES = 0.2      # s (≈5 por segundo)
     LOGS_POR_SEGUNDO = 20           # linhas "Mensagem de ..." por segundo; o excedente vira um resumo
+    INTERVALO_ULTIMA_LEITURA = 5.0  # s: no máx. 1 aviso de "última leitura" a cada 5 s
 
     def __init__(
         self,
@@ -55,11 +105,25 @@ class Pipeline:
         fabrica_sink: FabricaSink | None = None,
         pasta: Path | None = None,
         sessao_persistente: bool = True,
+        ao_proxima_gravacao: Callable[[float], None] = _nada,
+        ao_gravacao_ok: Callable[[str], None] = _nada,
+        ao_leitura: Callable[[str], None] = _nada,
+        relogio: Relogio = time.time,
+        intervalo_gravacao: float | None = None,
+        fabrica_cliente: Callable[..., ClienteMqtt] | None = None,
     ) -> None:
+        """``relogio``, ``intervalo_gravacao`` (sobrepõe a config) e ``fabrica_cliente`` existem para os testes."""
         self.config = config
         self._ao_status = ao_status
         self._ao_log = ao_log
         self._ao_contadores = ao_contadores
+        self._ao_proxima_gravacao = ao_proxima_gravacao
+        self._ao_gravacao_ok = ao_gravacao_ok
+        self._ao_leitura = ao_leitura
+        self._relogio = relogio
+        self._intervalo_fixo = intervalo_gravacao
+        self._fabrica_cliente = fabrica_cliente or ClienteMqtt
+        self._ultima_leitura_t: float | None = None
         self._fabrica_sink = fabrica_sink or self._sink_padrao
         self._pasta = pasta or pasta_base()
         self._sessao_persistente = sessao_persistente
@@ -77,6 +141,7 @@ class Pipeline:
         self._processador: threading.Thread | None = None
         self._assinatura = ""
         self._encerrado = False
+        self._amostrando = False
 
     # ------------------------------------------------------------------------------ API pública
 
@@ -136,11 +201,29 @@ class Pipeline:
             self._gravados += gravados
             self._erros += erros
 
+    def _avisar(self, callback, *args) -> None:
+        try:
+            callback(*args)
+        except Exception:  # noqa: BLE001
+            logger.exception("Falha em callback do pipeline")
+
+    def _intervalo(self) -> float:
+        valor = self._intervalo_fixo
+        if valor is None:
+            valor = getattr(self.config.gravacao, "intervalo_gravacao_segundos", 0)
+        try:
+            valor = float(valor)
+        except (TypeError, ValueError):
+            valor = 0.0
+        return valor if valor > 0 else 0.0
+
     def _sink_padrao(self, sql: SqlServerConfig, config: Config, logar) -> Sink:
         return criar_sink(sql, config.gravacao, logar, self._pasta)
 
     def _novo_sink(self, sql: SqlServerConfig) -> Sink:
         sink = self._fabrica_sink(sql, self.config, self._log)
+        if self._amostrando and hasattr(sink, "logar_sucesso"):
+            sink.logar_sucesso = False  # um log por ciclo (no pipeline) em vez de um por lote
         if not sql.habilitado:
             if not self._avisou_sem_sql:
                 self._avisou_sem_sql = True
@@ -156,6 +239,8 @@ class Pipeline:
             broker, porta, topico, qos = validar_parametros(broker, porta, topico, qos)
             with self._trava:
                 self._sql_pendente = None
+            intervalo = self._intervalo()
+            self._amostrando = intervalo > 0
             sink = self._novo_sink(self.config.sqlserver)
         except Exception as exc:  # noqa: BLE001 - ValueError de validação, tabela inválida etc.
             self._log("ERRO", str(exc))
@@ -163,12 +248,19 @@ class Pipeline:
             return
 
         self._assinatura = topico
+        self._ultima_leitura_t = None
+        proximo = proximo_ciclo(self._relogio(), intervalo) if intervalo > 0 else None
+        if intervalo > 0:
+            self._log("INFO", f"Amostragem: 1 leitura por dispositivo a cada {intervalo:g} s "
+                              f"(próxima gravação às {datetime.fromtimestamp(proximo):%H:%M:%S}).")
         self._fila = queue.Queue(maxsize=self.TAMANHO_FILA)
-        self._processador = threading.Thread(target=self._processar, args=(self._fila, sink),
+        self._processador = threading.Thread(target=self._processar, args=(self._fila, sink, intervalo, proximo),
                                              name="mqtt-processamento", daemon=True)
         self._processador.start()
+        if proximo is not None:
+            self._avisar(self._ao_proxima_gravacao, proximo)
         try:
-            self._cliente = ClienteMqtt(
+            self._cliente = self._fabrica_cliente(
                 broker, porta, topico, qos,
                 ao_mensagem=self._ao_mensagem,
                 ao_status=self._status,
@@ -213,9 +305,14 @@ class Pipeline:
         if fila is None:
             return
         self._somar(recebidas=1)
+        agora = self._relogio()
+        ultima = self._ultima_leitura_t
+        if ultima is None or agora - ultima >= self.INTERVALO_ULTIMA_LEITURA or agora < ultima:
+            self._ultima_leitura_t = agora
+            self._avisar(self._ao_leitura, iso_local(agora))
         try:
             # bloqueia a rede um pouco se a fila encher (contrapressão) em vez de perder a mensagem
-            fila.put((topico, payload, datetime.now(timezone.utc), retida), timeout=5)
+            fila.put((topico, payload, datetime.fromtimestamp(agora, timezone.utc), retida, agora), timeout=5)
         except queue.Full:
             self._somar(erros=1)
             self._log("ERRO", f"Fila de processamento cheia: mensagem de {topico} descartada "
@@ -223,7 +320,9 @@ class Pipeline:
 
     # -- thread de processamento ---------------------------------------------------------------------
 
-    def _processar(self, fila: queue.Queue, sink: Sink) -> None:
+    def _processar(self, fila: queue.Queue, sink: Sink, intervalo: float = 0.0,
+                   proximo: float | None = None) -> None:
+        amostra = _Amostragem() if proximo is not None else None
         ultimo_contador = 0.0
         enviado = (-1, -1, -1)
         janela_inicio = time.monotonic()
@@ -240,7 +339,10 @@ class Pipeline:
             if item is _FIM:
                 terminar = True
             elif item is not None:
-                topico, payload, recebido_em, retida = item
+                topico, payload, recebido_em, retida, t_receb = item
+                if amostra is not None and t_receb >= proximo:
+                    # chegou depois da virada: fecha a janela anterior antes de contar esta leitura
+                    proximo = self._ciclo(sink, amostra, intervalo, proximo)
                 res = mapear(topico, payload, recebido_em, self._assinatura, self.config.mapeamento)
                 agora = time.monotonic()
                 if agora - janela_inicio >= 1.0:
@@ -265,15 +367,33 @@ class Pipeline:
                             self._log("AVISO", f"{topico}: {aviso}")
                     else:
                         suprimidos += 1
-                    sink.adicionar(res.linhas)
+                    if amostra is None:
+                        sink.adicionar(res.linhas)
+                    else:
+                        if rejeitadas:
+                            sink.adicionar(rejeitadas)  # incompletas: contingência na hora, como sem amostragem
+                        amostra.adicionar(res.completas)
                 else:
                     self._somar(erros=1)
                     self._log("ERRO" if res.formato != "vazio" else "AVISO",
                               f"Mensagem de {topico} ignorada: {res.erro}")
 
             sink = self._trocar_sink_se_preciso(sink)
-            if terminar or sink.deve_descarregar():
-                self._descarregar(sink, fechar=terminar)
+            if amostra is not None and not terminar:
+                agora_rel = self._relogio()
+                if agora_rel >= proximo:
+                    proximo = self._ciclo(sink, amostra, intervalo, proximo)
+                elif agora_rel < proximo - intervalo - 1:
+                    # relógio do PC voltou para trás: realinha sem esperar até o horário antigo
+                    proximo = proximo_ciclo(agora_rel, intervalo)
+                    self._avisar(self._ao_proxima_gravacao, proximo)
+            if terminar:
+                if amostra is not None:
+                    self._ciclo(sink, amostra, intervalo, None, fechar=True)
+                else:
+                    self._descarregar(sink, fechar=True)
+            elif sink.deve_descarregar():
+                self._descarregar(sink)
 
             agora = time.monotonic()
             if terminar or agora - ultimo_contador >= self.INTERVALO_CONTADORES:
@@ -290,7 +410,47 @@ class Pipeline:
                     self._log("INFO", f"… e mais {suprimidos} mensagens no último segundo")
                 return
 
-    def _descarregar(self, sink: Sink, fechar: bool = False) -> None:
+    def _ciclo(self, sink: Sink, amostra: _Amostragem, intervalo: float, momento: float | None,
+               fechar: bool = False) -> float | None:
+        """Grava a amostra da janela. ``momento`` = virada (epoch); None = desconexão/encerramento.
+
+        Devolve o próximo ciclo (None no encerramento) e avisa ``ao_proxima_gravacao``.
+        """
+        linhas, recebidas = amostra.retirar()
+        if momento is not None:
+            rotulo = f"{datetime.fromtimestamp(momento):%H:%M}"
+        else:
+            rotulo = f"{datetime.fromtimestamp(self._relogio()):%H:%M:%S} (ao desconectar)"
+        if linhas:
+            sink.adicionar(linhas)
+        n, n_sql = (self._descarregar(sink, fechar=True) if fechar
+                    else self._descarregar(sink) if linhas else (0, 0))
+        if linhas:
+            total = len(linhas)
+            if n_sql >= total:
+                destino = f"{_plural(total, 'leitura gravada', 'leituras gravadas')} no SQL Server"
+            elif n_sql > 0:
+                destino = (f"{_plural(n_sql, 'leitura gravada', 'leituras gravadas')} no SQL Server e "
+                           f"{total - n_sql} na contingência")
+            elif n > 0:
+                destino = f"{_plural(total, 'leitura guardada', 'leituras guardadas')} na contingência"
+            else:
+                destino = f"{_plural(total, 'leitura não gravada', 'leituras não gravadas')} (ver erro acima)"
+            descartadas = recebidas - total
+            self._log("INFO", f"Gravação {rotulo}: {destino} ({_plural(recebidas, 'recebida', 'recebidas')}, "
+                              f"{_plural(descartadas, 'descartada', 'descartadas')} pela amostragem)")
+        elif momento is not None:
+            self._log("INFO", f"Gravação {rotulo}: nenhuma leitura completa recebida no período")
+        if momento is None:
+            return None
+        proximo = proximo_ciclo(max(self._relogio(), momento), intervalo)
+        self._avisar(self._ao_proxima_gravacao, proximo)
+        return proximo
+
+    def _descarregar(self, sink: Sink, fechar: bool = False) -> tuple[int, int]:
+        """Devolve (persistidos no SQL ou na contingência, gravados no SQL Server com commit)."""
+        antes = getattr(sink, "gravados_sql", 0)
+        n = 0
         try:
             n = sink.fechar() if fechar else sink.descarregar()
             self._somar(gravados=n)
@@ -300,6 +460,10 @@ class Pipeline:
         falhas = getattr(sink, "falhas", None)
         if falhas is not None:
             self._somar(erros=falhas())
+        n_sql = getattr(sink, "gravados_sql", 0) - antes
+        if n_sql > 0:
+            self._avisar(self._ao_gravacao_ok, iso_local(self._relogio()))
+        return n, n_sql
 
     def _trocar_sink_se_preciso(self, sink: Sink) -> Sink:
         with self._trava:

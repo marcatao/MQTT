@@ -95,6 +95,7 @@ def _config(tmp_path, sql=None):
     cfg.gravacao.lote_max = 100
     cfg.gravacao.lote_segundos = 0.2
     cfg.gravacao.pasta_contingencia = str(tmp_path / "contingencia")
+    cfg.gravacao.intervalo_gravacao_segundos = 0  # sem amostragem: grava tudo (amostragem em test_amostragem.py)
     return cfg
 
 

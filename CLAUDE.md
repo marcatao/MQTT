@@ -230,8 +230,7 @@ mensagem inteira, não só o booleano.
 
 ## Estado atual
 
-- Estrutura Python criada (`app/config.py`, `requirements*.txt`, `config.example.toml`). O protótipo Node.js foi
-  removido.
+- v0.1.3 validada pelo usuário em produção (NOVUS → dbo.IOT001). v0.1.4: amostragem de 1 min, contagem regressiva, limpeza diária e vigia.
 
 ## Idioma
 

@@ -41,6 +41,7 @@ class Paleta:
     neutro_suave: str
     log_fundo: str
     selecao: str
+    destaque_texto: str = ""  # texto na cor de destaque sobre destaque_suave (chips)
 
 
 # Contraste conferido para WCAG AA (texto normal >= 4,5:1 sobre a superfície correspondente).
@@ -67,6 +68,7 @@ CLARA = Paleta(
     neutro_suave="#EDEFF3",
     log_fundo="#FBFCFD",
     selecao="#CFDDFB",
+    destaque_texto="#1F4FC2",
 )
 
 ESCURA = Paleta(
@@ -92,6 +94,7 @@ ESCURA = Paleta(
     neutro_suave="#202733",
     log_fundo="#11151C",
     selecao="#24406F",
+    destaque_texto="#9DBBFF",
 )
 
 _QSS = Template(
@@ -224,6 +227,23 @@ QPushButton#chipPausa {
     min-height: 26px; padding: 0 12px; font-weight: 600;
 }
 QPushButton#chipPausa:hover { background: $aviso; color: $superficie; }
+
+/* ---------- Chips de tempo (Próxima / Última gravação) ---------- */
+QFrame#chipInfo {
+    background: $superficie_alt; border: 1px solid $borda; border-radius: 13px; min-height: 26px;
+}
+QFrame#chipInfo[estado="ativo"] { background: $destaque_suave; border-color: $destaque_suave; }
+QFrame#chipInfo[estado="ocupado"] { background: $aviso_suave; border-color: $aviso_suave; }
+QFrame#chipInfo[estado="ok"] { background: $sucesso_suave; border-color: $sucesso_suave; }
+QLabel#chipPrefixo { color: $texto_sec; background: transparent; }
+QLabel#chipValor { color: $texto; font-weight: 600; background: transparent; }
+QLabel#chipValor[estado="ativo"] { color: $destaque_texto; }
+QLabel#chipValor[estado="ocupado"] { color: $aviso; }
+QLabel#chipValor[estado="ok"] { color: $sucesso; }
+QLabel#chipPonto { border-radius: 4px; background: $texto_fraco; }
+QLabel#chipPonto[estado="ativo"] { background: $destaque_texto; }
+QLabel#chipPonto[estado="ocupado"] { background: $aviso; }
+QLabel#chipPonto[estado="ok"] { background: $sucesso; }
 
 /* ---------- Caixa de logs ---------- */
 QPlainTextEdit#caixaLogs {

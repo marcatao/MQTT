@@ -135,6 +135,7 @@ class SinkContingencia:
         self.descricao = f"contingência ({pasta})"
         self._lote = _Lote(gravacao.lote_max, gravacao.lote_segundos)
         self._logar = logar
+        self.logar_sucesso = True  # False: o pipeline (amostragem) faz um log por ciclo no lugar deste
 
     def adicionar(self, registros: Iterable[LinhaIot]) -> None:
         self._lote.adicionar(registros)
@@ -156,7 +157,8 @@ class SinkContingencia:
             self._lote.adicionar(itens)  # mantém em memória e tenta no próximo ciclo
             self._logar("ERRO", f"Falha ao gravar a contingência: {exc}")
             raise
-        self._logar("INFO", f"Guardados {len(itens)} registros na contingência ({caminho.name})")
+        if self.logar_sucesso:
+            self._logar("INFO", f"Guardados {len(itens)} registros na contingência ({caminho.name})")
         return sum(1 for i in itens if i.completa)
 
     def fechar(self) -> int:
@@ -202,7 +204,23 @@ class SinkSqlServer:
         self._indisponivel_ate = 0.0
         self._erros_lote = 0
         self._fallback = SinkContingencia(gravacao, logar, pasta_base)
+        self.gravados_sql = 0      # total de linhas com commit no SQL Server (o pipeline usa para "última gravação ok")
+        self._logar_sucesso = True
         self.descricao = f"SQL Server {sql.servidor}/{sql.banco} ({sql.tabela})"
+
+    @property
+    def logar_sucesso(self) -> bool:
+        return self._logar_sucesso
+
+    @logar_sucesso.setter
+    def logar_sucesso(self, valor: bool) -> None:
+        """False: não loga "Gravados N registros" por lote (o pipeline faz um log por ciclo de amostragem)."""
+        self._logar_sucesso = valor
+        self._fallback.logar_sucesso = valor
+
+    def _log_gravados(self, n: int) -> None:
+        if self._logar_sucesso:
+            self._logar("INFO", f"Gravados {n} registros no SQL Server")
 
     # -- configuração --------------------------------------------------------------------------------
 
@@ -256,7 +274,7 @@ class SinkSqlServer:
             tentativa += 1
             try:
                 self._inserir(itens)
-                self._logar("INFO", f"Gravados {len(itens)} registros no SQL Server")
+                self._log_gravados(len(itens))
                 return len(itens)
             except Exception as exc:  # noqa: BLE001 - pyodbc.Error, DriverOdbcAusente etc.
                 classe, sqlstate = classificar_erro(exc)
@@ -329,7 +347,7 @@ class SinkSqlServer:
                     self._fechar_conexao()
                     resto = parte + [r for p in reversed(pilha) for r in p]
                     if boas:
-                        self._logar("INFO", f"Gravados {boas} registros no SQL Server")
+                        self._log_gravados(boas)
                     self._para_contingencia(ruins)
                     self._pausar_e_contingencia(resto, exc_parte, "indisponível")
                     return len(itens)
@@ -342,7 +360,7 @@ class SinkSqlServer:
                     meio = len(parte) // 2
                     pilha += [parte[meio:], parte[:meio]]
         if boas:
-            self._logar("INFO", f"Gravados {boas} registros no SQL Server")
+            self._log_gravados(boas)
         if ruins:
             self._erros_lote += len(ruins)
             self._logar("AVISO", f"{len(ruins)} registro(s) com erro de dados enviados para a contingência")
@@ -365,6 +383,7 @@ class SinkSqlServer:
                 cursor.setinputsizes(tipos)
             cursor.executemany(self.sql_insert, [r.como_tupla() for r in itens])
             self._conexao.commit()
+            self.gravados_sql += len(itens)
         except Exception:
             try:
                 self._conexao.rollback()

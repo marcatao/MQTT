@@ -8,6 +8,7 @@ import os
 import sys
 import tempfile
 import time
+from datetime import datetime
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -43,7 +44,10 @@ def capturar(destino: Path, tema: str, conectar: bool = True, sql_ok: bool = Tru
     _rodar(0.5)
     if conectar:
         janela.botao_conectar.click()
-        _rodar(2.5)
+        _rodar(2.0)
+        # o ciclo real é de 1 min: simula a última gravação ok (há alguns segundos) para ela aparecer na captura
+        bridge.ultima_gravacao_ok.emit(datetime.fromtimestamp(time.time() - 18).strftime("%Y-%m-%dT%H:%M:%S"))
+        _rodar(0.5)
     nome = f"janela-{tema}{'-conectada' if conectar else ''}{'' if sql_ok else '-falha-sql'}.png"
     caminho = destino / nome
     janela.grab().save(str(caminho))

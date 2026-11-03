@@ -5,6 +5,7 @@ thread própria, como o bridge real (o Qt entrega na thread da GUI por conexão 
 """
 from __future__ import annotations
 
+import math
 import random
 import threading
 import time
@@ -26,16 +27,20 @@ class FakePipelineBridge(QObject):
     log = Signal(str, str, str)
     contadores = Signal(int, int, int)
     teste_sql_concluido = Signal(bool, str)
+    proxima_gravacao = Signal(float)   # epoch do próximo ciclo (alinhado ao relógio)
+    ultima_gravacao_ok = Signal(str)   # ISO local da última gravação com sucesso no SQL
+    ultima_leitura = Signal(str)       # ISO local da última mensagem recebida
 
     def __init__(self, config: Config, parent=None, *, atraso_conexao: float = 0.2,
                  intervalo: float = 0.05, falhar_conexao: bool = False, sql_ok: bool = True,
-                 semente: int | None = 7):
+                 semente: int | None = 7, ciclo: float = 60.0):
         super().__init__(parent)
         self.config = config
         self.atraso_conexao = atraso_conexao
         self.intervalo = intervalo
         self.falhar_conexao = falhar_conexao
         self.sql_ok = sql_ok
+        self.ciclo = ciclo  # segundos entre gravações (0 = sem ciclo: não emite proxima_gravacao)
         self._rng = random.Random(semente)
         self._parar = threading.Event()
         self._thread: threading.Thread | None = None
@@ -91,6 +96,14 @@ class FakePipelineBridge(QObject):
             t.join(timeout)
         self._thread = None
 
+    def _emitir_proxima(self) -> float | None:
+        if self.ciclo <= 0:
+            return None
+        agora = time.time()
+        proxima = math.floor(agora / self.ciclo + 1) * self.ciclo  # alinhado: hh:mm:00 com ciclo de 60 s
+        self.proxima_gravacao.emit(float(proxima))
+        return proxima
+
     def _log(self, nivel: str, msg: str) -> None:
         self.log.emit(datetime.now().strftime("%H:%M:%S"), nivel, msg)
 
@@ -109,8 +122,14 @@ class FakePipelineBridge(QObject):
             self._log("INFO", f"Gravando em {self.sql.servidor} / {self.sql.banco} ({self.sql.tabela}).")
         ultimo = 0.0
         n = 0
+        proxima = self._emitir_proxima()
         while not self._parar.wait(self.intervalo):
             n += 1
+            self.ultima_leitura.emit(_iso_agora())
+            if proxima is not None and time.time() >= proxima:
+                if self.sql and self.sql.habilitado and self.sql_ok:
+                    self.ultima_gravacao_ok.emit(_iso_agora())
+                proxima = self._emitir_proxima()
             sub, formato, campos = AMOSTRAS[n % len(AMOSTRAS)]
             self.recebidas += 1
             self._log("INFO", f"Mensagem em {sub} · {formato} · {campos} campos")
@@ -129,3 +148,7 @@ class FakePipelineBridge(QObject):
                 ultimo = agora
                 self.contadores.emit(self.recebidas, self.gravadas, self.erros)
         self.contadores.emit(self.recebidas, self.gravadas, self.erros)
+
+
+def _iso_agora() -> str:
+    return datetime.now().strftime("%Y-%m-%dT%H:%M:%S")

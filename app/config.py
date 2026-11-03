@@ -47,6 +47,9 @@ class GravacaoConfig:
     lote_max: int = 500
     lote_segundos: float = 1.0
     pasta_contingencia: str = "contingencia"
+    # amostragem: a cada ciclo (alinhado ao relógio, ex. hh:mm:00) grava só a leitura completa mais recente de
+    # cada device_id; 0 desliga e grava todas as leituras (em lote, por lote_max/lote_segundos)
+    intervalo_gravacao_segundos: int = 60
 
 
 @dataclass
@@ -72,11 +75,18 @@ class MapeamentoConfig:
 
 
 @dataclass
+class VigiaConfig:
+    """Vigia (watchdog): reinicia o app se ficar `minutos` sem leitura (ou sem gravação no SQL). 0 desliga."""
+    minutos: float = 10
+
+
+@dataclass
 class Config:
     mqtt: MqttConfig = field(default_factory=MqttConfig)
     sqlserver: SqlServerConfig = field(default_factory=SqlServerConfig)
     gravacao: GravacaoConfig = field(default_factory=GravacaoConfig)
     mapeamento: MapeamentoConfig = field(default_factory=MapeamentoConfig)
+    vigia: VigiaConfig = field(default_factory=VigiaConfig)
 
 
 def _preencher(destino, dados: dict) -> None:
@@ -92,6 +102,6 @@ def carregar(caminho: Path | None = None) -> Config:
     if caminho.exists():
         with caminho.open("rb") as f:
             dados = tomllib.load(f)
-        for secao in ("mqtt", "sqlserver", "gravacao", "mapeamento"):
+        for secao in ("mqtt", "sqlserver", "gravacao", "mapeamento", "vigia"):
             _preencher(getattr(cfg, secao), dados.get(secao, {}))
     return cfg

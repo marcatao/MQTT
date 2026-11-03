@@ -1,4 +1,4 @@
-"""Componentes da tela: indicador de status, cartão de contador, seletor de QoS e painel de logs."""
+"""Componentes da tela: indicador de status, cartão de contador, seletor de QoS, chips e painel de logs."""
 from __future__ import annotations
 
 from collections import deque
@@ -242,6 +242,54 @@ class ResultadoTeste(QFrame):
         self.hide()
 
 
+class ChipInfo(QFrame):
+    """Pílula discreta com ponto, prefixo (texto secundário) e valor (destacado). Ex.: "Próxima gravação em 0:42".
+
+    `estado` (propriedade dinâmica usada no QSS): "neutro" | "ativo" | "ok" | "ocupado".
+    """
+
+    def __init__(self, nome_objeto: str, nome_acessivel: str, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setObjectName("chipInfo")
+        self.setProperty("tipo", nome_objeto)
+        self.setAccessibleName(nome_acessivel)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(10, 0, 12, 0)
+        lay.setSpacing(6)
+        self._ponto = QLabel(self)
+        self._ponto.setObjectName("chipPonto")
+        self._ponto.setFixedSize(8, 8)
+        self._prefixo = QLabel(self)
+        self._prefixo.setObjectName("chipPrefixo")
+        self._valor = QLabel(self)
+        self._valor.setObjectName("chipValor")
+        self._valor.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        lay.addWidget(self._ponto)
+        lay.addWidget(self._prefixo)
+        lay.addWidget(self._valor)
+        self.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
+        self.estado = ""
+        self.definir("", "", "neutro")
+
+    def definir(self, prefixo: str, valor: str, estado: str = "neutro") -> None:
+        if self._prefixo.text() != prefixo:
+            self._prefixo.setText(prefixo)
+        if self._valor.text() != valor:
+            self._valor.setText(valor)
+        self.setAccessibleDescription(self.texto())
+        if estado != self.estado:
+            self.estado = estado
+            for w in (self, self._ponto, self._valor):
+                w.setProperty("estado", estado)
+            repolir(self, self._ponto, self._valor)
+
+    def texto(self) -> str:
+        return f"{self._prefixo.text()} {self._valor.text()}".strip()
+
+    def valor(self) -> str:
+        return self._valor.text()
+
+
 class PainelLogs(Cartao):
     """Caixa de logs com nível colorido, atualização em lote, rolagem inteligente e limite de linhas."""
 
@@ -280,6 +328,18 @@ class PainelLogs(Cartao):
         topo.addWidget(self.botao_copiar)
         topo.addWidget(self.botao_salvar)
 
+        # Faixa de tempo: contagem até a próxima gravação e a última gravação com sucesso no SQL.
+        faixa = QHBoxLayout()
+        faixa.setSpacing(8)
+        self.chip_proxima = ChipInfo("proxima", "Próxima gravação", self)
+        self.chip_proxima.setToolTip("Tempo até o próximo ciclo de gravação no SQL Server (uma leitura por minuto).")
+        self.chip_ultima = ChipInfo("ultima", "Última gravação", self)
+        self.chip_ultima.setToolTip("Dia e hora da última gravação bem-sucedida no SQL Server "
+                                    "(o que foi para a contingência não conta).")
+        faixa.addWidget(self.chip_proxima)
+        faixa.addWidget(self.chip_ultima)
+        faixa.addStretch(1)
+
         # Caixa
         self.caixa = QPlainTextEdit(self)
         self.caixa.setObjectName("caixaLogs")
@@ -296,6 +356,7 @@ class PainelLogs(Cartao):
         self.caixa.verticalScrollBar().valueChanged.connect(self._rolagem_mudou)
 
         self.corpo.addLayout(topo)
+        self.corpo.addLayout(faixa)
         self.corpo.addWidget(self.caixa, 1)
 
         self._timer = QTimer(self)
