@@ -176,6 +176,9 @@ class PipelineBridge(QObject):
     log = Signal(str, str, str)             # (hora "HH:MM:SS", nivel "INFO" | "AVISO" | "ERRO", mensagem)
     contadores = Signal(int, int, int)      # (mensagens recebidas, registros gravados, erros), no máx. ~5x por segundo
     teste_sql_concluido = Signal(bool, str) # (sucesso, mensagem multilinha em português)
+    proxima_gravacao = Signal(float)        # epoch (s) do próximo ciclo de gravação; emitido ao conectar e a cada ciclo
+    ultima_gravacao_ok = Signal(str)        # ISO 8601 local "AAAA-MM-DDTHH:MM:SS" do último INSERT com sucesso no SQL
+    ultima_leitura = Signal(str)            # ISO 8601 local da última mensagem MQTT recebida (para o vigia)
 
     def __init__(self, config: Config, parent=None): ...
     def definir_sql(self, sql: SqlServerConfig) -> None: ...   # a GUI chama antes de conectar e quando o usuário altera
@@ -203,6 +206,21 @@ class DriverOdbcAusente(RuntimeError): ...
 
 `testar_conexao` devolve `False` também quando conecta mas falta a tabela ou a permissão de INSERT; a tela mostra a
 mensagem inteira, não só o booleano.
+
+## Operação contínua (decidido com o usuário em 03/11/2026)
+
+- **Amostragem de 1 em 1 minuto** (`[gravacao] intervalo_gravacao_segundos = 60`; 0 = grava tudo): os ciclos são
+  alinhados ao relógio (hh:mm:00). Em cada ciclo grava-se, **por `device_id`, a leitura completa mais recente** recebida
+  naquele minuto; as demais são descartadas (não são erro). Leitura incompleta continua indo na hora para a
+  contingência. Um log por ciclo resume: gravadas, recebidas e descartadas pela amostragem.
+- **Caixa ATIVIDADE**: mostra contagem regressiva até a próxima gravação e dia/hora da última gravação com sucesso no
+  SQL Server (contingência não conta como sucesso). É **limpa todo dia à meia-noite** (hora local); o arquivo
+  `logs/` continua com tudo.
+- **Vigia (watchdog)**: com o usuário conectado, se passar **10 min** (`[vigia] minutos = 10`) sem nenhuma leitura
+  recebida, ou sem gravação com sucesso no SQL (só quando o SQL está configurado), o app **se reinicia sozinho** e
+  reconecta automaticamente (`--auto-conectar`). O motivo vai para o log em arquivo. A contagem começa no momento da
+  conexão. Para gravar no banco depois de reiniciar, a senha precisa estar salva ("Lembrar senha"); sem isso a tela
+  avisa ao conectar.
 
 ## Pendências conhecidas
 
