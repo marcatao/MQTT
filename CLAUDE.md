@@ -253,10 +253,14 @@ mensagem inteira, não só o booleano.
   `logs/erros_AAAAMMDD.jsonl`, e a janela lê o arquivo do dia ao abrir, para não perder a lista num reinício. Formato
   do JSON: `{"quando": ISO local, "categoria": "payload"|"sql"|"contingencia"|"mqtt"|"fila", "mensagem": str,
   "topico": str|null, "detalhe": str|null, "payload": str|null (máx. 2000 caracteres)}`.
+  Broker MQTT (categoria `"mqtt"`): **um erro por queda (incidente)**, não um por tentativa de reconexão. Conexão
+  perdida sem o usuário pedir ("Conexão com o broker IP:porta perdida", detalhe com o motivo e a hora da última
+  mensagem recebida) ou primeira tentativa de conexão que falha (inacessível ou CONNACK recusado, motivo no detalhe)
+  abre o incidente e soma 1; as tentativas seguintes da mesma queda só vão para o log. Ao reconectar, o incidente
+  fecha com um INFO "Broker voltou após 3 min 12 s" (não é erro); uma queda nova soma outro erro. Desconectar pelo
+  usuário, encerrar ou reinício do vigia não geram erro. Cada SUBACK recusado soma 1 erro, com o tópico.
 
 ## Pendências conhecidas
-
-- Queda/recusa do broker MQTT não soma no contador de erros (só log e status); categoria "mqtt" existe mas não é emitida.
 
 - Reprocessar os arquivos de `contingencia/` (`.jsonl`) no SQL Server quando o banco voltar.
 - Possível duplicação de um lote se o `commit` chegar ao servidor e a resposta se perder (exigiria id de lote ou
@@ -264,7 +268,7 @@ mensagem inteira, não só o booleano.
 
 ## Estado atual
 
-- v0.1.3 validada pelo usuário em produção (NOVUS → dbo.IOT001). v0.1.4: amostragem de 1 min, contagem regressiva, limpeza diária e vigia. v0.1.5: conexão automática ao abrir. v0.1.6: abas Atividade/Mosquitto e título Integrador Alumbra. v0.1.7: aba Clientes e janela de erros (card ERROS).
+- v0.1.3 validada pelo usuário em produção (NOVUS → dbo.IOT001). v0.1.4: amostragem de 1 min, contagem regressiva, limpeza diária e vigia. v0.1.5: conexão automática ao abrir. v0.1.6: abas Atividade/Mosquitto e título Integrador Alumbra. v0.1.7: aba Clientes e janela de erros (card ERROS). v0.1.8: queda do broker conta como erro (1 por queda).
 
 ## Idioma
 

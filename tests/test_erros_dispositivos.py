@@ -255,15 +255,7 @@ def test_erro_fila_cheia(tmp_path):
     assert len(col.registros[1]["payload"]) == 2000
 
 
-# --------------------------------------------------------------------------------- mqtt (não conta como erro)
-
-
-def test_recusa_do_broker_nao_conta_erro_nem_registra(montar, tmp_path):
-    p, cli, relogio, col = montar()
-    cli.ao_status("erro", "Conexão recusada: usuário ou senha incorretos")
-    p.desconectar().result(5)
-    assert p.contadores[2] == 0
-    _bate(p, col, tmp_path / "logs")
+# mqtt: queda/recusa do broker contam um erro por incidente; testes em tests/test_queda_broker.py
 
 
 # --------------------------------------------------------------------------------- arquivo do dia

@@ -21,7 +21,15 @@ hora local da recepção), no máx. 1 vez a cada ``INTERVALO_DISPOSITIVO`` s por
 Erros (``ao_erro``): todo +1 no contador de erros passa por ``_erro``, que soma, monta o registro JSON
 (``app.core.erros``), grava em ``<pasta_logs>/erros_AAAAMMDD.jsonl`` e avisa o callback. Assim contador e registros
 batem sempre. Categorias: "payload" (inválido, binário, vazio, incompleto), "sql" (lote para a contingência por
-falha do banco, linha recusada na bissecção), "contingencia" (falha ao gravar o arquivo), "fila" (fila cheia).
+falha do banco, linha recusada na bissecção), "contingencia" (falha ao gravar o arquivo), "fila" (fila cheia),
+"mqtt" (queda do broker, conexão recusada, assinatura recusada).
+
+Erros "mqtt" contam **um por queda (incidente)**, não um por tentativa de reconexão (o paho tenta a cada 1–60 s):
+- conexão perdida sem o usuário pedir, ou tentativa de conexão que falha (inacessível/CONNACK recusado) sem incidente
+  aberto → abre o incidente e soma 1 erro; as tentativas seguintes que falham não somam (só log);
+- ao conectar de novo, o incidente fecha com um INFO "Broker voltou após X";
+- desconectar/encerrar (inclusive o reinício do vigia) não gera erro e descarta o incidente aberto;
+- cada SUBACK recusado soma 1 erro, com o tópico.
 """
 from __future__ import annotations
 
@@ -74,6 +82,15 @@ def proximo_ciclo(agora: float, intervalo: float) -> float:
 def iso_local(t: float) -> str:
     """Epoch → "AAAA-MM-DDTHH:MM:SS" na hora local."""
     return datetime.fromtimestamp(t).strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def duracao_texto(segundos: float) -> str:
+    """3 → "3 s"; 192 → "3 min 12 s"; 3725 → "1 h 2 min 5 s"."""
+    total = int(round(max(0.0, segundos)))
+    h, resto = divmod(total, 3600)
+    m, s = divmod(resto, 60)
+    partes = ([f"{h} h"] if h else []) + ([f"{m} min"] if h or m else []) + [f"{s} s"]
+    return " ".join(partes)
 
 
 def _plural(n: int, singular: str, plural: str) -> str:
@@ -160,6 +177,12 @@ class Pipeline:
         self._encerrado = False
         self._amostrando = False
 
+        # incidentes do broker (protegidos por _trava; chegam pela thread de rede do paho)
+        self._geracao = 0                      # muda a cada conectar/parar: eventos de cliente antigo são ignorados
+        self._endereco = ""
+        self._incidente_inicio: float | None = None
+        self._ultima_msg_t: float | None = None  # epoch da última mensagem recebida nesta conexão (sem limitação)
+
     # ------------------------------------------------------------------------------ API pública
 
     def conectar(self, broker: str, porta: int, topico: str, qos: int) -> Future:
@@ -238,6 +261,37 @@ class Pipeline:
             logger.exception("Falha ao gravar o registro de erro")
         self._avisar(self._ao_erro, texto)
 
+    def _evento_mqtt(self, geracao: int, tipo: str, motivo: str) -> None:
+        """Eventos de conexão do ``ClienteMqtt`` (thread de rede): um erro por queda, INFO na volta."""
+        agora = self._relogio()
+        erro: tuple[str, str] | None = None
+        voltou: float | None = None
+        with self._trava:
+            if geracao != self._geracao or self._encerrado:
+                return  # cliente antigo, desconexão pedida ou encerramento: nunca é erro
+            endereco = self._endereco
+            if tipo == "conectado":
+                if self._incidente_inicio is not None:
+                    voltou = max(0.0, agora - self._incidente_inicio)
+                    self._incidente_inicio = None
+            elif tipo in ("perdida", "falha_conexao"):
+                if self._incidente_inicio is None:
+                    self._incidente_inicio = agora
+                    if tipo == "perdida":
+                        ultima = self._ultima_msg_t
+                        quando = (f"última mensagem recebida em {iso_local(ultima)}" if ultima is not None
+                                  else "nenhuma mensagem recebida nesta conexão")
+                        erro = (f"Conexão com o broker {endereco} perdida", f"Motivo: {motivo}; {quando}.")
+                    else:
+                        erro = (f"Não foi possível conectar ao broker {endereco}", f"Motivo: {motivo}.")
+        if tipo == "assinatura_recusada":
+            self._erro("mqtt", f"Assinatura recusada pelo broker para {self._assinatura}.", self._assinatura,
+                       f"Código do SUBACK: {motivo}. Verifique as permissões (ACL) do usuário no broker.")
+        elif erro is not None:
+            self._erro("mqtt", erro[0], detalhe=erro[1])
+        elif voltou is not None:
+            self._log("INFO", f"Broker voltou após {duracao_texto(voltou)}")
+
     def _pasta_logs(self) -> Path:
         pasta = getattr(self.config.gravacao, "pasta_logs", "logs") or "logs"
         return _erros.resolver_pasta(pasta, self._pasta)
@@ -302,6 +356,12 @@ class Pipeline:
 
         self._assinatura = topico
         self._ultima_leitura_t = None
+        with self._trava:
+            self._geracao += 1
+            geracao = self._geracao
+            self._endereco = f"{broker}:{porta}"
+            self._incidente_inicio = None
+            self._ultima_msg_t = None
         self._dispositivos_t = {}
         proximo = proximo_ciclo(self._relogio(), intervalo) if intervalo > 0 else None
         if intervalo > 0:
@@ -322,6 +382,7 @@ class Pipeline:
                 usuario=self.config.mqtt.usuario,
                 senha=self.config.mqtt.senha,
                 sessao_persistente=self._sessao_persistente,
+                ao_evento=lambda tipo, motivo, g=geracao: self._evento_mqtt(g, tipo, motivo),
             )
             self._cliente.iniciar()
         except Exception as exc:  # noqa: BLE001
@@ -331,6 +392,9 @@ class Pipeline:
             self._finalizar_processador()
 
     def _parar(self, silencioso: bool = False) -> None:
+        with self._trava:
+            self._geracao += 1          # a partir daqui, eventos do cliente que está saindo não contam
+            self._incidente_inicio = None
         cliente, self._cliente = self._cliente, None
         if cliente is None and self._processador is None:
             if not silencioso:
@@ -360,6 +424,7 @@ class Pipeline:
             return
         self._somar(recebidas=1)
         agora = self._relogio()
+        self._ultima_msg_t = agora
         ultima = self._ultima_leitura_t
         if ultima is None or agora - ultima >= self.INTERVALO_ULTIMA_LEITURA or agora < ultima:
             self._ultima_leitura_t = agora
