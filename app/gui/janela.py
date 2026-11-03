@@ -6,6 +6,9 @@ A janela não sabe nada de MQTT nem de SQL: recebe um objeto que segue o contrat
 
 Operação contínua (CLAUDE.md): contagem até a próxima gravação e última gravação no topo da caixa ATIVIDADE,
 limpeza da caixa à meia-noite (hora local) e o vigia, que reinicia o programa se faltar leitura ou gravação.
+
+O cartão da direita tem duas abas: "Atividade" (a caixa de logs) e "Mosquitto" (console do broker local, processo
+filho do app; ver app/gui/mosquitto.py). Os processos filhos param ao fechar a janela e antes do reinício do vigia.
 """
 from __future__ import annotations
 
@@ -16,7 +19,7 @@ from datetime import date, datetime
 from typing import Any, Callable
 
 from PySide6.QtCore import QSettings, QTimer, Qt
-from PySide6.QtGui import QCloseEvent, QGuiApplication, QKeySequence, QShortcut
+from PySide6.QtGui import QCloseEvent, QColor, QGuiApplication, QIcon, QKeySequence, QPainter, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -29,15 +32,17 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSizePolicy,
     QSpinBox,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
 
-from app.config import Config, SqlServerConfig
+from app.config import Config, MosquittoConfig, SqlServerConfig
 
 from . import estilo, tempo
 from . import vigia as vigia_mod
 from .credenciais import CofreSenhas
+from .mosquitto import ConsoleMosquitto, PainelMosquitto
 from .recursos import icone_app, icone_olho, pixmap_app
 from .widgets import (
     Cartao,
@@ -50,7 +55,8 @@ from .widgets import (
     repolir,
 )
 
-TITULO = "MQTT → SQL Server"
+TITULO = "Integrador Alumbra MQTT + SQL + Mosquitto"
+# Identificadores internos NÃO mudam com o título (senão o usuário perde a senha e os valores salvos).
 ORGANIZACAO = "Alumbra"
 APLICACAO = "MQTT SQL Server"
 
@@ -151,10 +157,13 @@ class JanelaPrincipal(QMainWindow):
         relogio: Callable[[], float] | None = None,
         iniciar_processo: Callable[[vigia_mod.Comando], bool] | None = None,
         sair: Callable[[], None] | None = None,
+        console_mosquitto: ConsoleMosquitto | None = None,
     ):
         """`tema`: None segue o sistema; "claro" ou "escuro" força um deles.
         `cofre`: onde guardar a senha do SQL (padrão: keyring); testes passam um falso.
-        `relogio` (epoch em s), `iniciar_processo` e `sair`: injetáveis para testar o vigia e o reinício."""
+        `relogio` (epoch em s), `iniciar_processo` e `sair`: injetáveis para testar o vigia e o reinício.
+        `console_mosquitto`: processo da aba Mosquitto (padrão: criado com `config.mosquitto`). A janela NÃO o
+        inicia sozinha: quem abre o programa chama `iniciar_mosquitto_ao_abrir()` (app/main.py)."""
         super().__init__(parent)
         self.bridge = bridge
         self.config = config
@@ -175,6 +184,11 @@ class JanelaPrincipal(QMainWindow):
         minutos = getattr(getattr(config, "vigia", None), "minutos", 10)
         self.vigia = vigia_mod.Vigia(minutos, self._reiniciar, sql_configurado=self._sql_configurado,
                                      relogio=self._relogio)
+        if console_mosquitto is None:
+            console_mosquitto = ConsoleMosquitto(getattr(config, "mosquitto", None) or MosquittoConfig(), self)
+        elif console_mosquitto.parent() is None:
+            console_mosquitto.setParent(self)
+        self.mosquitto = console_mosquitto
 
         self.setWindowTitle(TITULO)
         self.setWindowIcon(icone_app())
@@ -240,8 +254,7 @@ class JanelaPrincipal(QMainWindow):
             c.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
             linha.addWidget(c)
         direita.addLayout(linha)
-        self.logs = PainelLogs(parent=raiz)
-        direita.addWidget(self.logs, 1)
+        direita.addWidget(self._montar_abas(raiz), 1)
 
         colunas.addWidget(lateral)
         colunas.addLayout(direita, 1)
@@ -274,6 +287,60 @@ class JanelaPrincipal(QMainWindow):
         self._timer_meia_noite.setTimerType(Qt.TimerType.PreciseTimer)
         self._timer_meia_noite.timeout.connect(self._ao_meia_noite)
 
+    def _montar_abas(self, raiz: QWidget) -> Cartao:
+        """Cartão com as abas "Atividade" (a caixa de logs de sempre) e "Mosquitto" (console do broker local)."""
+        cartao = Cartao(raiz, margem=16, espaco=0)
+        cartao.corpo.setContentsMargins(16, 10, 16, 16)
+        self.abas = QTabWidget(cartao)
+        self.abas.setObjectName("abasAcompanhamento")
+        self.abas.tabBar().setObjectName("barraAbas")
+        self.abas.tabBar().setDrawBase(False)
+        self.abas.tabBar().setExpanding(False)
+        self.abas.tabBar().setCursor(Qt.CursorShape.PointingHandCursor)
+        self.abas.setDocumentMode(False)
+
+        # Aba Atividade: o mesmo painel de antes (chips, botões, caixa); o nome agora fica na própria aba.
+        self.logs = PainelLogs(parent=self.abas)
+        self.logs.corpo.setContentsMargins(0, 12, 0, 0)
+        self.logs.titulo.hide()
+        self.abas.addTab(self.logs, "Atividade")
+        self.abas.setTabToolTip(0, "Eventos da conexão, das mensagens e das gravações no SQL Server.")
+
+        self.painel_mosquitto = PainelMosquitto(self.mosquitto, self.abas)
+        self.abas.addTab(self.painel_mosquitto, "Mosquitto")
+        self.abas.setTabToolTip(1, f"Broker Mosquitto local: {self.mosquitto.prompt()}")
+        self.mosquitto.estado_alterado.connect(lambda estado, _t: self._icone_aba_mosquitto(estado))
+        self._icone_aba_mosquitto(self.mosquitto.estado)
+
+        cartao.corpo.addWidget(self.abas, 1)
+        return cartao
+
+    def _icone_aba_mosquitto(self, estado: str) -> None:
+        """Ponto colorido ao lado do nome da aba (o texto do estado fica no chip dentro dela)."""
+        p = self._paleta
+        cor = {"rodando": p.sucesso, "erro": p.erro, "iniciando": p.aviso, "parando": p.aviso}.get(estado)
+        if cor is None:
+            self.abas.setTabIcon(1, QIcon())
+            return
+        dpr = self.devicePixelRatioF()
+        pix = QPixmap(int(10 * dpr), int(10 * dpr))
+        pix.setDevicePixelRatio(dpr)
+        pix.fill(Qt.GlobalColor.transparent)
+        pintor = QPainter(pix)
+        pintor.setRenderHint(QPainter.RenderHint.Antialiasing)
+        pintor.setPen(Qt.PenStyle.NoPen)
+        pintor.setBrush(QColor(cor))
+        pintor.drawEllipse(1, 1, 8, 8)
+        pintor.end()
+        self.abas.setTabIcon(1, QIcon(pix))
+
+    def iniciar_mosquitto_ao_abrir(self) -> bool:
+        """Ao abrir o programa (antes da conexão automática): inicia o Mosquitto se
+        `[mosquitto] iniciar_automaticamente` estiver ligado. O cliente MQTT reconecta sozinho, sem esperar."""
+        if self._encerrado:
+            return False
+        return self.mosquitto.iniciar_ao_abrir()
+
     def _montar_cabecalho(self, raiz: QWidget) -> QHBoxLayout:
         cab = QHBoxLayout()
         cab.setSpacing(12)
@@ -284,8 +351,12 @@ class JanelaPrincipal(QMainWindow):
         titulos.setSpacing(0)
         titulo = QLabel(TITULO, raiz)
         titulo.setObjectName("titulo")
-        sub = QLabel("Recebe as leituras dos dispositivos via MQTT e grava no SQL Server.", raiz)
+        sub = QLabel("Recebe as leituras dos dispositivos via MQTT e grava no SQL Server, "
+                     "e mostra o broker Mosquitto local.", raiz)
         sub.setObjectName("subtitulo")
+        sub.setWordWrap(True)  # janela estreita (980 px): quebra em duas linhas em vez de cortar ou empurrar o status
+        sub.setMinimumWidth(240)
+        sub.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         titulos.addWidget(titulo)
         titulos.addWidget(sub)
         self.status = IndicadorStatus(raiz)
@@ -452,8 +523,11 @@ class JanelaPrincipal(QMainWindow):
         ordem = [self.campo_broker, self.campo_porta, self.campo_topico, *self.seletor_qos.botoes,
                  self.botao_conectar, self.campo_servidor, self.campo_banco, *self.seletor_autenticacao.botoes,
                  self.campo_usuario, self.campo_senha, self.opcao_lembrar, *self.seletor_cripto.botoes,
-                 self.opcao_confiar, self.botao_testar, self.logs.botao_limpar, self.logs.botao_copiar,
-                 self.logs.botao_salvar, self.logs.caixa]
+                 self.opcao_confiar, self.botao_testar, self.abas.tabBar(), self.logs.botao_limpar,
+                 self.logs.botao_copiar, self.logs.botao_salvar, self.logs.caixa,
+                 self.painel_mosquitto.botao_iniciar, self.painel_mosquitto.botao_parar,
+                 self.painel_mosquitto.botao_limpar, self.painel_mosquitto.caixa,
+                 self.painel_mosquitto.campo_comando, self.painel_mosquitto.botao_executar]
         for a, b in zip(ordem, ordem[1:]):
             QWidget.setTabOrder(a, b)
         QShortcut(QKeySequence("Ctrl+L"), self, activated=self.logs.limpar)
@@ -572,6 +646,8 @@ class JanelaPrincipal(QMainWindow):
         paleta = estilo.aplicar(QApplication.instance(), escuro)
         self._paleta = paleta
         self.logs.definir_paleta(paleta)
+        self.painel_mosquitto.caixa.definir_paleta(paleta)
+        self._icone_aba_mosquitto(self.mosquitto.estado)
         self._atualizar_icone_olho()
         self.tema_escuro = escuro
 
@@ -801,7 +877,7 @@ class JanelaPrincipal(QMainWindow):
                 motivo,
                 registrar=self._registrar_agora,
                 salvar=self._salvar_valores,
-                encerrar=self.bridge.encerrar,
+                encerrar=self._encerrar_tudo,
                 iniciar=self._iniciar_processo,
                 sair=self._sair,
             )
@@ -809,6 +885,14 @@ class JanelaPrincipal(QMainWindow):
             QApplication.restoreOverrideCursor()
         if not ok:
             self._aplicar_estado("erro", "Reinício automático falhou")
+
+    def _encerrar_tudo(self, timeout: float = TEMPO_ENCERRAR_S) -> None:
+        """Pipeline (grava o último lote e desconecta) e depois os processos filhos da aba Mosquitto
+        (o broker local pode ser o mesmo em que o pipeline está conectado)."""
+        try:
+            self.bridge.encerrar(timeout=timeout)
+        finally:
+            self.mosquitto.encerrar()
 
     def _registrar_agora(self, nivel: str, mensagem: str) -> None:
         self._log_local(nivel, mensagem)
@@ -867,7 +951,7 @@ class JanelaPrincipal(QMainWindow):
             QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
             QApplication.processEvents()
             try:
-                self.bridge.encerrar(timeout=TEMPO_ENCERRAR_S)
+                self._encerrar_tudo(timeout=TEMPO_ENCERRAR_S)
             finally:
                 QApplication.restoreOverrideCursor()
         super().closeEvent(evento)

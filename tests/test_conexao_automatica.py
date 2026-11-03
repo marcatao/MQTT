@@ -32,6 +32,7 @@ def abrir(qapp, tmp_path):  # noqa: F811
                broker="10.0.0.5", topico="NOVUS/x/#", config=None):
         config = config or Config()
         config.inicio.conectar_automaticamente = auto
+        config.mosquitto.iniciar_automaticamente = False  # não tenta rodar o mosquitto.exe nos testes
         settings = QSettings(str(tmp_path / f"gui{len(criadas)}.ini"), QSettings.Format.IniFormat)
         settings.setValue("mqtt/broker", broker)
         settings.setValue("mqtt/porta", 1884)

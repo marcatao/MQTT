@@ -52,7 +52,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v0.1.${{ github.run_number }}
-          name: MQTT → SQL Server v0.1.${{ github.run_number }}
+          name: Integrador Alumbra MQTT + SQL + Mosquitto v0.1.${{ github.run_number }}
           target_commitish: ${{ github.sha }}
           make_latest: true
           body: |

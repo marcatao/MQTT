@@ -48,6 +48,7 @@ def montar(qapp, tmp_path):  # noqa: F811
         relogio = relogio or Relogio()
         config = Config()
         config.vigia.minutos = minutos
+        config.mosquitto.iniciar_automaticamente = False  # não tenta rodar o mosquitto.exe nos testes
         settings = QSettings(str(tmp_path / "gui.ini"), QSettings.Format.IniFormat)
         kw.setdefault("intervalo", 3600)  # sem mensagens simuladas: o teste emite os sinais com o relógio falso
         bridge = FakePipelineBridge(config, ciclo=0, **kw)
@@ -298,7 +299,9 @@ def test_auto_conectar_conecta(qapp, tmp_path):  # noqa: F811
     settings.setValue("mqtt/topico", "NOVUS/x/#")
     settings.setValue("mqtt/qos", 1)
     settings.sync()
-    janela = montar_janela(["app", ARG_AUTO], config=Config(), bridge_cls=FakePipelineBridge, settings=settings,
+    config = Config()
+    config.mosquitto.iniciar_automaticamente = False  # não tenta rodar o mosquitto.exe nos testes
+    janela = montar_janela(["app", ARG_AUTO], config=config, bridge_cls=FakePipelineBridge, settings=settings,
                            tema="claro", cofre=CofreFalso())
     try:
         bridge = janela.bridge
@@ -313,6 +316,7 @@ def test_auto_conectar_conecta(qapp, tmp_path):  # noqa: F811
         janela.close()
 
     config = Config()
+    config.mosquitto.iniciar_automaticamente = False
     config.inicio.conectar_automaticamente = False  # sem --auto-conectar e com a opção desligada: não conecta
     janela = montar_janela(["app"], config=config, bridge_cls=FakePipelineBridge, settings=settings,
                            tema="claro", cofre=CofreFalso())

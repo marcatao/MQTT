@@ -28,6 +28,7 @@ def test_janela_com_bridge_real(qapp, broker, tmp_path):  # noqa: F811
     porta = broker
     config = Config()
     config.gravacao.pasta_contingencia = str(tmp_path / "contingencia")
+    config.mosquitto.iniciar_automaticamente = False  # não tenta rodar o mosquitto.exe nos testes
     bridge = PipelineBridge(config)
     settings = QSettings(str(tmp_path / "gui.ini"), QSettings.Format.IniFormat)
     janela = JanelaPrincipal(bridge, config, settings=settings, tema="claro", cofre=CofreFalso())

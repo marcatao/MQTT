@@ -42,6 +42,17 @@ class Paleta:
     log_fundo: str
     selecao: str
     destaque_texto: str = ""  # texto na cor de destaque sobre destaque_suave (chips)
+    # Console da aba Mosquitto: fundo de terminal (escuro nos dois temas, como o Prompt de Comando).
+    # Contraste sobre terminal_fundo: texto 13:1, fraco 6:1, prompt/aviso/erro/ok acima de 7:1.
+    terminal_fundo: str = "#0C0F14"
+    terminal_texto: str = "#D7DCE3"
+    terminal_fraco: str = "#8B95A5"
+    terminal_prompt: str = "#FFFFFF"
+    terminal_aviso: str = "#F5C04A"
+    terminal_erro: str = "#FF8A80"
+    terminal_ok: str = "#6EE7A0"
+    terminal_selecao: str = "#2B4C80"
+    terminal_borda: str = "#252C37"
 
 
 # Contraste conferido para WCAG AA (texto normal >= 4,5:1 sobre a superfície correspondente).
@@ -244,6 +255,27 @@ QLabel#chipPonto { border-radius: 4px; background: $texto_fraco; }
 QLabel#chipPonto[estado="ativo"] { background: $destaque_texto; }
 QLabel#chipPonto[estado="ocupado"] { background: $aviso; }
 QLabel#chipPonto[estado="ok"] { background: $sucesso; }
+QFrame#chipInfo[estado="erro"] { background: $erro_suave; border-color: $erro_suave; }
+QLabel#chipValor[estado="erro"] { color: $erro; }
+QLabel#chipPonto[estado="erro"] { background: $erro; }
+
+/* ---------- Abas do cartão de acompanhamento (Atividade / Mosquitto) ---------- */
+QTabWidget#abasAcompanhamento::pane {
+    border: none; border-top: 1px solid $borda; background: transparent; top: -1px;
+}
+QTabWidget#abasAcompanhamento::tab-bar { left: 0px; }
+QTabBar#barraAbas { background: transparent; }
+QTabBar#barraAbas::tab {
+    background: transparent; color: $texto_sec; font-size: 11pt; font-weight: 600;
+    border: none; border-bottom: 2px solid transparent;
+    padding: 4px 4px 10px 4px; margin-right: 24px; min-width: 64px;
+}
+QTabBar#barraAbas::tab:hover:!selected { color: $texto; border-bottom: 2px solid $borda_forte; }
+QTabBar#barraAbas::tab:selected { color: $texto; border-bottom: 2px solid $destaque; }
+QTabBar#barraAbas:focus { outline: none; }
+QWidget#paginaAba { background: transparent; }
+/* O painel de atividade já está dentro do cartão: sem uma segunda borda. */
+QTabWidget#abasAcompanhamento QFrame#cartao { background: transparent; border: none; }
 
 /* ---------- Caixa de logs ---------- */
 QPlainTextEdit#caixaLogs {
@@ -251,6 +283,16 @@ QPlainTextEdit#caixaLogs {
     border: 1px solid $borda; border-radius: 8px; padding: 6px 4px;
     selection-background-color: $selecao; selection-color: $texto;
 }
+
+/* ---------- Console da aba Mosquitto (fundo de terminal) ---------- */
+QPlainTextEdit#consoleMosquitto {
+    background: $terminal_fundo; color: $terminal_texto;
+    border: 1px solid $terminal_borda; border-radius: 8px; padding: 8px 6px;
+    selection-background-color: $terminal_selecao; selection-color: $terminal_prompt;
+}
+QPlainTextEdit#consoleMosquitto QScrollBar::handle:vertical { background: #3A4453; }
+QPlainTextEdit#consoleMosquitto QScrollBar::handle:vertical:hover { background: #56627A; }
+QLabel#promptComando { color: $texto_sec; }
 
 QScrollBar:vertical { background: transparent; width: 12px; margin: 4px 2px 4px 0; }
 QScrollBar::handle:vertical { background: $borda_forte; border-radius: 4px; min-height: 32px; margin: 0 2px; }
@@ -363,6 +405,9 @@ def _arquivo_check(cor: str) -> str:
 def aplicar(app: QApplication, escuro: bool) -> Paleta:
     """Aplica paleta e QSS na aplicação inteira e devolve a paleta usada."""
     p = ESCURA if escuro else CLARA
+    qss = _QSS.substitute(asdict(p), check=_arquivo_check(p.texto_sobre_destaque))
+    if app.styleSheet() == qss:
+        return p  # mesmo tema: reaplicar o QSS repoliria todos os widgets de todas as janelas à toa
     app.setPalette(_paleta_qt(p))
-    app.setStyleSheet(_QSS.substitute(asdict(p), check=_arquivo_check(p.texto_sobre_destaque)))
+    app.setStyleSheet(qss)
     return p

@@ -59,8 +59,10 @@ def montar(qapp, tmp_path):
 
     def _montar(cofre=None, **kw):
         settings = QSettings(str(tmp_path / "gui.ini"), QSettings.Format.IniFormat)
-        bridge = FakePipelineBridge(Config(), **kw)
-        janela = JanelaPrincipal(bridge, Config(), settings=settings, tema="claro", cofre=cofre or CofreFalso())
+        config = Config()
+        config.mosquitto.iniciar_automaticamente = False  # não tenta rodar o mosquitto.exe nos testes
+        bridge = FakePipelineBridge(config, **kw)
+        janela = JanelaPrincipal(bridge, config, settings=settings, tema="claro", cofre=cofre or CofreFalso())
         janela.show()
         criadas.append(janela)
         return janela, bridge, settings
@@ -72,7 +74,7 @@ def montar(qapp, tmp_path):
 
 def test_padroes_preenchidos(montar):
     janela, bridge, _ = montar()
-    assert janela.windowTitle() == "MQTT → SQL Server"
+    assert janela.windowTitle() == "Integrador Alumbra MQTT + SQL + Mosquitto"
     assert janela.campo_broker.text() == "192.168.100.162"
     assert janela.campo_porta.value() == 1883
     assert janela.campo_topico.text() == "NOVUS/Teste_Alumbra/#"

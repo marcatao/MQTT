@@ -88,6 +88,18 @@ class InicioConfig:
 
 
 @dataclass
+class MosquittoConfig:
+    """Broker Mosquitto local rodando como processo filho do app (aba Mosquitto).
+
+    `comando`: o primeiro token é o programa (".exe" é acrescentado se faltar), o resto são os argumentos.
+    O prompt mostrado no console é sempre ``<pasta>><comando>``.
+    """
+    pasta: str = "C:\\Program Files\\mosquitto168"
+    comando: str = "mosquitto -v"
+    iniciar_automaticamente: bool = True
+
+
+@dataclass
 class Config:
     mqtt: MqttConfig = field(default_factory=MqttConfig)
     sqlserver: SqlServerConfig = field(default_factory=SqlServerConfig)
@@ -95,6 +107,7 @@ class Config:
     mapeamento: MapeamentoConfig = field(default_factory=MapeamentoConfig)
     vigia: VigiaConfig = field(default_factory=VigiaConfig)
     inicio: InicioConfig = field(default_factory=InicioConfig)
+    mosquitto: MosquittoConfig = field(default_factory=MosquittoConfig)
 
 
 def _preencher(destino, dados: dict) -> None:
@@ -110,6 +123,6 @@ def carregar(caminho: Path | None = None) -> Config:
     if caminho.exists():
         with caminho.open("rb") as f:
             dados = tomllib.load(f)
-        for secao in ("mqtt", "sqlserver", "gravacao", "mapeamento", "vigia", "inicio"):
+        for secao in ("mqtt", "sqlserver", "gravacao", "mapeamento", "vigia", "inicio", "mosquitto"):
             _preencher(getattr(cfg, secao), dados.get(secao, {}))
     return cfg

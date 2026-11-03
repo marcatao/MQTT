@@ -55,3 +55,12 @@ minutos = 10
 # false = espera o clique em Conectar. (O reinício automático do vigia conecta de qualquer jeito.)
 # Para gravar no banco sem digitar nada, a senha precisa estar salva ("Lembrar senha").
 conectar_automaticamente = true
+
+[mosquitto]
+# Aba Mosquitto: ao abrir o programa, roda o broker local como processo filho e mostra a saída ao vivo
+# (prompt "<pasta>><comando>"). Ele para ao fechar o programa e volta junto no reinício automático.
+# Se o Mosquitto já roda como serviço do Windows, pare o serviço ou use iniciar_automaticamente = false
+# (os dois não podem ouvir a porta 1883 ao mesmo tempo).
+pasta = "C:\\Program Files\\mosquitto168"
+comando = "mosquitto -v"     # 1º token = programa (.exe é acrescentado se faltar); o resto são argumentos
+iniciar_automaticamente = true

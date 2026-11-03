@@ -1,6 +1,7 @@
-"""Ponto de entrada: `python -m app.main` abre a janela MQTT → SQL Server.
+"""Ponto de entrada: `python -m app.main` abre a janela do Integrador Alumbra MQTT + SQL + Mosquitto.
 
-Por padrão conecta sozinho ao abrir (`[inicio] conectar_automaticamente = true` no config.toml).
+Por padrão inicia o Mosquitto local (`[mosquitto] iniciar_automaticamente`, aba Mosquitto) e conecta sozinho ao
+abrir (`[inicio] conectar_automaticamente = true` no config.toml).
 
     --auto-conectar   força a conexão automática mesmo com a opção desligada (usado pelo vigia ao reiniciar)
 """
@@ -18,7 +19,7 @@ from PySide6.QtWidgets import QApplication
 from app.bridge import PipelineBridge
 from app.config import Config, carregar, pasta_base
 from app.gui import estilo
-from app.gui.janela import APLICACAO, ORGANIZACAO, JanelaPrincipal
+from app.gui.janela import APLICACAO, ORGANIZACAO, TITULO, JanelaPrincipal
 from app.gui.recursos import icone_app
 from app.gui.vigia import ARG_AUTO
 
@@ -74,6 +75,8 @@ def montar_janela(argv: list[str], config: Config | None = None, bridge_cls=Pipe
     bridge = bridge_cls(config)
     janela = JanelaPrincipal(bridge, config, settings=settings, **kw_janela)
     janela.show()
+    # Mosquitto local primeiro (aba Mosquitto); o cliente MQTT reconecta sozinho se o broker demorar a subir.
+    janela.iniciar_mosquitto_ao_abrir()
     inicio = getattr(config, "inicio", None)
     if args.auto_conectar or getattr(inicio, "conectar_automaticamente", True):
         origem = f"reinício ({ARG_AUTO})" if args.auto_conectar else "[inicio] conectar_automaticamente"
@@ -90,7 +93,8 @@ def main(argv: list[str] | None = None) -> int:
     QGuiApplication.setHighDpiScaleFactorRoundingPolicy(Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
     app = QApplication(argv)
     app.setOrganizationName(ORGANIZACAO)
-    app.setApplicationName(APLICACAO)
+    app.setApplicationName(APLICACAO)  # identificador do QSettings: não muda com o título
+    app.setApplicationDisplayName(TITULO)
     app.setWindowIcon(icone_app())
     app.setStyle("Fusion")
     app.setFont(estilo.fonte_interface())

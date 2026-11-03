@@ -1,4 +1,4 @@
-"""Componentes da tela: indicador de status, cartão de contador, seletor de QoS, chips e painel de logs."""
+"""Componentes da tela: indicador de status, cartão de contador, seletor de QoS, chips, painel de logs e console."""
 from __future__ import annotations
 
 from collections import deque
@@ -308,6 +308,7 @@ class PainelLogs(Cartao):
         topo.setSpacing(8)
         titulo = QLabel("Atividade", self)
         titulo.setObjectName("tituloCartao")
+        self.titulo = titulo
         self.chip_pausa = QPushButton("Rolagem pausada · ir para o fim ↓", self)
         self.chip_pausa.setObjectName("chipPausa")
         self.chip_pausa.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -487,4 +488,128 @@ class PainelLogs(Cartao):
         self._historico.extend(linhas)
         if seguir:
             barra = self.caixa.verticalScrollBar()
+            barra.setValue(barra.maximum())
+
+
+class CaixaConsole(QPlainTextEdit):
+    """Console somente leitura com fundo de terminal (aba Mosquitto).
+
+    Mesmo comportamento da caixa de atividade: atualização em lote por QTimer (milhares de linhas não travam a
+    tela), limite de linhas e rolagem automática que pausa quando o usuário rola para cima (`seguindo_alterado`).
+
+    Tipos de linha: "prompt" (C:\\pasta>comando), "saida" (o que o processo escreve), "info", "ok", "aviso", "erro"
+    (mensagens do próprio app sobre o processo).
+    """
+
+    TIPOS = ("prompt", "saida", "info", "ok", "aviso", "erro")
+    seguindo_alterado = Signal(bool)
+
+    def __init__(self, limite_linhas: int = 5000, intervalo_ms: int = 150, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setObjectName("consoleMosquitto")
+        self._limite = limite_linhas
+        self._historico: deque[tuple[str, str]] = deque(maxlen=limite_linhas)
+        self._pendentes: deque[tuple[str, str]] = deque(maxlen=limite_linhas)
+        self._seguir = True
+        self._formatos: dict[str, QTextCharFormat] = {}
+        self.setReadOnly(True)
+        self.setUndoRedoEnabled(False)
+        self.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
+        self.setMaximumBlockCount(limite_linhas)
+        self.setFont(fonte_mono())
+        self.setAccessibleName("Console do Mosquitto")
+        self.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.TextSelectableByKeyboard
+        )
+        self.verticalScrollBar().valueChanged.connect(self._rolagem_mudou)
+        self._timer = QTimer(self)
+        self._timer.setInterval(intervalo_ms)
+        self._timer.timeout.connect(self.descarregar)
+        self._timer.start()
+        self.definir_paleta(CLARA)
+
+    # ----- API -----
+    def adicionar(self, tipo: str, texto: str) -> None:
+        """Enfileira um bloco de texto (uma ou várias linhas). A tela é atualizada em lote pelo QTimer."""
+        tipo = tipo if tipo in self.TIPOS else "saida"
+        if tipo == "prompt" and (self._historico or self._pendentes):
+            self._pendentes.append(("saida", ""))  # linha em branco antes de um novo prompt, como no cmd
+        for linha in str(texto).split("\n"):
+            self._pendentes.append((tipo, linha.rstrip("\r")))
+
+    def descarregar(self) -> None:
+        if not self._pendentes:
+            return
+        linhas = list(self._pendentes)
+        self._pendentes.clear()
+        self._inserir(linhas)
+
+    def limpar(self) -> None:
+        self._pendentes.clear()
+        self._historico.clear()
+        self.clear()
+        self._definir_seguir(True)
+
+    def texto(self) -> str:
+        self.descarregar()
+        return "\n".join(l for _, l in self._historico)
+
+    def linhas_texto(self) -> list[str]:
+        self.descarregar()
+        return [l for _, l in self._historico]
+
+    def ir_para_fim(self) -> None:
+        barra = self.verticalScrollBar()
+        barra.setValue(barra.maximum())
+        self._definir_seguir(True)
+
+    @property
+    def seguindo(self) -> bool:
+        return self._seguir
+
+    def definir_paleta(self, p: Paleta) -> None:
+        cores = {"prompt": p.terminal_prompt, "saida": p.terminal_texto, "info": p.terminal_fraco,
+                 "ok": p.terminal_ok, "aviso": p.terminal_aviso, "erro": p.terminal_erro}
+        self._formatos = {}
+        for tipo, cor in cores.items():
+            f = QTextCharFormat()
+            f.setForeground(QColor(cor))
+            if tipo == "prompt":
+                f.setFontWeight(QFont.Weight.Bold)
+            self._formatos[tipo] = f
+        if self._historico:
+            linhas = list(self._historico)
+            self._historico.clear()
+            self.clear()
+            self._inserir(linhas)
+
+    # ----- interno -----
+    def _definir_seguir(self, seguir: bool) -> None:
+        if seguir != self._seguir:
+            self._seguir = seguir
+            self.seguindo_alterado.emit(seguir)
+
+    def _rolagem_mudou(self, valor: int) -> None:
+        self._definir_seguir(valor >= self.verticalScrollBar().maximum() - 2)
+
+    def _inserir(self, linhas: list[tuple[str, str]]) -> None:
+        if len(linhas) > self._limite:
+            linhas = linhas[-self._limite:]
+        seguir = self._seguir
+        doc = self.document()
+        cursor = QTextCursor(doc)
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        cursor.beginEditBlock()
+        vazio = doc.isEmpty() and not self._historico
+        f = self._formatos
+        for tipo, linha in linhas:
+            if vazio:
+                vazio = False
+            else:
+                cursor.insertBlock()
+            cursor.insertText(linha, f.get(tipo, f["saida"]))
+        cursor.endEditBlock()
+        self._historico.extend(linhas)
+        if seguir:
+            barra = self.verticalScrollBar()
             barra.setValue(barra.maximum())
