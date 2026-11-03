@@ -1,4 +1,4 @@
-# MQTT → SQL Server (orquestrador do projeto)
+# Integrador Alumbra MQTT + SQL + Mosquitto (orquestrador do projeto)
 
 Este arquivo é a memória permanente do projeto. Ele é carregado em toda sessão do Claude Code, e quem lê é o
 **orquestrador**: a sessão principal, que entende o objetivo, divide o trabalho, delega aos agentes especialistas e
@@ -230,7 +230,11 @@ mensagem inteira, não só o booleano.
   como era. A aba **Mosquitto** é um console que, ao abrir o programa, executa `mosquitto -v` na pasta
   `C:\Program Files\mosquitto168` (mostrando o prompt `C:\Program Files\mosquitto168>mosquitto -v`) e exibe a saída ao
   vivo. O processo é filho do app (QProcess, só na GUI): para ao fechar o programa e volta junto no reinício do vigia.
-  Pasta, comando e início automático configuráveis em `[mosquitto]`.
+  Pasta, comando e início automático configuráveis em `[mosquitto]`. O usuário abre o Mosquitto manualmente (não é
+  serviço do Windows), então o padrão é iniciar automaticamente.
+- **Nome do app** (03/11/2026): título exibido "Integrador Alumbra MQTT + SQL + Mosquitto". Os identificadores internos
+  continuam (`QSettings("Alumbra", "MQTT SQL Server")`, serviço do keyring, `MQTT-SQLServer.exe`) para não perder a
+  senha e os valores salvos.
 
 ## Pendências conhecidas
 
