@@ -179,6 +179,8 @@ class PipelineBridge(QObject):
     proxima_gravacao = Signal(float)        # epoch (s) do próximo ciclo de gravação; emitido ao conectar e a cada ciclo
     ultima_gravacao_ok = Signal(str)        # ISO 8601 local "AAAA-MM-DDTHH:MM:SS" do último INSERT com sucesso no SQL
     ultima_leitura = Signal(str)            # ISO 8601 local da última mensagem MQTT recebida (para o vigia)
+    dispositivo_visto = Signal(str, str, str)  # (device_id, tópico, ISO local) de leitura recebida; máx. 1 a cada 5 s por device
+    erro_registrado = Signal(str)           # JSON de UM erro (ver "Erros detalhados"); 1 sinal para cada +1 no contador de erros
 
     def __init__(self, config: Config, parent=None): ...
     def definir_sql(self, sql: SqlServerConfig) -> None: ...   # a GUI chama antes de conectar e quando o usuário altera
@@ -235,6 +237,21 @@ mensagem inteira, não só o booleano.
 - **Nome do app** (03/11/2026): título exibido "Integrador Alumbra MQTT + SQL + Mosquitto". Os identificadores internos
   continuam (`QSettings("Alumbra", "MQTT SQL Server")`, serviço do keyring, `MQTT-SQLServer.exe`) para não perder a
   senha e os valores salvos.
+
+- **Aba Clientes** (decidido em 03/11/2026): terceira aba, lista os dispositivos que enviam dados, com **Nome**,
+  **IP**, **MAC**, **Último envio**, tópico, status (conectado/desconectado) e quantidade de mensagens. O MQTT não
+  traz IP/MAC: o **IP e o client id** vêm da saída do `mosquitto -v` da aba Mosquitto ("New client connected from
+  IP:porta as ID", "Received PUBLISH from ID (... 'tópico' ...)", "Client ID disconnected"); o **MAC** vem da tabela
+  ARP do Windows (`arp -a`, só para IPs da mesma rede local); o **nome** é o `device_id` do payload (via
+  `dispositivo_visto`), ligado ao client id pelo tópico. Clientes que só assinam (o próprio app, `mosquitto_sub`) aparecem
+  marcados como "assinante" e podem ser ocultados. Sem o Mosquitto na aba, a lista mostra só nome, tópico e último
+  envio.
+- **Erros detalhados** (decidido em 03/11/2026): clicar no card **ERROS** abre uma janela com a lista de erros
+  registrados (data/hora, categoria, mensagem, tópico, detalhe e trecho do payload), com filtro, cópia e exportação
+  CSV. Cada erro que soma 1 no contador gera exatamente um registro. O core grava os registros também em
+  `logs/erros_AAAAMMDD.jsonl`, e a janela lê o arquivo do dia ao abrir, para não perder a lista num reinício. Formato
+  do JSON: `{"quando": ISO local, "categoria": "payload"|"sql"|"contingencia"|"mqtt"|"fila", "mensagem": str,
+  "topico": str|null, "detalhe": str|null, "payload": str|null (máx. 2000 caracteres)}`.
 
 ## Pendências conhecidas
 
