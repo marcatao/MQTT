@@ -312,10 +312,12 @@ def test_auto_conectar_conecta(qapp, tmp_path):  # noqa: F811
     finally:
         janela.close()
 
-    janela = montar_janela(["app"], config=Config(), bridge_cls=FakePipelineBridge, settings=settings,
+    config = Config()
+    config.inicio.conectar_automaticamente = False  # sem --auto-conectar e com a opção desligada: não conecta
+    janela = montar_janela(["app"], config=config, bridge_cls=FakePipelineBridge, settings=settings,
                            tema="claro", cofre=CofreFalso())
     try:
-        esperar(lambda: False, timeout=0.2)
+        esperar(lambda: False, timeout=0.6)
         assert not any(c[0] == "conectar" for c in janela.bridge.chamadas)
     finally:
         janela.close()

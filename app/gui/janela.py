@@ -60,6 +60,10 @@ TEMPO_ENCERRAR_S = 8.0  # a última gravação pode levar até timeout_conexao (
 ESPERA_DEFINIR_SQL_MS = 600
 TIQUE_MS = 1000  # contagem regressiva, virada do dia e vigia
 AVISO_LEMBRAR_SENHA = "Para o reinício automático continuar gravando no banco, marque Lembrar senha."
+AVISO_SEM_SENHA = ("Senha do SQL Server não salva: digite a senha e marque Lembrar senha para gravar no banco "
+                   "automaticamente. Até lá as leituras vão para a contingência.")
+MSG_AUTO_ABERTURA = "Conexão automática ao abrir o programa"
+MSG_AUTO_REINICIO = "Conexão automática após reinício automático"
 
 CRIPTOGRAFIA = [
     ("Optional", "Opcional", "Criptografa se o servidor oferecer (Encrypt=Optional)."),
@@ -585,13 +589,26 @@ class JanelaPrincipal(QMainWindow):
             self.botao_conectar.setText("Desconectando…")
             self.bridge.desconectar()
 
-    def auto_conectar(self) -> None:
-        """--auto-conectar (reinício pelo vigia): conecta com os valores salvos, sem clique."""
-        self._log_local("INFO", "Início automático: conectando com os valores salvos.")
+    def auto_conectar(self, reinicio: bool = False) -> None:
+        """Conexão automática ao abrir (`[inicio] conectar_automaticamente`) ou após o reinício do vigia
+        (`--auto-conectar`): envia o SQL, testa o banco (como o botão Testar conexão) e conecta no broker como o
+        clique em Conectar, inclusive iniciando o vigia. Chamada pelo app/main.py depois de a janela aparecer."""
+        if self._encerrado or self._estado not in ("desconectado", "erro"):
+            return
+        self._log_local("INFO", MSG_AUTO_REINICIO if reinicio else MSG_AUTO_ABERTURA)
         self._enviar_sql()
-        self._conectar()
+        cfg = self.sql_config()
+        sem_senha = cfg.habilitado and not cfg.autenticacao_windows and not cfg.senha
+        if sem_senha:
+            self._log_local("AVISO", AVISO_SEM_SENHA)
+        elif cfg.habilitado:
+            self._testar_sql()
+        if not self._conectar(avisar_senha=not sem_senha):
+            self._log_local("AVISO", f"Conexão automática não iniciada: {self.erro_validacao.text()} "
+                                     "Corrija e clique em Conectar.")
 
-    def _conectar(self) -> None:
+    def _conectar(self, avisar_senha: bool = True) -> bool:
+        """Valida os campos e pede a conexão ao bridge. Devolve False se a validação falhar."""
         broker = self.campo_broker.text().strip()
         topico = self.campo_topico.text().strip()
         self.campo_broker.setText(broker)
@@ -599,7 +616,7 @@ class JanelaPrincipal(QMainWindow):
         for campo, erro in ((self.campo_broker, validar_broker(broker)), (self.campo_topico, validar_topico(topico))):
             if erro:
                 self._mostrar_validacao(campo, erro)
-                return
+                return False
         self._limpar_validacao()
         porta = self.campo_porta.value()
         qos = self.seletor_qos.valor()
@@ -607,9 +624,10 @@ class JanelaPrincipal(QMainWindow):
         self._enviar_sql()
         self._aplicar_estado("conectando", f"{broker}:{porta}")
         self.vigia.iniciar()
-        if self.vigia.ligado and self._precisa_lembrar_senha():
+        if avisar_senha and self.vigia.ligado and self._precisa_lembrar_senha():
             self._log_local("AVISO", AVISO_LEMBRAR_SENHA)
         self.bridge.conectar(broker, porta, topico, qos)
+        return True
 
     def _precisa_lembrar_senha(self) -> bool:
         """SQL com login e senha, sem a senha salva: depois de um reinício automático o banco ficaria sem senha."""

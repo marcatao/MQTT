@@ -1,6 +1,8 @@
 """Ponto de entrada: `python -m app.main` abre a janela MQTT → SQL Server.
 
-    --auto-conectar   conecta sozinho com os valores salvos (usado pelo vigia ao reiniciar o programa)
+Por padrão conecta sozinho ao abrir (`[inicio] conectar_automaticamente = true` no config.toml).
+
+    --auto-conectar   força a conexão automática mesmo com a opção desligada (usado pelo vigia ao reiniciar)
 """
 from __future__ import annotations
 
@@ -57,20 +59,27 @@ def ler_argumentos(argv: list[str]) -> argparse.Namespace:
     return args
 
 
+ATRASO_AUTO_MS = 300  # conexão automática só depois de a janela aparecer (a tela não abre travada)
+
+
 def montar_janela(argv: list[str], config: Config | None = None, bridge_cls=PipelineBridge,
                   settings: QSettings | None = None, **kw_janela) -> JanelaPrincipal:
-    """Cria bridge e janela, mostra e, com --auto-conectar, agenda a conexão automática.
+    """Cria bridge e janela, mostra e agenda a conexão automática.
 
-    A janela já chama bridge.definir_sql no construtor; auto_conectar envia o SQL de novo e só então conecta.
+    Conecta sozinho quando `[inicio] conectar_automaticamente` está ligado (padrão) ou com --auto-conectar
+    (reinício pelo vigia, que força mesmo com a opção desligada). Toda abertura conecta: o estado não é lembrado.
     """
     args = ler_argumentos(argv)
     config = config or carregar()
     bridge = bridge_cls(config)
     janela = JanelaPrincipal(bridge, config, settings=settings, **kw_janela)
     janela.show()
-    if args.auto_conectar:
-        logging.getLogger("app.main").info("Início com %s: conectando com os valores salvos.", ARG_AUTO)
-        QTimer.singleShot(0, janela.auto_conectar)
+    inicio = getattr(config, "inicio", None)
+    if args.auto_conectar or getattr(inicio, "conectar_automaticamente", True):
+        origem = f"reinício ({ARG_AUTO})" if args.auto_conectar else "[inicio] conectar_automaticamente"
+        logging.getLogger("app.main").info("Conexão automática ao abrir (%s): usando os valores salvos.", origem)
+        reinicio = args.auto_conectar
+        QTimer.singleShot(ATRASO_AUTO_MS, janela, lambda: janela.auto_conectar(reinicio=reinicio))
     return janela
 
 

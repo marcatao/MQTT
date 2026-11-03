@@ -222,6 +222,10 @@ mensagem inteira, não só o booleano.
   conexão. Para gravar no banco depois de reiniciar, a senha precisa estar salva ("Lembrar senha"); sem isso a tela
   avisa ao conectar.
 
+- **Conexão automática ao abrir** (decidido em 03/11/2026): toda vez que o programa abre, ele testa o banco e conecta
+  no broker sozinho, sem clique (`[inicio] conectar_automaticamente = true`). Sem senha salva, conecta o MQTT e avisa
+  que as leituras vão para a contingência até a senha ser salva.
+
 ## Pendências conhecidas
 
 - Reprocessar os arquivos de `contingencia/` (`.jsonl`) no SQL Server quando o banco voltar.
@@ -230,7 +234,7 @@ mensagem inteira, não só o booleano.
 
 ## Estado atual
 
-- v0.1.3 validada pelo usuário em produção (NOVUS → dbo.IOT001). v0.1.4: amostragem de 1 min, contagem regressiva, limpeza diária e vigia.
+- v0.1.3 validada pelo usuário em produção (NOVUS → dbo.IOT001). v0.1.4: amostragem de 1 min, contagem regressiva, limpeza diária e vigia. Seguinte: conexão automática ao abrir.
 
 ## Idioma
 

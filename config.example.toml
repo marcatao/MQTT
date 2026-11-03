@@ -49,3 +49,9 @@ colunas_sem_cabecalho = []   # tabular sem cabeçalho: ex. ["pid", "device_id", 
 # Com o app conectado, se passar este tempo sem nenhuma leitura recebida (ou sem gravação com sucesso no
 # SQL Server, quando ele está configurado), o programa se reinicia sozinho e reconecta. 0 desliga.
 minutos = 10
+
+[inicio]
+# Ao abrir o programa, testa o SQL Server e conecta no broker sozinho, com os últimos valores usados na tela.
+# false = espera o clique em Conectar. (O reinício automático do vigia conecta de qualquer jeito.)
+# Para gravar no banco sem digitar nada, a senha precisa estar salva ("Lembrar senha").
+conectar_automaticamente = true

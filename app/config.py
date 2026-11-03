@@ -81,12 +81,20 @@ class VigiaConfig:
 
 
 @dataclass
+class InicioConfig:
+    """O que fazer ao abrir o programa."""
+    # testa o banco e conecta no broker sozinho, com os valores salvos (--auto-conectar força mesmo com False)
+    conectar_automaticamente: bool = True
+
+
+@dataclass
 class Config:
     mqtt: MqttConfig = field(default_factory=MqttConfig)
     sqlserver: SqlServerConfig = field(default_factory=SqlServerConfig)
     gravacao: GravacaoConfig = field(default_factory=GravacaoConfig)
     mapeamento: MapeamentoConfig = field(default_factory=MapeamentoConfig)
     vigia: VigiaConfig = field(default_factory=VigiaConfig)
+    inicio: InicioConfig = field(default_factory=InicioConfig)
 
 
 def _preencher(destino, dados: dict) -> None:
@@ -102,6 +110,6 @@ def carregar(caminho: Path | None = None) -> Config:
     if caminho.exists():
         with caminho.open("rb") as f:
             dados = tomllib.load(f)
-        for secao in ("mqtt", "sqlserver", "gravacao", "mapeamento", "vigia"):
+        for secao in ("mqtt", "sqlserver", "gravacao", "mapeamento", "vigia", "inicio"):
             _preencher(getattr(cfg, secao), dados.get(secao, {}))
     return cfg
