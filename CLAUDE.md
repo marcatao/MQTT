@@ -226,6 +226,12 @@ mensagem inteira, não só o booleano.
   no broker sozinho, sem clique (`[inicio] conectar_automaticamente = true`). Sem senha salva, conecta o MQTT e avisa
   que as leituras vão para a contingência até a senha ser salva.
 
+- **Aba Mosquitto** (decidido em 03/11/2026): o cartão de atividade vira abas. A aba **Atividade** fica exatamente
+  como era. A aba **Mosquitto** é um console que, ao abrir o programa, executa `mosquitto -v` na pasta
+  `C:\Program Files\mosquitto168` (mostrando o prompt `C:\Program Files\mosquitto168>mosquitto -v`) e exibe a saída ao
+  vivo. O processo é filho do app (QProcess, só na GUI): para ao fechar o programa e volta junto no reinício do vigia.
+  Pasta, comando e início automático configuráveis em `[mosquitto]`.
+
 ## Pendências conhecidas
 
 - Reprocessar os arquivos de `contingencia/` (`.jsonl`) no SQL Server quando o banco voltar.
