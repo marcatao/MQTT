@@ -24,6 +24,8 @@ class PipelineBridge(QObject):
     proxima_gravacao = Signal(float)         # epoch (s) do próximo ciclo de gravação; ao conectar e a cada ciclo
     ultima_gravacao_ok = Signal(str)         # "AAAA-MM-DDTHH:MM:SS" local do último INSERT com commit no SQL Server
     ultima_leitura = Signal(str)             # "AAAA-MM-DDTHH:MM:SS" local da última mensagem MQTT (máx. 1 a cada 5 s)
+    dispositivo_visto = Signal(str, str, str)  # (device_id, tópico, ISO local) de leitura recebida; máx. 1/5 s por device
+    erro_registrado = Signal(str)            # JSON de UM erro (app.core.erros); 1 sinal para cada +1 no contador de erros
 
     def __init__(self, config: Config, parent=None) -> None:
         super().__init__(parent)
@@ -36,6 +38,8 @@ class PipelineBridge(QObject):
             ao_proxima_gravacao=self.proxima_gravacao.emit,
             ao_gravacao_ok=self.ultima_gravacao_ok.emit,
             ao_leitura=self.ultima_leitura.emit,
+            ao_dispositivo=self.dispositivo_visto.emit,
+            ao_erro=self.erro_registrado.emit,
         )
 
     def _emitir_log(self, nivel: str, mensagem: str) -> None:

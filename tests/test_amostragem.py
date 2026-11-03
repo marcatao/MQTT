@@ -104,6 +104,7 @@ def _config(tmp_path, sql: SqlServerConfig | None = None, intervalo: int = 60) -
     cfg.gravacao.lote_max = 500
     cfg.gravacao.lote_segundos = 0.05
     cfg.gravacao.pasta_contingencia = str(tmp_path / "contingencia")
+    cfg.gravacao.pasta_logs = str(tmp_path / "logs")
     cfg.gravacao.intervalo_gravacao_segundos = intervalo
     return cfg
 

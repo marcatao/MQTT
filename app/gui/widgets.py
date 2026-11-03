@@ -1,14 +1,21 @@
 """Componentes da tela: indicador de status, cartão de contador, seletor de QoS, chips, painel de logs e console."""
 from __future__ import annotations
 
+import threading
 from collections import deque
 from datetime import datetime
 from pathlib import Path
+from typing import Callable
 
-from PySide6.QtCore import QLocale, QTimer, Signal, Qt
-from PySide6.QtGui import QColor, QFont, QGuiApplication, QTextCharFormat, QTextCursor
+from PySide6.QtCore import QLocale, QModelIndex, QObject, QRectF, QTimer, Signal, Qt
+from PySide6.QtGui import QColor, QFont, QFontMetrics, QGuiApplication, QKeyEvent, QMouseEvent, QPainter, QTextCharFormat, QTextCursor
 from PySide6.QtWidgets import (
+    QApplication,
     QButtonGroup,
+    QStyle,
+    QStyledItemDelegate,
+    QStyleOptionViewItem,
+    QToolTip,
     QFileDialog,
     QFrame,
     QHBoxLayout,
@@ -23,6 +30,61 @@ from PySide6.QtWidgets import (
 from .estilo import CLARA, Paleta, fonte_mono
 
 LOCALE_BR = QLocale(QLocale.Language.Portuguese, QLocale.Country.Brazil)
+# Papel do modelo com o "tom" de uma pílula (DelegadoPilula): "sucesso" | "aviso" | "erro" | "destaque" | "roxo" | "neutro"
+PAPEL_PILULA = Qt.ItemDataRole.UserRole + 1
+
+
+class _Mensageiro(QObject):
+    """Leva o resultado de uma thread de trabalho à thread da GUI. Sem pai e guardado em `_MENSAGEIROS` até a
+    entrega: a thread nunca emite num objeto que a tela possa estar destruindo."""
+
+    pronto = Signal(object, str)
+
+
+_MENSAGEIROS: set[_Mensageiro] = set()
+
+
+def rodar_em_thread(funcao: Callable[[], object], ao_terminar: Callable[[object, str], None],
+                    nome: str = "trabalho") -> None:
+    """Roda `funcao()` numa thread daemon (nunca na thread da GUI) e chama `ao_terminar(resultado, erro)` na thread
+    da GUI. `ao_terminar` deve ser método de um QObject: se ele for destruído antes, a entrega é descartada."""
+    m = _Mensageiro()
+    _MENSAGEIROS.add(m)
+    m.pronto.connect(ao_terminar)
+
+    def limpar(*_args) -> None:
+        _MENSAGEIROS.discard(m)
+        m.deleteLater()
+
+    m.pronto.connect(limpar)
+
+    def trabalho() -> None:
+        try:
+            resultado, erro = funcao(), ""
+        except Exception as exc:  # noqa: BLE001 - qualquer falha vira mensagem, nunca derruba a tela
+            resultado, erro = None, str(exc) or type(exc).__name__
+        m.pronto.emit(resultado, erro)
+
+    threading.Thread(target=trabalho, name=nome, daemon=True).start()
+
+
+def refiltrar(proxy) -> None:
+    """Reaplica o filtro de linhas de um QSortFilterProxyModel (API nova do Qt 6.10+; antiga como reserva)."""
+    if hasattr(proxy, "beginFilterChange"):
+        proxy.beginFilterChange()
+        try:
+            from PySide6.QtCore import QSortFilterProxyModel
+
+            proxy.endFilterChange(QSortFilterProxyModel.Direction.Rows)
+        except (AttributeError, TypeError):
+            proxy.endFilterChange()
+    else:
+        proxy.invalidateFilter()
+
+
+def avisar(widget: QWidget, texto: str) -> None:
+    """Aviso curto junto do widget (sem caixa de diálogo modal)."""
+    QToolTip.showText(widget.mapToGlobal(widget.rect().bottomLeft()), texto, widget)
 
 
 def repolir(*widgets: QWidget) -> None:
@@ -102,9 +164,15 @@ class IndicadorStatus(QFrame):
 
 
 class CartaoContador(Cartao):
-    def __init__(self, titulo: str, dica: str, tipo: str, parent: QWidget | None = None):
+    """Contador grande. Com `clicavel`, vira um botão: mãozinha, hover, foco, Enter/Espaço e o sinal `clicado`."""
+
+    clicado = Signal()
+
+    def __init__(self, titulo: str, dica: str, tipo: str, parent: QWidget | None = None,
+                 clicavel: bool = False, dica_clique: str = "", texto_acao: str = ""):
         super().__init__(parent, margem=16, espaco=2)
         self._tipo = tipo
+        self.clicavel = clicavel
         topo = QHBoxLayout()
         topo.setSpacing(8)
         marca = QFrame(self)
@@ -116,9 +184,22 @@ class CartaoContador(Cartao):
         topo.addWidget(marca)
         topo.addWidget(rotulo)
         topo.addStretch(1)
+        self.acao: QLabel | None = None
+        if clicavel:
+            self.setProperty("clicavel", True)
+            self.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+            self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
+            self.setToolTip(dica_clique)
+            self.setAccessibleDescription(dica_clique)
+            if texto_acao:
+                self.acao = QLabel(texto_acao, self)
+                self.acao.setObjectName("acaoContador")
+                topo.addWidget(self.acao)
         self._valor = QLabel("0", self)
         self._valor.setObjectName("valorContador")
-        self._valor.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        if not clicavel:  # texto selecionável "engoliria" o clique
+            self._valor.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         dica_lbl = QLabel(dica, self)
         dica_lbl.setObjectName("dicaContador")
         self.corpo.addLayout(topo)
@@ -137,6 +218,21 @@ class CartaoContador(Cartao):
         if bool(self._valor.property("alerta")) != alerta:
             self._valor.setProperty("alerta", alerta)
             repolir(self._valor)
+
+    def mouseReleaseEvent(self, evento: QMouseEvent) -> None:  # noqa: N802
+        if (self.clicavel and evento.button() == Qt.MouseButton.LeftButton
+                and self.rect().contains(evento.position().toPoint())):
+            self.clicado.emit()
+            evento.accept()
+            return
+        super().mouseReleaseEvent(evento)
+
+    def keyPressEvent(self, evento: QKeyEvent) -> None:  # noqa: N802
+        if self.clicavel and evento.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Space):
+            self.clicado.emit()
+            evento.accept()
+            return
+        super().keyPressEvent(evento)
 
 
 class SeletorSegmentado(QWidget):
@@ -274,6 +370,7 @@ class ChipInfo(QFrame):
     def definir(self, prefixo: str, valor: str, estado: str = "neutro") -> None:
         if self._prefixo.text() != prefixo:
             self._prefixo.setText(prefixo)
+            self._prefixo.setVisible(bool(prefixo))
         if self._valor.text() != valor:
             self._valor.setText(valor)
         self.setAccessibleDescription(self.texto())
@@ -613,3 +710,68 @@ class CaixaConsole(QPlainTextEdit):
         if seguir:
             barra = self.verticalScrollBar()
             barra.setValue(barra.maximum())
+
+
+class DelegadoPilula(QStyledItemDelegate):
+    """Desenha o texto da célula como uma pílula colorida (fundo suave + texto forte), conforme `PAPEL_PILULA`.
+
+    Usado na categoria dos erros e no status dos clientes. Sem tom, a célula é desenhada normalmente.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.paleta: Paleta = CLARA
+
+    def definir_paleta(self, p: Paleta) -> None:
+        self.paleta = p
+
+    def cores(self, tom: str) -> tuple[str, str]:
+        p = self.paleta
+        return {
+            "sucesso": (p.sucesso, p.sucesso_suave),
+            "aviso": (p.aviso, p.aviso_suave),
+            "erro": (p.erro, p.erro_suave),
+            "destaque": (p.destaque_texto or p.destaque, p.destaque_suave),
+            "roxo": (p.roxo, p.roxo_suave),
+        }.get(tom, (p.texto_sec, p.neutro_suave))
+
+    def paint(self, pintor: QPainter, opcao: QStyleOptionViewItem, indice: QModelIndex) -> None:
+        tom = indice.data(PAPEL_PILULA)
+        if not tom:
+            super().paint(pintor, opcao, indice)
+            return
+        opt = QStyleOptionViewItem(opcao)
+        self.initStyleOption(opt, indice)
+        texto = opt.text
+        opt.text = ""
+        estilo = opt.widget.style() if opt.widget else QApplication.style()
+        estilo.drawControl(QStyle.ControlElement.CE_ItemViewItem, opt, pintor, opt.widget)
+        cor_texto, cor_fundo = self.cores(str(tom))
+        fonte = QFont(opt.font)
+        fonte.setWeight(QFont.Weight.DemiBold)
+        fonte.setPointSizeF(max(7.0, fonte.pointSizeF() * 0.9))
+        metricas = QFontMetrics(fonte)
+        disponivel = opt.rect.width() - 12
+        largura = min(metricas.horizontalAdvance(texto) + 22, disponivel)
+        altura = min(metricas.height() + 6, opt.rect.height() - 6)
+        x = opt.rect.left() + 8
+        y = opt.rect.top() + (opt.rect.height() - altura) / 2
+        caixa = QRectF(x, y, max(0, largura), altura)
+        pintor.save()
+        pintor.setRenderHint(QPainter.RenderHint.Antialiasing)
+        pintor.setPen(Qt.PenStyle.NoPen)
+        pintor.setBrush(QColor(cor_fundo))
+        pintor.drawRoundedRect(caixa, altura / 2, altura / 2)
+        pintor.setFont(fonte)
+        pintor.setPen(QColor(cor_texto))
+        cabe = metricas.horizontalAdvance(texto) + 22 <= disponivel
+        visivel = texto if cabe else metricas.elidedText(texto, Qt.TextElideMode.ElideRight, int(caixa.width()) - 20)
+        pintor.drawText(caixa.adjusted(11, 0, 0, 0), int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft),
+                        visivel)
+        pintor.restore()
+
+    def sizeHint(self, opcao: QStyleOptionViewItem, indice: QModelIndex):  # noqa: N802
+        tamanho = super().sizeHint(opcao, indice)
+        tamanho.setWidth(tamanho.width() + 16)
+        return tamanho
+

@@ -13,6 +13,15 @@ da janela (pela ``recebido_em``; empate: a última que chegou) e, na virada, man
 demais são descartadas (não são erro nem gravadas). Leituras incompletas vão na hora para o sink (contingência). Ao
 desconectar/encerrar, o que estiver pendente da janela atual é gravado. Com 0, tudo vai ao sink como antes
 (lote por ``lote_max``/``lote_segundos``).
+
+Dispositivos (``ao_dispositivo``): para cada leitura com ``device_id`` (completa ou não), avisa (device_id, tópico,
+hora local da recepção), no máx. 1 vez a cada ``INTERVALO_DISPOSITIVO`` s por device; a primeira de cada device
+(desde a conexão) sai sempre.
+
+Erros (``ao_erro``): todo +1 no contador de erros passa por ``_erro``, que soma, monta o registro JSON
+(``app.core.erros``), grava em ``<pasta_logs>/erros_AAAAMMDD.jsonl`` e avisa o callback. Assim contador e registros
+batem sempre. Categorias: "payload" (inválido, binário, vazio, incompleto), "sql" (lote para a contingência por
+falha do banco, linha recusada na bissecção), "contingencia" (falha ao gravar o arquivo), "fila" (fila cheia).
 """
 from __future__ import annotations
 
@@ -28,6 +37,7 @@ from pathlib import Path
 from typing import Callable
 
 from app.config import Config, SqlServerConfig, pasta_base
+from app.core import erros as _erros
 from app.core.mqtt_client import ClienteMqtt, validar_parametros
 from app.core.mapeamento import LinhaIot, mapear
 from app.core.parser import trecho
@@ -95,6 +105,7 @@ class Pipeline:
     INTERVALO_CONTADORES = 0.2      # s (≈5 por segundo)
     LOGS_POR_SEGUNDO = 20           # linhas "Mensagem de ..." por segundo; o excedente vira um resumo
     INTERVALO_ULTIMA_LEITURA = 5.0  # s: no máx. 1 aviso de "última leitura" a cada 5 s
+    INTERVALO_DISPOSITIVO = 5.0     # s: no máx. 1 aviso de "dispositivo visto" a cada 5 s por device_id
 
     def __init__(
         self,
@@ -111,6 +122,8 @@ class Pipeline:
         relogio: Relogio = time.time,
         intervalo_gravacao: float | None = None,
         fabrica_cliente: Callable[..., ClienteMqtt] | None = None,
+        ao_dispositivo: Callable[[str, str, str], None] = _nada,
+        ao_erro: Callable[[str], None] = _nada,
     ) -> None:
         """``relogio``, ``intervalo_gravacao`` (sobrepõe a config) e ``fabrica_cliente`` existem para os testes."""
         self.config = config
@@ -120,6 +133,9 @@ class Pipeline:
         self._ao_proxima_gravacao = ao_proxima_gravacao
         self._ao_gravacao_ok = ao_gravacao_ok
         self._ao_leitura = ao_leitura
+        self._ao_dispositivo = ao_dispositivo
+        self._ao_erro = ao_erro
+        self._dispositivos_t: dict[str, float] = {}  # device_id → epoch do último aviso (só a thread de processamento)
         self._relogio = relogio
         self._intervalo_fixo = intervalo_gravacao
         self._fabrica_cliente = fabrica_cliente or ClienteMqtt
@@ -127,6 +143,7 @@ class Pipeline:
         self._fabrica_sink = fabrica_sink or self._sink_padrao
         self._pasta = pasta or pasta_base()
         self._sessao_persistente = sessao_persistente
+        self._gravador_erros: _erros.GravadorErros | None = None
 
         self._controle = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mqtt-controle")
         self._trava = threading.Lock()
@@ -201,6 +218,42 @@ class Pipeline:
             self._gravados += gravados
             self._erros += erros
 
+    def _erro(self, categoria: str, mensagem: str, topico: str | None = None, detalhe: str | None = None,
+              payload: bytes | str | None = None) -> None:
+        """Soma 1 no contador de erros e registra o erro (callback + arquivo do dia). Único jeito de somar erro."""
+        self._somar(erros=1)
+        try:
+            agora = self._relogio()
+            registro = _erros.montar_registro(iso_local(agora), categoria, mensagem, topico, detalhe, payload)
+            texto = _erros.para_json(registro)
+        except Exception:  # noqa: BLE001 - nunca derruba o pipeline por causa do registro
+            logger.exception("Falha ao montar o registro de erro")
+            return
+        gravador = self._gravador_erros
+        if gravador is None:
+            gravador = self._gravador_erros = _erros.GravadorErros(self._pasta_logs(), self._log)
+        try:
+            gravador.gravar(texto, datetime.fromtimestamp(agora).date())
+        except Exception:  # noqa: BLE001
+            logger.exception("Falha ao gravar o registro de erro")
+        self._avisar(self._ao_erro, texto)
+
+    def _pasta_logs(self) -> Path:
+        pasta = getattr(self.config.gravacao, "pasta_logs", "logs") or "logs"
+        return _erros.resolver_pasta(pasta, self._pasta)
+
+    def _avisar_dispositivos(self, linhas: list[LinhaIot], topico: str, t_receb: float) -> None:
+        vistos: set[str] = set()
+        for linha in linhas:
+            device = linha.device_id
+            if not device or device in vistos:
+                continue
+            vistos.add(device)
+            ultimo = self._dispositivos_t.get(device)
+            if ultimo is None or t_receb - ultimo >= self.INTERVALO_DISPOSITIVO or t_receb < ultimo:
+                self._dispositivos_t[device] = t_receb
+                self._avisar(self._ao_dispositivo, device, topico, iso_local(t_receb))
+
     def _avisar(self, callback, *args) -> None:
         try:
             callback(*args)
@@ -249,6 +302,7 @@ class Pipeline:
 
         self._assinatura = topico
         self._ultima_leitura_t = None
+        self._dispositivos_t = {}
         proximo = proximo_ciclo(self._relogio(), intervalo) if intervalo > 0 else None
         if intervalo > 0:
             self._log("INFO", f"Amostragem: 1 leitura por dispositivo a cada {intervalo:g} s "
@@ -314,7 +368,8 @@ class Pipeline:
             # bloqueia a rede um pouco se a fila encher (contrapressão) em vez de perder a mensagem
             fila.put((topico, payload, datetime.fromtimestamp(agora, timezone.utc), retida, agora), timeout=5)
         except queue.Full:
-            self._somar(erros=1)
+            self._erro("fila", "Fila de processamento cheia: mensagem descartada", topico,
+                       f"{self.TAMANHO_FILA} mensagens aguardando processamento", payload)
             self._log("ERRO", f"Fila de processamento cheia: mensagem de {topico} descartada "
                               f"({trecho(payload, 40)})")
 
@@ -351,8 +406,10 @@ class Pipeline:
                     janela_inicio, logs_na_janela, suprimidos = agora, 0, 0
                 if res.ok:
                     rejeitadas = res.rejeitadas
-                    if rejeitadas:  # sem pid/device_id/ts_unix: vão para a contingência, contam como erro
-                        self._somar(erros=len(rejeitadas))
+                    for linha in rejeitadas:  # sem pid/device_id/ts_unix: vão para a contingência, contam como erro
+                        self._erro("payload", f"Leitura não vai para o banco ({res.formato}); guardada na "
+                                              "contingência", topico, linha.motivo, payload)
+                    self._avisar_dispositivos(res.linhas, topico, t_receb)
                     if logs_na_janela < self.LOGS_POR_SEGUNDO:
                         logs_na_janela += 1
                         n = len(res.linhas) - len(rejeitadas)
@@ -374,7 +431,7 @@ class Pipeline:
                             sink.adicionar(rejeitadas)  # incompletas: contingência na hora, como sem amostragem
                         amostra.adicionar(res.completas)
                 else:
-                    self._somar(erros=1)
+                    self._erro("payload", f"Mensagem ignorada ({res.formato})", topico, res.erro, payload)
                     self._log("ERRO" if res.formato != "vazio" else "AVISO",
                               f"Mensagem de {topico} ignorada: {res.erro}")
 
@@ -455,11 +512,21 @@ class Pipeline:
             n = sink.fechar() if fechar else sink.descarregar()
             self._somar(gravados=n)
         except Exception as exc:  # noqa: BLE001 - contingência sem disco, por exemplo
-            self._somar(erros=1)
+            if isinstance(exc, OSError):
+                self._erro("contingencia", "Falha ao gravar a contingência; os registros ficam na memória e "
+                                           "serão tentados de novo", detalhe=f"{type(exc).__name__}: {exc}")
+            else:
+                self._erro("sql", "Falha ao gravar registros", detalhe=f"{type(exc).__name__}: {exc}")
             self._log("ERRO", f"Falha ao gravar registros: {exc}")
-        falhas = getattr(sink, "falhas", None)
-        if falhas is not None:
-            self._somar(erros=falhas())
+        retirar = getattr(sink, "retirar_erros", None)
+        if retirar is not None:
+            for e in retirar():
+                self._erro("sql", e.get("mensagem") or "Falha ao gravar no SQL Server", e.get("topico"),
+                           e.get("detalhe"), e.get("payload"))
+        else:
+            falhas = getattr(sink, "falhas", None)
+            for _ in range(falhas() if falhas is not None else 0):
+                self._erro("sql", "Falha ao gravar no SQL Server")
         n_sql = getattr(sink, "gravados_sql", 0) - antes
         if n_sql > 0:
             self._avisar(self._ao_gravacao_ok, iso_local(self._relogio()))

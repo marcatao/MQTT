@@ -7,8 +7,13 @@ A janela não sabe nada de MQTT nem de SQL: recebe um objeto que segue o contrat
 Operação contínua (CLAUDE.md): contagem até a próxima gravação e última gravação no topo da caixa ATIVIDADE,
 limpeza da caixa à meia-noite (hora local) e o vigia, que reinicia o programa se faltar leitura ou gravação.
 
-O cartão da direita tem duas abas: "Atividade" (a caixa de logs) e "Mosquitto" (console do broker local, processo
-filho do app; ver app/gui/mosquitto.py). Os processos filhos param ao fechar a janela e antes do reinício do vigia.
+O cartão da direita tem três abas: "Atividade" (a caixa de logs), "Mosquitto" (console do broker local, processo
+filho do app; ver app/gui/mosquitto.py) e "Clientes" (quem envia dados, com IP e MAC; ver app/gui/clientes.py).
+Os processos filhos param ao fechar a janela e antes do reinício do vigia.
+
+O card ERROS é clicável e abre a janela "Erros registrados" (app/gui/erros.py), alimentada por
+`erro_registrado` e pelo arquivo do dia em logs/. Os sinais novos (`dispositivo_visto`, `erro_registrado`) são
+opcionais: um bridge sem eles continua funcionando.
 """
 from __future__ import annotations
 
@@ -41,7 +46,9 @@ from app.config import Config, MosquittoConfig, SqlServerConfig
 
 from . import estilo, tempo
 from . import vigia as vigia_mod
+from .clientes import PainelClientes
 from .credenciais import CofreSenhas
+from .erros import JanelaErros
 from .mosquitto import ConsoleMosquitto, PainelMosquitto
 from .recursos import icone_app, icone_olho, pixmap_app
 from .widgets import (
@@ -80,6 +87,17 @@ AUTENTICACAO = [
     (False, "SQL Server", "Usuário e senha do próprio SQL Server."),
     (True, "Windows", "Usa o usuário do Windows que está rodando o app (sem senha)."),
 ]
+
+
+def tamanho_inicial() -> tuple[int, int]:
+    """1440×900 (a aba Clientes tem 8 colunas), limitado à área útil da tela; nunca menor que o mínimo."""
+    largura, altura = 1440, 900
+    tela = QGuiApplication.primaryScreen()
+    if tela is not None:
+        area = tela.availableGeometry()
+        largura = min(largura, area.width() - 40)
+        altura = min(altura, area.height() - 40)
+    return max(980, largura), max(640, altura)
 
 
 def configuracoes_padrao() -> QSettings:
@@ -158,12 +176,17 @@ class JanelaPrincipal(QMainWindow):
         iniciar_processo: Callable[[vigia_mod.Comando], bool] | None = None,
         sair: Callable[[], None] | None = None,
         console_mosquitto: ConsoleMosquitto | None = None,
+        executor_arp: Callable[[], str] | None = None,
+        enderecos_locais: set[str] | None = None,
+        ler_erros: Callable[..., list] | None = None,
     ):
         """`tema`: None segue o sistema; "claro" ou "escuro" força um deles.
         `cofre`: onde guardar a senha do SQL (padrão: keyring); testes passam um falso.
         `relogio` (epoch em s), `iniciar_processo` e `sair`: injetáveis para testar o vigia e o reinício.
         `console_mosquitto`: processo da aba Mosquitto (padrão: criado com `config.mosquitto`). A janela NÃO o
-        inicia sozinha: quem abre o programa chama `iniciar_mosquitto_ao_abrir()` (app/main.py)."""
+        inicia sozinha: quem abre o programa chama `iniciar_mosquitto_ao_abrir()` (app/main.py).
+        `executor_arp` (devolve o texto do `arp -a`), `enderecos_locais` e `ler_erros` (lê o arquivo de erros do
+        dia): injetáveis para testar a aba Clientes e a janela de erros fora do Windows."""
         super().__init__(parent)
         self.bridge = bridge
         self.config = config
@@ -189,11 +212,15 @@ class JanelaPrincipal(QMainWindow):
         elif console_mosquitto.parent() is None:
             console_mosquitto.setParent(self)
         self.mosquitto = console_mosquitto
+        self._executor_arp = executor_arp
+        self._enderecos_locais = enderecos_locais
+        pasta_logs = getattr(getattr(config, "gravacao", None), "pasta_logs", "logs") or "logs"
+        self.janela_erros = JanelaErros(pasta_logs, self, ler=ler_erros)
 
         self.setWindowTitle(TITULO)
         self.setWindowIcon(icone_app())
         self.setMinimumSize(980, 640)
-        self.resize(1200, 860)
+        self.resize(*tamanho_inicial())
 
         self._montar()
         self._carregar_valores()
@@ -249,7 +276,9 @@ class JanelaPrincipal(QMainWindow):
         linha.setSpacing(16)
         self.contador_recebidas = CartaoContador("Recebidas", "mensagens MQTT", "recebidas", raiz)
         self.contador_gravadas = CartaoContador("Gravadas", "registros no SQL Server", "gravadas", raiz)
-        self.contador_erros = CartaoContador("Erros", "leitura ou gravação", "erros", raiz)
+        self.contador_erros = CartaoContador("Erros", "leitura ou gravação", "erros", raiz, clicavel=True,
+                                             dica_clique="Clique para ver os erros", texto_acao="Ver lista ›")
+        self.contador_erros.clicado.connect(self.abrir_erros)
         for c in (self.contador_recebidas, self.contador_gravadas, self.contador_erros):
             c.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
             linha.addWidget(c)
@@ -312,8 +341,18 @@ class JanelaPrincipal(QMainWindow):
         self.mosquitto.estado_alterado.connect(lambda estado, _t: self._icone_aba_mosquitto(estado))
         self._icone_aba_mosquitto(self.mosquitto.estado)
 
+        self.painel_clientes = PainelClientes(self.abas, relogio=self._relogio, executor_arp=self._executor_arp,
+                                              locais=self._enderecos_locais)
+        self.abas.addTab(self.painel_clientes, "Clientes")
+        self.abas.setTabToolTip(2, "Dispositivos que enviam dados ao broker: nome, IP, MAC e último envio.")
+        self.mosquitto.saida.connect(self.painel_clientes.ao_saida_mosquitto)
+
         cartao.corpo.addWidget(self.abas, 1)
         return cartao
+
+    def abrir_erros(self) -> None:
+        """Card ERROS: abre (ou traz para a frente) a janela "Erros registrados"."""
+        self.janela_erros.abrir()
 
     def _icone_aba_mosquitto(self, estado: str) -> None:
         """Ponto colorido ao lado do nome da aba (o texto do estado fica no chip dentro dela)."""
@@ -527,7 +566,9 @@ class JanelaPrincipal(QMainWindow):
                  self.logs.botao_copiar, self.logs.botao_salvar, self.logs.caixa,
                  self.painel_mosquitto.botao_iniciar, self.painel_mosquitto.botao_parar,
                  self.painel_mosquitto.botao_limpar, self.painel_mosquitto.caixa,
-                 self.painel_mosquitto.campo_comando, self.painel_mosquitto.botao_executar]
+                 self.painel_mosquitto.campo_comando, self.painel_mosquitto.botao_executar,
+                 self.painel_clientes.opcao_assinantes, self.painel_clientes.botao_mac,
+                 self.painel_clientes.botao_exportar, self.painel_clientes.tabela]
         for a, b in zip(ordem, ordem[1:]):
             QWidget.setTabOrder(a, b)
         QShortcut(QKeySequence("Ctrl+L"), self, activated=self.logs.limpar)
@@ -633,6 +674,11 @@ class JanelaPrincipal(QMainWindow):
         self.bridge.proxima_gravacao.connect(self._ao_proxima_gravacao)
         self.bridge.ultima_gravacao_ok.connect(self._ao_ultima_gravacao)
         self.bridge.ultima_leitura.connect(self._ao_ultima_leitura)
+        # Sinais da aba Clientes e da janela de erros: opcionais (um bridge antigo não os tem).
+        if hasattr(self.bridge, "dispositivo_visto"):
+            self.bridge.dispositivo_visto.connect(self.painel_clientes.ao_dispositivo_visto)
+        if hasattr(self.bridge, "erro_registrado"):
+            self.bridge.erro_registrado.connect(self.janela_erros.adicionar_json)
 
     def _log_local(self, nivel: str, mensagem: str) -> None:
         self.logs.adicionar(datetime.fromtimestamp(self._relogio()).strftime("%H:%M:%S"), nivel, mensagem)
@@ -647,6 +693,8 @@ class JanelaPrincipal(QMainWindow):
         self._paleta = paleta
         self.logs.definir_paleta(paleta)
         self.painel_mosquitto.caixa.definir_paleta(paleta)
+        self.painel_clientes.definir_paleta(paleta)
+        self.janela_erros.definir_paleta(paleta)
         self._icone_aba_mosquitto(self.mosquitto.estado)
         self._atualizar_icone_olho()
         self.tema_escuro = escuro
@@ -837,6 +885,7 @@ class JanelaPrincipal(QMainWindow):
     def _tique(self) -> None:
         self._conferir_dia()
         self._atualizar_tempo()
+        self.painel_clientes.tique()
         self.vigia.verificar()
 
     def _agendar_meia_noite(self) -> None:
@@ -946,6 +995,8 @@ class JanelaPrincipal(QMainWindow):
             for t in (self._timer_cancelar, self._timer_sql, self._timer_teste, self._timer_tique,
                       self._timer_meia_noite):
                 t.stop()
+            self.painel_clientes.parar()
+            self.janela_erros.close()
             self._salvar_valores()
             self.detalhe_status.setText("Encerrando…")
             QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)

@@ -53,6 +53,9 @@ class Paleta:
     terminal_ok: str = "#6EE7A0"
     terminal_selecao: str = "#2B4C80"
     terminal_borda: str = "#252C37"
+    # Categoria "mqtt" na janela de erros (4ª cor de categoria, distinta de aviso/erro/destaque).
+    roxo: str = "#6D28D9"
+    roxo_suave: str = "#F0E9FD"
 
 
 # Contraste conferido para WCAG AA (texto normal >= 4,5:1 sobre a superfície correspondente).
@@ -106,6 +109,8 @@ ESCURA = Paleta(
     log_fundo="#11151C",
     selecao="#24406F",
     destaque_texto="#9DBBFF",
+    roxo="#C4B5FD",
+    roxo_suave="#261E3E",
 )
 
 _QSS = Template(
@@ -329,6 +334,60 @@ QLabel#resultadoTexto { color: $texto; }
 QLabel#resultadoTexto[estado="ok"] { color: $sucesso; }
 QLabel#resultadoTexto[estado="falha"] { color: $erro; }
 
+/* ---------- Card ERROS clicável ---------- */
+QFrame#cartao[clicavel="true"]:hover { background: $superficie_alt; border-color: $borda_forte; }
+QFrame#cartao[clicavel="true"]:focus { border: 1px solid $destaque; }
+QLabel#acaoContador { color: $texto_sec; font-size: 9pt; background: transparent; }
+QFrame#cartao[clicavel="true"]:hover QLabel#acaoContador { color: $destaque_texto; }
+
+/* ---------- Tabelas (aba Clientes, janela de erros) ---------- */
+QTableView#tabelaDados {
+    background: $log_fundo; alternate-background-color: $superficie_alt; color: $texto;
+    border: 1px solid $borda; border-radius: 8px; gridline-color: transparent; outline: none;
+    selection-background-color: $selecao; selection-color: $texto;
+}
+QTableView#tabelaDados::item { padding: 0 6px; border: none; }
+QTableView#tabelaDados::item:selected { background: $selecao; }
+QHeaderView { background: transparent; }
+QHeaderView::section {
+    background: $superficie_alt; color: $texto_sec; font-size: 8pt; font-weight: 600;
+    border: none; border-bottom: 1px solid $borda; padding: 6px 6px;
+}
+QHeaderView::section:first { border-top-left-radius: 8px; }
+QHeaderView::section:last { border-top-right-radius: 8px; }
+QHeaderView::section:hover { color: $texto; }
+QHeaderView::up-arrow, QHeaderView::down-arrow { width: 0; height: 0; }
+QTableCornerButton::section { background: $superficie_alt; border: none; }
+QLabel#estadoVazio {
+    color: $texto_sec; background: $log_fundo; border: 1px dashed $borda_forte; border-radius: 8px; padding: 24px;
+}
+
+/* ---------- Janela de erros ---------- */
+QDialog#janelaErros { background: $fundo; }
+QFrame#detalheErro { background: $superficie; border: 1px solid $borda; border-radius: 12px; }
+QLabel#detalheMensagem { font-weight: 600; color: $texto; }
+QLabel#detalheValor { color: $texto; }
+QLabel#detalheVazio { color: $texto_fraco; }
+QPlainTextEdit#payloadErro {
+    background: $log_fundo; color: $texto; border: 1px solid $borda; border-radius: 8px; padding: 6px 4px;
+    selection-background-color: $selecao; selection-color: $texto;
+}
+QSplitter::handle { background: transparent; }
+QSplitter::handle:vertical { height: 12px; }
+
+QComboBox {
+    background: $superficie; color: $texto; border: 1px solid $borda_forte; border-radius: 8px;
+    padding: 0 10px; min-height: 32px;
+}
+QComboBox:hover { border-color: $texto_fraco; }
+QComboBox:focus { border: 2px solid $destaque; padding: 0 9px; }
+QComboBox::drop-down { border: none; width: 26px; }
+QComboBox::down-arrow { image: url("$seta"); width: 10px; height: 10px; }
+QComboBox QAbstractItemView {
+    background: $superficie; color: $texto; border: 1px solid $borda_forte; outline: none; padding: 4px;
+    selection-background-color: $destaque_suave; selection-color: $texto;
+}
+
 QMenu { background: $superficie; border: 1px solid $borda_forte; border-radius: 8px; padding: 4px; }
 QMenu::item { padding: 6px 20px; border-radius: 4px; }
 QMenu::item:selected { background: $destaque_suave; color: $texto; }
@@ -388,24 +447,33 @@ _CHECK_SVG = (
     '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="M3.5 8.5l3 3 6-7" fill="none" '
     'stroke="{cor}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>'
 )
+_SETA_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10"><path d="M2 3.5l3 3 3-3" fill="none" '
+    'stroke="{cor}" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>'
+)
 _pasta_temp: QTemporaryDir | None = None
 
 
-def _arquivo_check(cor: str) -> str:
-    """O QSS só aceita imagem por caminho: grava o SVG do “visto” numa pasta temporária do processo."""
+def _arquivo_svg(nome: str, modelo: str, cor: str) -> str:
+    """O QSS só aceita imagem por caminho: grava o SVG numa pasta temporária do processo."""
     global _pasta_temp
     if _pasta_temp is None:
         _pasta_temp = QTemporaryDir()
-    caminho = Path(_pasta_temp.path()) / f"check-{cor.lstrip('#')}.svg"
+    caminho = Path(_pasta_temp.path()) / f"{nome}-{cor.lstrip('#')}.svg"
     if not caminho.exists():
-        caminho.write_text(_CHECK_SVG.format(cor=cor), encoding="utf-8")
+        caminho.write_text(modelo.format(cor=cor), encoding="utf-8")
     return caminho.as_posix()
+
+
+def _arquivo_check(cor: str) -> str:
+    return _arquivo_svg("check", _CHECK_SVG, cor)
 
 
 def aplicar(app: QApplication, escuro: bool) -> Paleta:
     """Aplica paleta e QSS na aplicação inteira e devolve a paleta usada."""
     p = ESCURA if escuro else CLARA
-    qss = _QSS.substitute(asdict(p), check=_arquivo_check(p.texto_sobre_destaque))
+    qss = _QSS.substitute(asdict(p), check=_arquivo_check(p.texto_sobre_destaque),
+                          seta=_arquivo_svg("seta", _SETA_SVG, p.texto_sec))
     if app.styleSheet() == qss:
         return p  # mesmo tema: reaplicar o QSS repoliria todos os widgets de todas as janelas à toa
     app.setPalette(_paleta_qt(p))

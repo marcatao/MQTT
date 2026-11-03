@@ -5,6 +5,7 @@ thread própria, como o bridge real (o Qt entrega na thread da GUI por conexão 
 """
 from __future__ import annotations
 
+import json
 import math
 import random
 import threading
@@ -30,6 +31,8 @@ class FakePipelineBridge(QObject):
     proxima_gravacao = Signal(float)   # epoch do próximo ciclo (alinhado ao relógio)
     ultima_gravacao_ok = Signal(str)   # ISO local da última gravação com sucesso no SQL
     ultima_leitura = Signal(str)       # ISO local da última mensagem recebida
+    dispositivo_visto = Signal(str, str, str)  # (device_id, tópico, ISO local); máx. 1 a cada 5 s por device
+    erro_registrado = Signal(str)      # JSON de UM erro; 1 sinal para cada +1 no contador de erros
 
     def __init__(self, config: Config, parent=None, *, atraso_conexao: float = 0.2,
                  intervalo: float = 0.05, falhar_conexao: bool = False, sql_ok: bool = True,
@@ -47,6 +50,17 @@ class FakePipelineBridge(QObject):
         self.chamadas: list[tuple] = []
         self.sql: SqlServerConfig | None = None
         self.recebidas = self.gravadas = self.erros = 0
+        self._visto_em: dict[str, float] = {}
+
+    # ----- ajudas para testes e capturas (emitem como o bridge real) -----
+    def emitir_dispositivo(self, device_id: str, topico: str, iso: str | None = None) -> None:
+        self.dispositivo_visto.emit(device_id, topico, iso or _iso_agora())
+
+    def emitir_erro(self, categoria: str, mensagem: str, topico: str | None = None, detalhe: str | None = None,
+                    payload: str | None = None, quando: str | None = None) -> None:
+        self.erro_registrado.emit(json.dumps({
+            "quando": quando or _iso_agora(), "categoria": categoria, "mensagem": mensagem, "topico": topico,
+            "detalhe": detalhe, "payload": payload[:2000] if payload else None}, ensure_ascii=False))
 
     # ----- contrato -----
     def definir_sql(self, sql: SqlServerConfig) -> None:
@@ -133,12 +147,24 @@ class FakePipelineBridge(QObject):
             sub, formato, campos = AMOSTRAS[n % len(AMOSTRAS)]
             self.recebidas += 1
             self._log("INFO", f"Mensagem em {sub} · {formato} · {campos} campos")
+            device = sub.rsplit("/", 1)[-1]
+            agora_m = time.monotonic()
+            if agora_m - self._visto_em.get(device, -1e9) >= 5.0:  # como o bridge real: 1 a cada 5 s por device
+                self._visto_em[device] = agora_m
+                self.emitir_dispositivo(device, sub)
             if n % 9 == 0:
                 self.erros += 1
                 self._log("AVISO", f"Campo “temp_3” sem valor numérico em {sub}; gravado como texto.")
+                self.emitir_erro("payload", f"Leitura incompleta em {sub}: falta ts_unix.", sub,
+                                 "Campos obrigatórios: pid, device_id, ts_unix. Enviada para a contingência.",
+                                 json.dumps({"pid": 51387400 + n, "device_id": device,
+                                             "channels": {"chd1_value": 67, "chd2_value": 119}}))
             elif n % 23 == 0:
                 self.erros += 1
                 self._log("ERRO", "Payload inválido em NOVUS/Teste_Alumbra/logbox02: JSON truncado (posição 118).")
+                self.emitir_erro("payload", "Payload inválido: JSON truncado (posição 118).",
+                                 "NOVUS/Teste_Alumbra/logbox02", "Expecting ',' delimiter: line 1 column 118",
+                                 '{"pid":51387408,"device_id":"logbox02","channels":{"timestamp":17933867')
             else:
                 self.gravadas += campos
             if n % 4 == 0:

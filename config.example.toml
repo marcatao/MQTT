@@ -26,6 +26,7 @@ timeout_conexao = 5
 lote_max = 500           # grava quando juntar esta quantidade...
 lote_segundos = 1.0      # ...ou quando passar este tempo, o que vier primeiro
 pasta_contingencia = "contingencia"
+pasta_logs = "logs"      # erros detalhados do dia em erros_AAAAMMDD.jsonl (a janela de erros lê daqui)
 # Amostragem: a cada ciclo alinhado ao relógio (60 = hh:mm:00) grava só a leitura completa mais recente de cada
 # device_id; as outras do período são descartadas. 0 = grava todas (por lote_max/lote_segundos, como acima).
 intervalo_gravacao_segundos = 60

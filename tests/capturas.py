@@ -1,4 +1,5 @@
-"""Gera capturas PNG da janela (claro e escuro, conectada, com logs, aba Mosquitto) usando o bridge falso.
+"""Gera capturas PNG da janela (claro e escuro, conectada, com logs, abas Mosquitto e Clientes, janela de erros)
+usando o bridge falso.
 
     QT_QPA_PLATFORM=offscreen python -m tests.capturas <pasta_destino>
 """
@@ -104,6 +105,122 @@ def _simular_mosquitto(janela) -> None:
     console.saida.emit("info", "Comando interrompido.")
 
 
+ARP_SIMULADO = """
+Interface: 192.168.100.162 --- 0x7
+  Endereço IP           Endereço físico       Tipo
+  192.168.100.1         00-1a-2b-3c-4d-5e     dinâmico
+  192.168.100.50        a4-cf-12-8e-3b-71     dinâmico
+  192.168.100.57        a4-cf-12-8e-40-0c     dinâmico
+  192.168.100.255       ff-ff-ff-ff-ff-ff     estático
+"""
+
+
+def _saida_clientes(agora: float) -> str:
+    """Três dispositivos NOVUS (um parado há 3 min), o próprio app e um mosquitto_sub, no formato do mosquitto -v."""
+    t = int(agora)
+    linhas = [
+        f"{t - 900}: New connection from 192.168.100.50:51544 on port 1883.",
+        f"{t - 900}: New client connected from 192.168.100.50:51544 as NOVUS_A1B2C3 (p2, c1, k60, u'novus').",
+        f"{t - 880}: New client connected from 192.168.100.57:49152 as NOVUS_D4E5F6 (p2, c1, k60, u'novus').",
+        f"{t - 870}: New client connected from 192.168.100.71:50210 as fieldlogger-07 (p2, c1, k60).",
+        f"{t - 860}: New client connected from 127.0.0.1:51551 as mqtt-sqlserver-4f2a (p5, c1, k60).",
+        f"{t - 860}: Received SUBSCRIBE from mqtt-sqlserver-4f2a",
+        f"{t - 300}: New client connected from 127.0.0.1:51600 as mosq-Zx81kPq (p2, c1, k60).",
+        f"{t - 300}: Received SUBSCRIBE from mosq-Zx81kPq",
+    ]
+    for k in range(86):  # um envio a cada ~10 s
+        linhas.append(f"{t - 860 + k * 10}: Received PUBLISH from NOVUS_A1B2C3 (d0, q0, r0, m0, "
+                      f"'NOVUS/Teste_Alumbra/events', ... (128 bytes))")
+    for k in range(40):
+        linhas.append(f"{t - 600 + k * 10 + 3}: Received PUBLISH from NOVUS_D4E5F6 (d0, q0, r0, m0, "
+                      f"'NOVUS/Linha2/events', ... (131 bytes))")
+    for k in range(9):  # parou há 3 min
+        linhas.append(f"{t - 830 + k * 70}: Received PUBLISH from fieldlogger-07 (d0, q1, r0, m{k + 1}, "
+                      f"'NOVUS/Teste_Alumbra/fieldlogger', ... (96 bytes))")
+    return "\n".join(sorted(linhas, key=lambda l: int(l.split(":", 1)[0])))
+
+
+def capturar_clientes(destino: Path, tema: str) -> Path:
+    pasta = tempfile.mkdtemp()
+    settings = QSettings(str(Path(pasta) / "gui.ini"), QSettings.Format.IniFormat)
+    config = Config()
+    config.mosquitto.iniciar_automaticamente = False
+    bridge = FakePipelineBridge(config)
+    janela = JanelaPrincipal(bridge, config, settings=settings, tema=tema, cofre=CofreFalso(),
+                             executor_arp=lambda: ARP_SIMULADO, enderecos_locais={"192.168.100.162"})
+    janela.resize(1440, 900)  # tamanho inicial padrão numa tela Full HD
+    janela.show()
+    _rodar(0.3)
+    agora = time.time()
+    console = janela.mosquitto
+    console.estado_alterado.emit("rodando", "Rodando (PID 4812)")
+    console.saida.emit("saida", _saida_clientes(agora))
+    iso = lambda t: datetime.fromtimestamp(t).strftime("%Y-%m-%dT%H:%M:%S")  # noqa: E731
+    bridge.emitir_dispositivo("Teste_Alumbra", "NOVUS/Teste_Alumbra/events", iso(agora - 10))
+    bridge.emitir_dispositivo("Linha2_Forno", "NOVUS/Linha2/events", iso(agora - 7))
+    bridge.contadores.emit(1284, 21, 3)
+    janela.abas.setCurrentIndex(2)
+    _rodar(1.5)  # consulta ARP (thread) e tique
+    janela.painel_clientes.tique()
+    _rodar(0.2)
+    caminho = destino / f"janela-{tema}-clientes.png"
+    janela.grab().save(str(caminho))
+    janela.close()
+    return caminho
+
+
+ERROS_SIMULADOS = [
+    ("payload", "Leitura incompleta em NOVUS/Teste_Alumbra/events: falta ts_unix. Enviada para a contingência.",
+     "NOVUS/Teste_Alumbra/events", "Campos obrigatórios: pid, device_id, ts_unix.",
+     '{"pid":51387408,"device_id":"Teste_Alumbra","channels":{"chd1_value":67,"chd2_value":119,"chd3_value":0}}'),
+    ("sql", "Falha ao gravar 3 leituras no SQL Server: tempo de login esgotado.", None,
+     "[HYT00] [Microsoft][ODBC Driver 18 for SQL Server]Login timeout expired (servidor TERRA\\SOLO)", None),
+    ("contingencia", "Leituras guardadas na contingência: contingencia/20261103.jsonl (3 linhas).", None,
+     "O SQL Server não respondeu; serão gravadas quando o reprocessamento existir.", None),
+    ("payload", "Payload inválido: JSON truncado (posição 118).", "NOVUS/Linha2/events",
+     "Expecting ',' delimiter: line 1 column 118 (char 117)",
+     '{"pid":51387409,"device_id":"Linha2_Forno","channels":{"timestamp":17933867'),
+    ("fila", "Fila de processamento cheia: 1 mensagem descartada.", "NOVUS/Teste_Alumbra/events", None, None),
+    ("mqtt", "Assinatura recusada pelo broker para NOVUS/Restrito/#.", "NOVUS/Restrito/#",
+     "SUBACK com código 0x87 (não autorizado)", None),
+]
+
+
+def capturar_erros(destino: Path, tema: str) -> Path:
+    pasta = tempfile.mkdtemp()
+    settings = QSettings(str(Path(pasta) / "gui.ini"), QSettings.Format.IniFormat)
+    config = Config()
+    config.mosquitto.iniciar_automaticamente = False
+    config.gravacao.pasta_logs = pasta  # arquivo do dia vazio: só os erros da sessão
+    bridge = FakePipelineBridge(config)
+    janela = JanelaPrincipal(bridge, config, settings=settings, tema=tema, cofre=CofreFalso(),
+                             executor_arp=lambda: "", enderecos_locais=set())
+    janela.show()
+    agora = time.time()
+    for i, (cat, msg, topico, detalhe, payload) in enumerate(ERROS_SIMULADOS):
+        quando = datetime.fromtimestamp(agora - 3600 + i * 517).strftime("%Y-%m-%dT%H:%M:%S")
+        bridge.emitir_erro(cat, msg, topico, detalhe, payload, quando=quando)
+    bridge.contadores.emit(1284, 21, len(ERROS_SIMULADOS))
+    _rodar(0.4)
+    janela.abrir_erros()
+    _rodar(0.5)
+    dlg = janela.janela_erros
+    # seleciona o primeiro (mais antigo) erro de payload, que tem JSON completo
+    for r in range(dlg.filtro.rowCount()):
+        reg = dlg.modelo.registro(dlg.filtro.mapToSource(dlg.filtro.index(r, 0)).row())
+        if reg.payload and reg.payload.endswith("}}"):
+            dlg.tabela.selectRow(r)
+            break
+    _rodar(0.3)
+    caminho = destino / f"erros-{tema}.png"
+    dlg.grab().save(str(caminho))
+    caminho_card = destino / f"janela-{tema}-card-erros.png"
+    janela.grab().save(str(caminho_card))
+    dlg.close()
+    janela.close()
+    return caminho
+
+
 def main() -> None:
     destino = Path(sys.argv[1] if len(sys.argv) > 1 else ".")
     destino.mkdir(parents=True, exist_ok=True)
@@ -117,6 +234,10 @@ def main() -> None:
         capturar(destino, "claro", mosquitto=True),
         capturar(destino, "escuro", mosquitto=True),
         capturar(destino, "escuro", mosquitto=True, tamanho=(980, 640)),
+        capturar_clientes(destino, "claro"),
+        capturar_clientes(destino, "escuro"),
+        capturar_erros(destino, "claro"),
+        capturar_erros(destino, "escuro"),
     ):
         print(caminho)
 

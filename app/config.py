@@ -47,6 +47,8 @@ class GravacaoConfig:
     lote_max: int = 500
     lote_segundos: float = 1.0
     pasta_contingencia: str = "contingencia"
+    # registros da janela de erros (erros_AAAAMMDD.jsonl); relativa à pasta do programa, como a contingência
+    pasta_logs: str = "logs"
     # amostragem: a cada ciclo (alinhado ao relógio, ex. hh:mm:00) grava só a leitura completa mais recente de
     # cada device_id; 0 desliga e grava todas as leituras (em lote, por lote_max/lote_segundos)
     intervalo_gravacao_segundos: int = 60

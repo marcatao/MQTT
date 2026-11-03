@@ -167,6 +167,9 @@ class SinkContingencia:
     def falhas(self) -> int:
         return 0
 
+    def retirar_erros(self) -> list[dict]:
+        return []
+
     def definir_sql(self, sql: SqlServerConfig) -> None:  # sem banco: nada a trocar
         pass
 
@@ -202,7 +205,7 @@ class SinkSqlServer:
         self._lote = _Lote(gravacao.lote_max, gravacao.lote_segundos)
         self._conexao = None
         self._indisponivel_ate = 0.0
-        self._erros_lote = 0
+        self._erros: list[dict] = []  # um item por erro (vira registro na janela de erros do pipeline)
         self._fallback = SinkContingencia(gravacao, logar, pasta_base)
         self.gravados_sql = 0      # total de linhas com commit no SQL Server (o pipeline usa para "última gravação ok")
         self._logar_sucesso = True
@@ -313,10 +316,18 @@ class SinkSqlServer:
 
     def _pausar_e_contingencia(self, itens: list[LinhaIot], exc: Exception, motivo: str) -> int:
         self._indisponivel_ate = time.monotonic() + self.pausa_apos_falha
-        self._erros_lote += 1
+        traduzido = sql_conexao.traduzir_erro(exc)
+        topicos = {i.topico for i in itens}
+        self._erros.append({
+            "mensagem": (f"SQL Server {motivo}: {len(itens)} registros enviados para a contingência"
+                         if len(itens) != 1 else f"SQL Server {motivo}: 1 registro enviado para a contingência"),
+            "detalhe": traduzido,
+            "topico": topicos.pop() if len(topicos) == 1 else None,
+            "payload": None,
+        })
         self._logar("ERRO", f"SQL Server {motivo}: {len(itens)} registros enviados para a contingência; "
                             f"nova tentativa no banco em {self.pausa_apos_falha:.0f}s. "
-                            + sql_conexao.traduzir_erro(exc).replace("\n", " "))
+                            + traduzido.replace("\n", " "))
         return self._para_contingencia(itens)
 
     def _para_contingencia(self, itens: list[LinhaIot]) -> int:
@@ -330,9 +341,11 @@ class SinkSqlServer:
                              f"com problema. {sql_conexao.traduzir_erro(exc).splitlines()[-1]}")
         boas = 0
         ruins: list[LinhaIot] = []
+        motivos: list[str] = []  # erro traduzido de cada linha ruim (mesma ordem de ``ruins``)
         pilha = [itens[len(itens) // 2:], itens[:len(itens) // 2]] if len(itens) > 1 else []
         if len(itens) == 1:
             ruins.append(itens[0])
+            motivos.append(sql_conexao.traduzir_erro(exc))
         while pilha:
             parte = pilha.pop()
             if not parte:
@@ -353,24 +366,35 @@ class SinkSqlServer:
                     return len(itens)
                 if len(parte) == 1:
                     ruins.append(parte[0])
+                    motivos.append(sql_conexao.traduzir_erro(exc_parte))
                     self._logar("ERRO", f"Registro recusado pelo SQL Server ({parte[0].descricao()}, "
-                                        f"tópico {parte[0].topico}): "
-                                        + sql_conexao.traduzir_erro(exc_parte).replace("\n", " "))
+                                        f"tópico {parte[0].topico}): " + motivos[-1].replace("\n", " "))
                 else:
                     meio = len(parte) // 2
                     pilha += [parte[meio:], parte[:meio]]
         if boas:
             self._log_gravados(boas)
         if ruins:
-            self._erros_lote += len(ruins)
+            for linha, motivo in zip(ruins, motivos):
+                self._erros.append({
+                    "mensagem": f"Registro recusado pelo SQL Server ({linha.descricao()}); guardado na contingência",
+                    "detalhe": motivo, "topico": linha.topico or None, "payload": linha.payload_json,
+                })
             self._logar("AVISO", f"{len(ruins)} registro(s) com erro de dados enviados para a contingência")
             self._para_contingencia(ruins)
         return len(itens)
 
     def falhas(self) -> int:
         """Erros desde a última consulta (lotes que foram à contingência por falha do banco + linhas ruins)."""
-        n, self._erros_lote = self._erros_lote, 0
-        return n
+        return len(self.retirar_erros())
+
+    def retirar_erros(self) -> list[dict]:
+        """Os mesmos erros de ``falhas()``, um dict por erro: ``mensagem``, ``detalhe``, ``topico``, ``payload``.
+
+        Esvazia a lista (``falhas()`` e ``retirar_erros()`` consomem os mesmos itens).
+        """
+        erros, self._erros = self._erros, []
+        return erros
 
     def _inserir(self, itens: list[LinhaIot]) -> None:
         if self._conexao is None:

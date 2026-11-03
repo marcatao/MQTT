@@ -244,7 +244,8 @@ mensagem inteira, não só o booleano.
   IP:porta as ID", "Received PUBLISH from ID (... 'tópico' ...)", "Client ID disconnected"); o **MAC** vem da tabela
   ARP do Windows (`arp -a`, só para IPs da mesma rede local); o **nome** é o `device_id` do payload (via
   `dispositivo_visto`), ligado ao client id pelo tópico. Clientes que só assinam (o próprio app, `mosquitto_sub`) aparecem
-  marcados como "assinante" e podem ser ocultados. Sem o Mosquitto na aba, a lista mostra só nome, tópico e último
+  marcados como "assinante" e ficam ocultos por padrão (pelo comportamento: assinou e nunca publicou). "Mensagens" conta
+  as linhas PUBLISH do `mosquitto -v`. Tamanho padrão da janela: 1440×900 (limitado à tela). Sem o Mosquitto na aba, a lista mostra só nome, tópico e último
   envio.
 - **Erros detalhados** (decidido em 03/11/2026): clicar no card **ERROS** abre uma janela com a lista de erros
   registrados (data/hora, categoria, mensagem, tópico, detalhe e trecho do payload), com filtro, cópia e exportação
@@ -255,13 +256,15 @@ mensagem inteira, não só o booleano.
 
 ## Pendências conhecidas
 
+- Queda/recusa do broker MQTT não soma no contador de erros (só log e status); categoria "mqtt" existe mas não é emitida.
+
 - Reprocessar os arquivos de `contingencia/` (`.jsonl`) no SQL Server quando o banco voltar.
 - Possível duplicação de um lote se o `commit` chegar ao servidor e a resposta se perder (exigiria id de lote ou
   chave única — decidir com o usuário).
 
 ## Estado atual
 
-- v0.1.3 validada pelo usuário em produção (NOVUS → dbo.IOT001). v0.1.4: amostragem de 1 min, contagem regressiva, limpeza diária e vigia. v0.1.5: conexão automática ao abrir. v0.1.6: abas Atividade/Mosquitto e título Integrador Alumbra.
+- v0.1.3 validada pelo usuário em produção (NOVUS → dbo.IOT001). v0.1.4: amostragem de 1 min, contagem regressiva, limpeza diária e vigia. v0.1.5: conexão automática ao abrir. v0.1.6: abas Atividade/Mosquitto e título Integrador Alumbra. v0.1.7: aba Clientes e janela de erros (card ERROS).
 
 ## Idioma
 

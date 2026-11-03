@@ -153,9 +153,10 @@ def test_config_mosquitto(tmp_path):
 # ---------------------------------------------------------------------- janela
 def test_abas_atividade_e_mosquitto(abrir):
     janela, _, painel = abrir(auto=False)
-    assert janela.abas.count() == 2
+    assert janela.abas.count() == 3  # + aba Clientes (terceira)
     assert janela.abas.tabText(0) == "Atividade"
     assert janela.abas.tabText(1) == "Mosquitto"
+    assert janela.abas.tabText(2) == "Clientes"
     assert janela.abas.widget(0) is janela.logs
     assert janela.abas.widget(1) is painel
     assert janela.abas.currentIndex() == 0  # abre na Atividade, como antes

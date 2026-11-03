@@ -34,6 +34,7 @@ def test_sinais_de_erro_de_validacao(app, tmp_path):
     cfg = Config()
     cfg.sqlserver = SqlServerConfig(servidor="", banco="")
     cfg.gravacao.pasta_contingencia = str(tmp_path)
+    cfg.gravacao.pasta_logs = str(tmp_path / "logs")
     b = PipelineBridge(cfg)
     status, logs = [], []
     b.status_alterado.connect(lambda e, d: status.append((e, d)))
