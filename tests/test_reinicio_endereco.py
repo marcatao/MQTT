@@ -258,7 +258,8 @@ def test_seletor_aceita_pasta(abrir_janela, pastas, monkeypatch):
     janela, console, painel, settings = abrir_janela(padrao)
     chamadas = _mock_dialogo(monkeypatch, str(outra))
     painel.botao_procurar.click()
-    assert chamadas == [str(padrao)]  # abre na pasta atual
+    # abre na pasta atual (compara o caminho, não o texto: no Windows o Qt usa "/" e o pathlib "\")
+    assert [Path(c) for c in chamadas] == [Path(padrao)]
     assert painel.campo_endereco.text() == str(outra)
     assert console.pasta == str(outra)
     assert settings.value(CHAVE_PASTA) == str(outra)
