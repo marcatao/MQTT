@@ -260,7 +260,20 @@ mensagem inteira, não só o booleano.
   fecha com um INFO "Broker voltou após 3 min 12 s" (não é erro); uma queda nova soma outro erro. Desconectar pelo
   usuário, encerrar ou reinício do vigia não geram erro. Cada SUBACK recusado soma 1 erro, com o tópico.
 
+## Dispositivo cliente: NOVUS DigiRail IoT
+
+Manual em `docs/Manual_DigiRail_IoT.pdf` (enviado pelo usuário em 04/11/2026); referência técnica do MQTT em
+`docs/digirail_iot_mqtt.md`, anexada ao agente `mqtt-python`. `pid` é o código do modelo, não número de pacote.
+Eventos (`events`) e respostas (`ack/command`, `ack/config`) **não são leituras**. Recomendado no NXperience até as
+lacunas L1/L2 serem corrigidas: QoS 1, "Reter Dados" desligado, diagnóstico periódico desligado.
+
 ## Pendências conhecidas
+
+- Lacunas do integrador com o DigiRail (seção 7 de `docs/digirail_iot_mqtt.md`), a decidir com o usuário:
+  L1 eventos viram leitura com canais NULL e podem substituir a leitura do minuto; L2 respostas `ack/*` viram
+  leitura falsa ou erro; L3 reenvio da memória circular é descartado pela amostragem (agrupa por `recebido_em`, não
+  por `ts_unix`); L4 mensagens retidas regravadas; L5 duplicatas sem chave única `(device_id, ts_unix)`; L6 vigia de
+  10 min × intervalo de envio ≥ 10 min.
 
 - Reprocessar os arquivos de `contingencia/` (`.jsonl`) no SQL Server quando o banco voltar.
 - Possível duplicação de um lote se o `commit` chegar ao servidor e a resposta se perder (exigiria id de lote ou
