@@ -47,7 +47,8 @@ Regras do orquestrador:
 - **JSON:** `orjson` (mais rápido que `json`); fallback para `json` se não estiver instalado.
 - **Tabular:** módulo `csv` da biblioteca padrão, com detecção de delimitador (`;`, `,`, `\t`, `|`).
 - **SQL Server:** `pyodbc` + "ODBC Driver 18 for SQL Server", `fast_executemany = True`, gravação **em lotes**
-  (por quantidade ou por tempo, o que vier primeiro), sempre com parâmetros (nunca concatenar SQL).
+  (padrão: gravação imediata — grava assim que a fila esvazia, até `lote_max` por lote), sempre com parâmetros
+  (nunca concatenar SQL).
 - **Configuração:** arquivo `config.toml` (lido com `tomllib`) para SQL Server e opções; os campos da tela lembram o
   último valor usado. Senhas não ficam em texto puro no repositório (preferir autenticação do Windows ou `keyring`).
 - **Logs:** módulo `logging`, com um handler que envia para a caixa de logs da tela e outro para arquivo rotativo.
@@ -176,7 +177,7 @@ class PipelineBridge(QObject):
     log = Signal(str, str, str)             # (hora "HH:MM:SS", nivel "INFO" | "AVISO" | "ERRO", mensagem)
     contadores = Signal(int, int, int)      # (mensagens recebidas, registros gravados, erros), no máx. ~5x por segundo
     teste_sql_concluido = Signal(bool, str) # (sucesso, mensagem multilinha em português)
-    proxima_gravacao = Signal(float)        # epoch (s) do próximo ciclo de gravação; emitido ao conectar e a cada ciclo
+    proxima_gravacao = Signal(float)        # epoch (s) do próximo ciclo; só com amostragem (> 0); no padrão (0) não é emitido
     ultima_gravacao_ok = Signal(str)        # ISO 8601 local "AAAA-MM-DDTHH:MM:SS" do último INSERT com sucesso no SQL
     ultima_leitura = Signal(str)            # ISO 8601 local da última mensagem MQTT recebida (para o vigia)
     dispositivo_visto = Signal(str, str, str)  # (device_id, tópico, ISO local) de leitura recebida; máx. 1 a cada 5 s por device
@@ -222,15 +223,16 @@ mensagem inteira, não só o booleano.
 
 ## Operação contínua (decidido com o usuário em 03/11/2026)
 
-- **Amostragem de 1 em 1 minuto** (`[gravacao] intervalo_gravacao_segundos = 60`; 0 = grava tudo): os ciclos são
+- **Amostragem (opcional desde 04/11/2026; padrão agora é gravação imediata, ver abaixo)** (`[gravacao]
+  intervalo_gravacao_segundos = 60` só se configurado; 0 = grava tudo, padrão): os ciclos são
   alinhados ao relógio (hh:mm:00). Desde a v0.1.10 a amostragem é **pelo minuto da leitura (`ts_unix`)**: em cada
   ciclo grava-se, por `device_id`, a leitura completa mais recente de cada minuto de `ts_unix` já encerrado
   (inclusive os reenviados da memória do dispositivo); as demais são descartadas (não são erro). Leitura incompleta continua indo na hora para a
   contingência. Um log por ciclo resume: gravadas, recebidas e descartadas pela amostragem.
-- **Caixa ATIVIDADE**: mostra contagem regressiva até a próxima gravação e dia/hora da última gravação com sucesso no
+- **Caixa ATIVIDADE**: mostra contagem regressiva (desde 04/11/2026: até o reinício automático) e dia/hora da última gravação com sucesso no
   SQL Server (contingência não conta como sucesso). É **limpa todo dia à meia-noite** (hora local); o arquivo
   `logs/` continua com tudo.
-- **Vigia (watchdog)**: com o usuário conectado, se passar **10 min** (`[vigia] minutos = 10`) sem nenhuma leitura
+- **Vigia (watchdog)**: com o usuário conectado, se passar **60 min** (`[vigia] minutos = 60`; eram 10 até 04/11/2026) sem nenhuma leitura
   recebida, ou sem gravação com sucesso no SQL (só quando o SQL está configurado), o app **se reinicia sozinho** e
   reconecta automaticamente (`--auto-conectar`). O motivo vai para o log em arquivo. A contagem começa no momento da
   conexão. Para gravar no banco depois de reiniciar, a senha precisa estar salva ("Lembrar senha"); sem isso a tela
