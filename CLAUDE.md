@@ -336,7 +336,7 @@ que o integrador não ouvia.
 
 ## Estado atual
 
-- v0.1.3 validada pelo usuário em produção (NOVUS → dbo.IOT001). v0.1.4: amostragem de 1 min, contagem regressiva, limpeza diária e vigia. v0.1.5: conexão automática ao abrir. v0.1.6: abas Atividade/Mosquitto e título Integrador Alumbra. v0.1.7: aba Clientes e janela de erros (card ERROS). v0.1.8: queda do broker conta como erro (1 por queda). v0.1.10: DigiRail (classificação, amostragem por ts_unix, sem duplicatas), diagnóstico e Zerar contadores na aba Clientes.  Seguinte: tópicos por dispositivo (dispositivos.json), aviso de tópicos não ouvidos e diagnóstico "sem resposta".
+- v0.1.3 validada pelo usuário em produção (NOVUS → dbo.IOT001). v0.1.4: amostragem de 1 min, contagem regressiva, limpeza diária e vigia. v0.1.5: conexão automática ao abrir. v0.1.6: abas Atividade/Mosquitto e título Integrador Alumbra. v0.1.7: aba Clientes e janela de erros (card ERROS). v0.1.8: queda do broker conta como erro (1 por queda). v0.1.10: DigiRail (classificação, amostragem por ts_unix, sem duplicatas), diagnóstico e Zerar contadores na aba Clientes. v0.1.11: tópicos por dispositivo (dispositivos.json), aviso de tópicos não ouvidos e diagnóstico "sem resposta".
 
 ## Idioma
 
