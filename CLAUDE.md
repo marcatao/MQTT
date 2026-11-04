@@ -323,6 +323,21 @@ que o integrador não ouvia.
   diagnóstico — manual ou automático — não é respondido no tempo; o core emite `resposta_comando(device, "diag", False,
   msg)` também para o automático, só em caso de falha.
 
+### Gravação imediata, reinício em 1 h e endereço do Mosquitto (decidido com o usuário em 04/11/2026)
+
+- **Sem amostragem**: o padrão passa a `intervalo_gravacao_segundos = 0`. Cada leitura completa é gravada no SQL
+  Server **assim que chega** (lote só quando várias chegam juntas, como no reenvio da memória do dispositivo). A
+  proteção contra duplicatas `(device_id, ts_unix)` continua. A amostragem por minuto fica disponível só via
+  `config.toml` (não é mais o padrão).
+- **Vigia de 1 hora**: `[vigia] minutos = 60`. Se em 1 h não houver nenhuma gravação com sucesso (ou nenhuma leitura,
+  quando o SQL não está configurado), o programa se reinicia e reconecta sozinho.
+- **Contador da aba Atividade**: o chip "Próxima gravação" sai; no lugar entra "Reinício automático em mm:ss se nada for
+  gravado", que recomeça a cada gravação com sucesso. O chip "Última gravação" continua.
+- **Endereço Mosquitto** (aba Mosquitto): campo com o caminho da pasta do Mosquitto, pré-preenchido com `[mosquitto]
+  pasta`, botão "…" ao lado para escolher a pasta (ou o `mosquitto.exe`), editável com o Mosquitto parado; ao Iniciar,
+  usa o caminho do campo (prompt `<pasta>>mosquitto -v`). Salvo em `QSettings` (vale mais que o `config.toml`) e usado
+  também no reinício automático.
+
 ## Pendências conhecidas
 
 - Índice único `(device_id, ts_unix)` na IOT001 (opcional, decidir com o usuário).
