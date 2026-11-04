@@ -181,6 +181,9 @@ class PipelineBridge(QObject):
     ultima_leitura = Signal(str)            # ISO 8601 local da última mensagem MQTT recebida (para o vigia)
     dispositivo_visto = Signal(str, str, str)  # (device_id, tópico, ISO local) de leitura recebida; máx. 1 a cada 5 s por device
     erro_registrado = Signal(str)           # JSON de UM erro (ver "Erros detalhados"); 1 sinal para cada +1 no contador de erros
+    canais_vistos = Signal(str, str)        # (device_id, JSON lista ["chd1","chd2","chd3"]) quando o conjunto de canais muda
+    diagnostico_dispositivo = Signal(str, str)  # (device_id, JSON do objeto "diag" do DigiRail: sn, fw_v, curr/avg_rssi, mqtt_queue, ipv4...)
+    resposta_comando = Signal(str, str, bool, str)  # (device_id, comando "reset_counters"|"diag", sucesso, mensagem em português)
 
     def __init__(self, config: Config, parent=None): ...
     def definir_sql(self, sql: SqlServerConfig) -> None: ...   # a GUI chama antes de conectar e quando o usuário altera
@@ -188,6 +191,8 @@ class PipelineBridge(QObject):
     def conectar(self, broker: str, porta: int, topico: str, qos: int) -> None: ...  # não bloqueia
     def desconectar(self) -> None: ...                                              # não bloqueia
     def encerrar(self, timeout: float = 5.0) -> None: ...  # ao fechar a janela: para, grava o último lote, desconecta
+    def zerar_contadores(self, device_id: str, canais: list[int]) -> None: ...  # publica reset_counters; não bloqueia
+    def pedir_diagnostico(self, device_id: str) -> None: ...                   # publica diag; não bloqueia
 ```
 
 Os sinais são emitidos de outras threads; o Qt entrega na thread da GUI (conexão enfileirada). A GUI só usa isso.
@@ -267,8 +272,33 @@ Manual em `docs/Manual_DigiRail_IoT.pdf` (enviado pelo usuário em 04/11/2026); 
 Eventos (`events`) e respostas (`ack/command`, `ack/config`) **não são leituras**. Recomendado no NXperience até as
 lacunas L1/L2 serem corrigidas: QoS 1, "Reter Dados" desligado, diagnóstico periódico desligado.
 
+### Correções e comandos do DigiRail (decidido com o usuário em 04/11/2026)
+
+- **Classificação das mensagens** (L1/L2/L9): `channels` → leitura (vai para a IOT001); `events` → evento (não é
+  leitura, não grava, não é erro; só log resumido); `reported`/`desired`/respostas em `ack/*` → resposta de comando
+  (não é leitura nem erro; `diag` e `reset_counters` viram sinais). Dispositivo do tópico no padrão NOVUS é o nível
+  `{id}` de `NOVUS/{id}/...`.
+- **Amostragem pelo minuto da leitura** (L3): substitui a regra anterior. Grava-se 1 linha por `device_id` por minuto
+  de `ts_unix` (a mais recente daquele minuto). Leituras reenviadas da memória circular depois de uma queda viram uma
+  linha por minuto, sem buracos. O ciclo continua a cada minuto do relógio e grava todos os minutos de `ts_unix` já
+  encerrados.
+- **Sem duplicatas** (L4/L5): o integrador não grava duas vezes o mesmo `(device_id, minuto de ts_unix)` nem o mesmo
+  `(device_id, ts_unix)` (memória das últimas 24 h; mensagens retidas e reenvios QoS 1 caem aqui). Índice único no
+  banco fica como opção futura.
+- **Comandos ao dispositivo** (primeira vez que o integrador publica): tópico de comando `NOVUS/{id}/command`, resposta
+  em `NOVUS/{id}/ack/command` (modelos configuráveis em `[dispositivos]`), QoS 1, `timestamp` = agora.
+  - **Zerar contadores** por canal: `{"timestamp": T, "desired": {"reset_counters": {"reset_chd2": 1}}}`. Só funciona
+    nos canais com "reset por MQTT" habilitado no NXperience; a resposta traz `error` (0 = ok). Sem resposta em 15 s
+    → falha "sem resposta do dispositivo". Falha registra erro categoria `"comando"`.
+  - **Diagnóstico**: `{"timestamp": T, "desired": {"diag": {}}}` ao ver um dispositivo pela primeira vez em cada
+    conexão e a cada `[dispositivos] diagnostico_minutos = 30` (0 desliga). Preenche na aba Clientes: nº de série,
+    firmware, sinal Wi-Fi (RSSI), leituras guardadas no aparelho (`mqtt_queue`) e IP.
+- **Aba Clientes**: colunas novas Nº série, Firmware, Wi-Fi e Fila; em cada linha, botão **Zerar contadores** que abre
+  a escolha dos canais (chd1–chd6, individual ou todos), pede confirmação e mostra o resultado.
+
 ## Pendências conhecidas
 
+- Índice único `(device_id, ts_unix)` na IOT001 (opcional, decidir com o usuário).
 - Lacunas do integrador com o DigiRail (seção 7 de `docs/digirail_iot_mqtt.md`), a decidir com o usuário:
   L1 eventos viram leitura com canais NULL e podem substituir a leitura do minuto; L2 respostas `ack/*` viram
   leitura falsa ou erro; L3 reenvio da memória circular é descartado pela amostragem (agrupa por `recebido_em`, não
