@@ -217,7 +217,7 @@ mensagem inteira, não só o booleano.
 ## Operação contínua (decidido com o usuário em 03/11/2026)
 
 - **Amostragem de 1 em 1 minuto** (`[gravacao] intervalo_gravacao_segundos = 60`; 0 = grava tudo): os ciclos são
-  alinhados ao relógio (hh:mm:00). Desde a v0.1.9 a amostragem é **pelo minuto da leitura (`ts_unix`)**: em cada
+  alinhados ao relógio (hh:mm:00). Desde a v0.1.10 a amostragem é **pelo minuto da leitura (`ts_unix`)**: em cada
   ciclo grava-se, por `device_id`, a leitura completa mais recente de cada minuto de `ts_unix` já encerrado
   (inclusive os reenviados da memória do dispositivo); as demais são descartadas (não são erro). Leitura incompleta continua indo na hora para a
   contingência. Um log por ciclo resume: gravadas, recebidas e descartadas pela amostragem.
@@ -302,7 +302,7 @@ lacunas L1/L2 serem corrigidas: QoS 1, "Reter Dados" desligado, diagnóstico per
 - Índice único `(device_id, ts_unix)` na IOT001 (opcional, decidir com o usuário).
 - Lacunas do DigiRail ainda abertas (seção 7 de `docs/digirail_iot_mqtt.md`): L6 vigia de 10 min × intervalo de envio
   ≥ 10 min; L7 JSON inválido do firmware (parcial, confirmar com captura real); L11 canais além de chd1–chd3 só no
-  `payload_json`. L1–L5, L8–L10 resolvidas na v0.1.9 (L5 só em memória: some ao reiniciar o programa).
+  `payload_json`. L1–L5, L8–L10 resolvidas na v0.1.10 (L5 só em memória: some ao reiniciar o programa).
 
 - Reprocessar os arquivos de `contingencia/` (`.jsonl`) no SQL Server quando o banco voltar.
 - Possível duplicação de um lote se o `commit` chegar ao servidor e a resposta se perder (exigiria id de lote ou
@@ -310,7 +310,7 @@ lacunas L1/L2 serem corrigidas: QoS 1, "Reter Dados" desligado, diagnóstico per
 
 ## Estado atual
 
-- v0.1.3 validada pelo usuário em produção (NOVUS → dbo.IOT001). v0.1.4: amostragem de 1 min, contagem regressiva, limpeza diária e vigia. v0.1.5: conexão automática ao abrir. v0.1.6: abas Atividade/Mosquitto e título Integrador Alumbra. v0.1.7: aba Clientes e janela de erros (card ERROS). v0.1.8: queda do broker conta como erro (1 por queda). v0.1.9: DigiRail (classificação, amostragem por ts_unix, sem duplicatas), diagnóstico e Zerar contadores na aba Clientes.
+- v0.1.3 validada pelo usuário em produção (NOVUS → dbo.IOT001). v0.1.4: amostragem de 1 min, contagem regressiva, limpeza diária e vigia. v0.1.5: conexão automática ao abrir. v0.1.6: abas Atividade/Mosquitto e título Integrador Alumbra. v0.1.7: aba Clientes e janela de erros (card ERROS). v0.1.8: queda do broker conta como erro (1 por queda). v0.1.10: DigiRail (classificação, amostragem por ts_unix, sem duplicatas), diagnóstico e Zerar contadores na aba Clientes.
 
 ## Idioma
 
