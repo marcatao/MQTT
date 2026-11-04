@@ -23,16 +23,17 @@ trust_server_certificate = false
 timeout_conexao = 5
 
 [gravacao]
-lote_max = 500           # grava quando juntar esta quantidade...
-lote_segundos = 1.0      # ...ou quando passar este tempo, o que vier primeiro
+lote_max = 500           # teto de registros por INSERT (as leituras que chegam juntas viram um lote)
+lote_segundos = 1.0      # só com amostragem: espera máxima para juntar registros (com 0 abaixo, grava na hora)
 pasta_contingencia = "contingencia"
 pasta_logs = "logs"      # erros detalhados do dia em erros_AAAAMMDD.jsonl (a janela de erros lê daqui)
-# Amostragem pelo minuto da leitura (ts_unix): 1 linha por device_id por minuto (a leitura mais recente daquele
-# minuto). A cada ciclo alinhado ao relógio (60 = hh:mm:00) grava todos os minutos já encerrados, inclusive os
-# antigos reenviados pela memória do dispositivo depois de uma queda; o minuto corrente espera o próximo ciclo.
-# 0 = grava todas (por lote_max/lote_segundos, como acima). Nos dois casos, a mesma leitura (device_id, ts_unix)
-# não é gravada duas vezes (memória das últimas 24 h).
-intervalo_gravacao_segundos = 60
+# 0 (padrão) = gravação imediata: cada leitura completa vai ao SQL Server assim que chega; as que chegam juntas
+# (ex.: reenvio da memória do dispositivo depois de uma queda) viram um único lote de até lote_max.
+# Amostragem (só se configurada, ex. 60): 1 linha por device_id por minuto de ts_unix (a leitura mais recente
+# daquele minuto); a cada ciclo alinhado ao relógio (60 = hh:mm:00) grava todos os minutos já encerrados,
+# inclusive os reenviados pela memória do dispositivo; o minuto corrente espera o próximo ciclo.
+# Nos dois casos, a mesma leitura (device_id, ts_unix) não é gravada duas vezes (memória das últimas 24 h).
+intervalo_gravacao_segundos = 0
 
 [mapeamento]
 # Como achar cada coluna da dbo.IOT001 no payload (JSON ou tabular com cabeçalho). A primeira chave encontrada
@@ -50,9 +51,10 @@ fuso_sem_offset = "local"    # data/hora ISO sem fuso: "local" (do PC) ou "utc"
 colunas_sem_cabecalho = []   # tabular sem cabeçalho: ex. ["pid", "device_id", "ts", "chd1", "chd2", "chd3"]
 
 [vigia]
-# Com o app conectado, se passar este tempo sem nenhuma leitura recebida (ou sem gravação com sucesso no
-# SQL Server, quando ele está configurado), o programa se reinicia sozinho e reconecta. 0 desliga.
-minutos = 10
+# Com o app conectado, se passar este tempo sem nenhuma gravação com sucesso no SQL Server (ou sem nenhuma leitura
+# recebida, quando o SQL não está configurado), o programa se reinicia sozinho e reconecta. 0 desliga.
+# A aba Atividade mostra a contagem regressiva ("Reinício automático em 59:12 se nada for gravado").
+minutos = 60
 
 [inicio]
 # Ao abrir o programa, testa o SQL Server e conecta no broker sozinho, com os últimos valores usados na tela.
@@ -65,7 +67,7 @@ conectar_automaticamente = true
 # (prompt "<pasta>><comando>"). Ele para ao fechar o programa e volta junto no reinício automático.
 # Se o Mosquitto já roda como serviço do Windows, pare o serviço ou use iniciar_automaticamente = false
 # (os dois não podem ouvir a porta 1883 ao mesmo tempo).
-pasta = "C:\\Program Files\\mosquitto168"
+pasta = "C:\\Program Files\\mosquitto168"   # padrão; o campo "Endereço Mosquitto" da aba vale mais (fica salvo no programa)
 comando = "mosquitto -v"     # 1º token = programa (.exe é acrescentado se faltar); o resto são argumentos
 iniciar_automaticamente = true
 

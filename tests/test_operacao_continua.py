@@ -44,10 +44,11 @@ def iso(epoch: float) -> str:
 def montar(qapp, tmp_path):  # noqa: F811
     criadas = []
 
-    def _montar(minutos=10, servidor="TERRA\\SOLO", lembrar=False, relogio=None, **kw):
+    def _montar(minutos=10, servidor="TERRA\\SOLO", lembrar=False, relogio=None, intervalo=0, **kw):
         relogio = relogio or Relogio()
         config = Config()
         config.vigia.minutos = minutos
+        config.gravacao.intervalo_gravacao_segundos = intervalo
         config.mosquitto.iniciar_automaticamente = False  # não tenta rodar o mosquitto.exe nos testes
         settings = QSettings(str(tmp_path / "gui.ini"), QSettings.Format.IniFormat)
         kw.setdefault("intervalo", 3600)  # sem mensagens simuladas: o teste emite os sinais com o relógio falso
@@ -84,8 +85,10 @@ def test_contagem_formata(segundos, esperado):
 
 
 def test_contagem_regressiva_no_chip(montar):
-    janela, bridge, relogio, _, _ = montar()
+    # chip antigo "Próxima gravação": só com amostragem ligada no config.toml (intervalo > 0)
+    janela, bridge, relogio, _, _ = montar(intervalo=60)
     chip = janela.logs.chip_proxima
+    assert not chip.isHidden()
     assert chip.texto() == "Próxima gravação —"  # desconectado
     janela.botao_conectar.click()
     assert esperar(lambda: janela.estado == "conectado")
@@ -328,7 +331,7 @@ def test_auto_conectar_conecta(qapp, tmp_path):  # noqa: F811
 
 
 def test_config_vigia(tmp_path):
-    assert Config().vigia.minutos == 10
+    assert Config().vigia.minutos == 60  # 1 hora (decidido em 04/11/2026)
     arq = tmp_path / "config.toml"
     arq.write_text("[vigia]\nminutos = 0\n", encoding="utf-8")
     assert carregar(arq).vigia.minutos == 0

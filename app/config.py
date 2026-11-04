@@ -44,14 +44,16 @@ class SqlServerConfig:
 
 @dataclass
 class GravacaoConfig:
-    lote_max: int = 500
+    lote_max: int = 500           # teto de registros por INSERT em lote
+    # só com amostragem (ou sem SQL): espera máxima para juntar registros; com intervalo 0 a gravação é imediata
     lote_segundos: float = 1.0
     pasta_contingencia: str = "contingencia"
     # registros da janela de erros (erros_AAAAMMDD.jsonl); relativa à pasta do programa, como a contingência
     pasta_logs: str = "logs"
-    # amostragem: a cada ciclo (alinhado ao relógio, ex. hh:mm:00) grava só a leitura completa mais recente de
-    # cada device_id; 0 desliga e grava todas as leituras (em lote, por lote_max/lote_segundos)
-    intervalo_gravacao_segundos: int = 60
+    # 0 (padrão): grava cada leitura completa assim que chega (as que chegam juntas, como o reenvio da memória do
+    # dispositivo, viram um lote de até lote_max). Amostragem só se configurada (> 0): a cada ciclo alinhado ao
+    # relógio (60 = hh:mm:00) grava 1 leitura por device_id por minuto de ts_unix
+    intervalo_gravacao_segundos: int = 0
 
 
 @dataclass
@@ -83,8 +85,9 @@ class MapeamentoConfig:
 
 @dataclass
 class VigiaConfig:
-    """Vigia (watchdog): reinicia o app se ficar `minutos` sem leitura (ou sem gravação no SQL). 0 desliga."""
-    minutos: float = 10
+    """Vigia (watchdog): reinicia o app se ficar `minutos` sem gravação com sucesso no SQL (ou sem leitura, quando o
+    SQL não está configurado). 0 desliga. A aba Atividade mostra a contagem regressiva."""
+    minutos: float = 60
 
 
 @dataclass
@@ -99,7 +102,8 @@ class MosquittoConfig:
     """Broker Mosquitto local rodando como processo filho do app (aba Mosquitto).
 
     `comando`: o primeiro token é o programa (".exe" é acrescentado se faltar), o resto são os argumentos.
-    O prompt mostrado no console é sempre ``<pasta>><comando>``.
+    O prompt mostrado no console é sempre ``<pasta>><comando>``. `pasta` é só o padrão: o campo "Endereço
+    Mosquitto" da aba salva o valor escolhido em QSettings (``mosquitto/pasta``), que vale mais que este.
     """
     pasta: str = "C:\\Program Files\\mosquitto168"
     comando: str = "mosquitto -v"

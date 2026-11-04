@@ -5,7 +5,8 @@ Duas partes:
 * `ConsoleMosquitto` (QObject, sem widgets): inicia/para o `mosquitto -v` e um "comando extra" (ex.:
   `mosquitto_sub -h localhost -t "#" -v`) com QProcess e avisa por sinais (`saida`, `estado_alterado`,
   `comando_alterado`). A fábrica de processo e o interpretador do comando extra são injetáveis para os testes.
-* `PainelMosquitto` (QWidget): chip de estado, botões Iniciar/Parar/Limpar, o console e o campo "Comando".
+* `PainelMosquitto` (QWidget): chip de estado, botões Iniciar/Parar/Limpar, o campo "Endereço Mosquitto" (pasta do
+  mosquitto.exe, com botão "…" e "Restaurar padrão"), o console e o campo "Comando".
 
 Tudo roda na thread da GUI: o QProcess é assíncrono (sinais `readyRead`/`finished`), nada aqui bloqueia, exceto
 `encerrar()`, que é chamado só ao fechar o programa ou no reinício do vigia (no máximo ~3 s).
@@ -13,6 +14,10 @@ Tudo roda na thread da GUI: o QProcess é assíncrono (sinais `readyRead`/`finis
 Config (`[mosquitto]` no config.toml, `MosquittoConfig` em app/config.py): `pasta`, `comando` (1º token = programa,
 ".exe" acrescentado se faltar; o resto são argumentos) e `iniciar_automaticamente`. O prompt mostrado é sempre
 ``<pasta>><comando>``, como no Prompt de Comando do Windows.
+
+Endereço Mosquitto: `[mosquitto] pasta` é só o padrão. A pasta escolhida no campo da aba fica em QSettings
+(`mosquitto/pasta`, chave `CHAVE_PASTA`), vale mais que o config.toml e é lida ao abrir (inclusive no reinício do
+vigia, antes do início automático). Só é salva por ação do usuário: Iniciar com sucesso, Enter no campo ou o seletor.
 """
 from __future__ import annotations
 
@@ -25,18 +30,28 @@ import sys
 import time
 from typing import Callable
 
-from PySide6.QtCore import QEvent, QObject, QProcess, QTimer, Qt, Signal
+from PySide6.QtCore import QEvent, QObject, QProcess, QSettings, QTimer, Qt, Signal
 from PySide6.QtGui import QKeySequence
-from PySide6.QtWidgets import QHBoxLayout, QLabel, QLineEdit, QPushButton, QVBoxLayout, QWidget
+from PySide6.QtWidgets import (
+    QFileDialog,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QPushButton,
+    QVBoxLayout,
+    QWidget,
+)
 
 from app.config import MosquittoConfig
 
 from .estilo import fonte_mono
-from .widgets import CaixaConsole, ChipInfo
+from .widgets import CaixaConsole, ChipInfo, repolir
 
 log = logging.getLogger("app.mosquitto")
 
 ESPERA_TERMINAR_MS = 3000  # terminate → espera até 3 s → kill
+CHAVE_PASTA = "mosquitto/pasta"   # QSettings: pasta escolhida no campo "Endereço Mosquitto"
+DICA_PARE = "Pare o Mosquitto para alterar o endereço"
 DICA_SERVICO = ("Se o Mosquitto já roda como serviço do Windows, pare o serviço ou desligue "
                 "[mosquitto] iniciar_automaticamente")
 
@@ -63,6 +78,22 @@ def caminho_programa(pasta: str, programa: str) -> str:
         return programa
     sep = "\\" if ("\\" in pasta and "/" not in pasta) else os.sep
     return pasta.rstrip("\\/") + sep + programa
+
+
+def normalizar_pasta(texto: str) -> str:
+    """Texto do campo → pasta: tira espaços e aspas; se for o caminho de um arquivo .exe (ex.: o próprio
+    mosquitto.exe), devolve a pasta dele. Barras finais saem (menos na raiz, como C:\\)."""
+    t = str(texto or "").strip().strip('"').strip()
+    if not t:
+        return ""
+    if t.lower().endswith(".exe"):
+        corte = max(t.rfind("\\"), t.rfind("/"))
+        t = t[:corte] if corte > 0 else t
+        if t.endswith(":"):
+            t += "\\"
+    if len(t) > 1 and t[-1] in "\\/" and not t.endswith(":\\") and not t.endswith(":/"):
+        t = t.rstrip("\\/") or t[0]
+    return t
 
 
 def codificacao_local() -> str:
@@ -150,17 +181,20 @@ class ConsoleMosquitto(QObject):
       estado_alterado(estado, texto): estado "parado" | "iniciando" | "rodando" | "parando" | "erro";
           texto pronto para o chip: "Rodando (PID 1234)", "Parado", "Erro: <motivo>"…
       comando_alterado(rodando): o comando extra começou (True) ou terminou (False).
+      pasta_alterada(pasta): a pasta usada (campo "Endereço Mosquitto") mudou.
     """
 
     saida = Signal(str, str)
     estado_alterado = Signal(str, str)
     comando_alterado = Signal(bool)
+    pasta_alterada = Signal(str)
 
     def __init__(self, config: MosquittoConfig, parent: QObject | None = None,
                  fabrica_processo: FabricaProcesso | None = None,
                  interpretador: tuple[str, list[str]] | None = None):
         super().__init__(parent)
         self.config = config
+        self._pasta: str | None = None  # None = a de config.pasta
         self._fabrica = fabrica_processo or (lambda pai: QProcess(pai))
         self._interpretador = interpretador or interpretador_padrao()
         self._proc: QProcess | None = None
@@ -176,8 +210,31 @@ class ConsoleMosquitto(QObject):
 
     # ----- propriedades -----
     @property
-    def pasta(self) -> str:
+    def pasta_padrao(self) -> str:
         return str(self.config.pasta or "")
+
+    @property
+    def pasta(self) -> str:
+        return self.pasta_padrao if self._pasta is None else self._pasta
+
+    def definir_pasta(self, pasta: str | None) -> None:
+        """Troca a pasta usada no próximo Iniciar (None = volta ao `[mosquitto] pasta`). Não mexe no que roda."""
+        anterior = self.pasta
+        self._pasta = None if pasta is None else str(pasta)
+        if self.pasta != anterior:
+            self.pasta_alterada.emit(self.pasta)
+
+    def validar_pasta(self, pasta: str | None = None) -> str | None:
+        """Mensagem de erro se a pasta não tem o programa do comando (mosquitto.exe); None se está tudo certo."""
+        pasta = self.pasta if pasta is None else pasta
+        nome = separar_comando(self.comando)[0] or "mosquitto.exe"
+        if not pasta:
+            return f"Informe a pasta onde está o {nome}."
+        if not os.path.isdir(pasta):
+            return f"Pasta não encontrada: {pasta}"
+        if not os.path.isfile(caminho_programa(pasta, nome)):
+            return f"{nome} não encontrado em {pasta}"
+        return None
 
     @property
     def comando(self) -> str:
@@ -221,7 +278,7 @@ class ConsoleMosquitto(QObject):
         programa = caminho_programa(self.pasta, nome)
         if not os.path.isfile(programa):
             self._erro(f"{nome} não encontrado",
-                       f"{nome} não encontrado em {self.pasta} — confira [mosquitto] pasta no config.toml.")
+                       f"{nome} não encontrado em {self.pasta} — confira o Endereço Mosquitto (botão …).")
             return False
         proc = self._fabrica(self)
         proc.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)  # mosquitto -v escreve no stderr
@@ -315,7 +372,7 @@ class ConsoleMosquitto(QObject):
             return False
         self.saida.emit("prompt", self.prompt(comando))
         if not os.path.isdir(self.pasta):
-            self.saida.emit("erro", f"Pasta não encontrada: {self.pasta} — confira [mosquitto] pasta no config.toml.")
+            self.saida.emit("erro", f"Pasta não encontrada: {self.pasta} — confira o Endereço Mosquitto.")
             return False
         programa, prefixo = self._interpretador
         proc = self._fabrica(self)
@@ -433,13 +490,60 @@ def _matar(proc: QProcess, arvore: bool) -> None:
 
 
 # ---------------------------------------------------------------------- tela
-class PainelMosquitto(QWidget):
-    """Conteúdo da aba Mosquitto: barra (estado, Iniciar, Parar, Limpar), console e campo Comando."""
+def escolher_pasta(parent: QWidget | None, inicial: str) -> str:
+    """Diálogo "Procurar" do Endereço Mosquitto. Devolve a pasta (ou o caminho do mosquitto.exe) ou "" se cancelou.
 
-    def __init__(self, console: ConsoleMosquitto, parent: QWidget | None = None):
+    Usa o diálogo do Qt (não o nativo) para mostrar também os arquivos: assim o usuário pode clicar no próprio
+    mosquitto.exe ou só entrar na pasta e clicar em "Escolher". O diálogo nativo de pasta do Windows esconde os
+    arquivos, e o de arquivo não aceita pasta."""
+    dialogo = _DialogoPasta(parent, inicial)
+    if dialogo.exec() != _DialogoPasta.DialogCode.Accepted:
+        return ""
+    return dialogo.escolhido
+
+
+class _DialogoPasta(QFileDialog):
+    """QFileDialog em modo pasta que também aceita um arquivo selecionado (o mosquitto.exe)."""
+
+    def __init__(self, parent: QWidget | None, inicial: str):
+        super().__init__(parent, "Endereço Mosquitto — escolha a pasta ou o mosquitto.exe",
+                         inicial if inicial and os.path.isdir(inicial) else "")
+        self.setOption(QFileDialog.Option.DontUseNativeDialog, True)
+        self.setFileMode(QFileDialog.FileMode.Directory)
+        self.setOption(QFileDialog.Option.ShowDirsOnly, False)
+        self.setNameFilter("mosquitto.exe (mosquitto.exe);;Programas (*.exe);;Todos os arquivos (*)")
+        self.setLabelText(QFileDialog.DialogLabel.Accept, "Escolher")
+        self.setLabelText(QFileDialog.DialogLabel.Reject, "Cancelar")
+        self.escolhido = ""
+
+    def accept(self) -> None:  # noqa: D401 - API do Qt
+        selecionados = self.selectedFiles()
+        alvo = selecionados[0] if selecionados else self.directory().absolutePath()
+        if os.path.isfile(alvo):  # clicou no mosquitto.exe: aceita (a pasta é tirada depois)
+            self.escolhido = alvo
+            self.done(QFileDialog.DialogCode.Accepted)
+            return
+        self.escolhido = alvo
+        super().accept()
+
+
+class PainelMosquitto(QWidget):
+    """Conteúdo da aba Mosquitto: barra (estado, Iniciar, Parar, Limpar), Endereço Mosquitto, console e Comando.
+
+    `settings` (QSettings da janela): de onde vem e para onde vai a pasta escolhida (`CHAVE_PASTA`). Sem ele, o
+    campo funciona mas nada é salvo. `escolher` (injetável nos testes): diálogo de "…"."""
+
+    def __init__(self, console: ConsoleMosquitto, parent: QWidget | None = None,
+                 settings: QSettings | None = None,
+                 escolher: Callable[[QWidget | None, str], str] | None = None):
         super().__init__(parent)
         self.setObjectName("paginaAba")
         self.console = console
+        self.settings = settings
+        self._escolher = escolher
+        salva = str(settings.value(CHAVE_PASTA, "") or "").strip() if settings is not None else ""
+        if salva:
+            console.definir_pasta(salva)  # QSettings vale mais que o config.toml (também no reinício do vigia)
         corpo = QVBoxLayout(self)
         corpo.setContentsMargins(0, 12, 0, 0)
         corpo.setSpacing(12)
@@ -453,7 +557,7 @@ class PainelMosquitto(QWidget):
         self.chip_pausa.setCursor(Qt.CursorShape.PointingHandCursor)
         self.chip_pausa.setToolTip("Novas linhas continuam chegando. Clique para voltar ao fim.")
         self.chip_pausa.hide()
-        self.botao_iniciar = self._botao("Iniciar", f"Rodar {console.comando} em {console.pasta}")
+        self.botao_iniciar = self._botao("Iniciar", "")
         self.botao_parar = self._botao("Parar", "Encerrar o Mosquitto")
         self.botao_limpar = self._botao("Limpar", "Apagar as linhas do console (o processo continua)")
         barra.addWidget(self.chip_estado)
@@ -464,9 +568,39 @@ class PainelMosquitto(QWidget):
         barra.addWidget(self.botao_parar)
         barra.addWidget(self.botao_limpar)
 
+        # Endereço Mosquitto: pasta do mosquitto.exe, editável só com o processo parado.
+        endereco = QHBoxLayout()
+        endereco.setSpacing(8)
+        self.rotulo_endereco = QLabel("ENDEREÇO MOSQUITTO", self)
+        self.rotulo_endereco.setObjectName("rotuloCampo")
+        self.campo_endereco = QLineEdit(self)
+        self.campo_endereco.setObjectName("campoEndereco")
+        self.campo_endereco.setFont(fonte_mono())
+        self.campo_endereco.setPlaceholderText(r"ex.: C:\Program Files\mosquitto")
+        self.campo_endereco.setAccessibleName("Endereço Mosquitto")
+        self.campo_endereco.setClearButtonEnabled(False)
+        self.rotulo_endereco.setBuddy(self.campo_endereco)
+        self.botao_procurar = QPushButton("…", self)
+        self.botao_procurar.setObjectName("botaoProcurar")
+        self.botao_procurar.setAccessibleName("Procurar pasta do Mosquitto")
+        self.botao_procurar.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.botao_procurar.setFixedWidth(40)
+        self.botao_restaurar = QPushButton("Restaurar padrão", self)
+        self.botao_restaurar.setObjectName("botaoLink")
+        self.botao_restaurar.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.erro_endereco = QLabel(self)
+        self.erro_endereco.setObjectName("erroValidacao")
+        self.erro_endereco.setWordWrap(True)
+        self.erro_endereco.hide()
+        endereco.addWidget(self.campo_endereco, 1)
+        endereco.addWidget(self.botao_procurar)
+        endereco.addWidget(self.botao_restaurar)
+        bloco_endereco = QVBoxLayout()  # rótulo em cima (como os campos da coluna esquerda): o caminho cabe inteiro
+        bloco_endereco.setSpacing(4)
+        bloco_endereco.addWidget(self.rotulo_endereco)
+        bloco_endereco.addLayout(endereco)
+
         self.caixa = CaixaConsole(parent=self)
-        self.caixa.setPlaceholderText(
-            f"O Mosquitto não está rodando. Clique em Iniciar para executar {console.prompt()}")
         self.caixa.seguindo_alterado.connect(lambda seguir: self.chip_pausa.setVisible(not seguir))
         self.chip_pausa.clicked.connect(self.caixa.ir_para_fim)
 
@@ -478,9 +612,7 @@ class PainelMosquitto(QWidget):
         self.campo_comando.setObjectName("campoComando")
         self.campo_comando.setFont(fonte_mono())
         self.campo_comando.setPlaceholderText('ex.: mosquitto_sub -h localhost -t "#" -v')
-        self.campo_comando.setToolTip(
-            f"Roda outro comando em {console.pasta} (cmd.exe /c), com a saída neste console. "
-            "Enter executa; Ctrl+C ou Parar encerra.")
+
         self.campo_comando.setAccessibleName("Comando")
         self.rotulo_comando.setBuddy(self.campo_comando)
         self.botao_executar = QPushButton("Executar", self)
@@ -491,10 +623,17 @@ class PainelMosquitto(QWidget):
         linha.addWidget(self.botao_executar)
 
         corpo.addLayout(barra)
+        corpo.addLayout(bloco_endereco)
+        bloco_endereco.addWidget(self.erro_endereco)
         corpo.addWidget(self.caixa, 1)
         corpo.addLayout(linha)
 
-        self.botao_iniciar.clicked.connect(console.iniciar)
+        self.botao_iniciar.clicked.connect(self.iniciar)
+        self.botao_procurar.clicked.connect(self.procurar)
+        self.botao_restaurar.clicked.connect(self.restaurar_padrao)
+        self.campo_endereco.returnPressed.connect(self.confirmar_endereco)
+        self.campo_endereco.textEdited.connect(self._endereco_editado)
+        console.pasta_alterada.connect(self._ao_pasta)
         self.botao_parar.clicked.connect(console.parar)
         self.botao_limpar.clicked.connect(self.caixa.limpar)
         self.botao_executar.clicked.connect(self._executar_ou_parar)
@@ -503,6 +642,8 @@ class PainelMosquitto(QWidget):
         console.saida.connect(self.caixa.adicionar)
         console.estado_alterado.connect(self._ao_estado)
         console.comando_alterado.connect(self._ao_comando)
+        self.campo_endereco.setText(console.pasta)
+        self._ao_pasta(console.pasta)
         self._ao_estado(console.estado, console.texto_estado)
         self._ao_comando(console.comando_rodando)
 
@@ -519,6 +660,120 @@ class PainelMosquitto(QWidget):
         ativo = estado in ("iniciando", "rodando", "parando")
         self.botao_iniciar.setEnabled(not ativo)
         self.botao_parar.setEnabled(estado in ("iniciando", "rodando"))
+        # Endereço: só com o Mosquitto parado (o processo que roda não muda de pasta).
+        self.campo_endereco.setReadOnly(ativo)
+        self.botao_procurar.setEnabled(not ativo)
+        self.botao_restaurar.setEnabled(not ativo)
+        if ativo:
+            self.campo_endereco.setText(self.console.pasta)  # mostra a pasta em uso, não um rascunho
+            self._limpar_erro_endereco()
+            self.campo_endereco.setToolTip(DICA_PARE)
+            self.botao_procurar.setToolTip(DICA_PARE)
+            self.botao_restaurar.setToolTip(DICA_PARE)
+        else:
+            self.campo_endereco.setToolTip(
+                "Pasta onde está o mosquitto.exe. Enter confirma; o botão … procura a pasta (ou o próprio "
+                "mosquitto.exe). Fica salvo e vale mais que o config.toml.")
+            self.botao_procurar.setToolTip("Procurar a pasta do Mosquitto (ou o mosquitto.exe)")
+            self.botao_restaurar.setToolTip(
+                f"Voltar ao padrão do config.toml: {self.console.pasta_padrao or '(vazio)'}")
+        repolir(self.campo_endereco)
+
+    # ----- Endereço Mosquitto -----
+    def _ao_pasta(self, pasta: str) -> None:
+        prompt = self.console.prompt()
+        self.chip_estado.setToolTip(f"Processo {prompt}")
+        self.botao_iniciar.setToolTip(f"Rodar {self.console.comando} em {pasta}")
+        self.caixa.setPlaceholderText(f"O Mosquitto não está rodando. Clique em Iniciar para executar {prompt}")
+        self.campo_comando.setToolTip(
+            f"Roda outro comando em {pasta} (cmd.exe /c), com a saída neste console. "
+            "Enter executa; Ctrl+C ou Parar encerra.")
+
+    def _endereco_editado(self, _texto: str = "") -> None:
+        self._limpar_erro_endereco()
+
+    def _limpar_erro_endereco(self) -> None:
+        self.erro_endereco.hide()
+        if self.campo_endereco.property("invalido"):
+            self.campo_endereco.setProperty("invalido", False)
+            repolir(self.campo_endereco)
+
+    def _mostrar_erro_endereco(self, mensagem: str) -> None:
+        self.campo_endereco.setProperty("invalido", True)
+        repolir(self.campo_endereco)
+        self.erro_endereco.setText(mensagem)
+        self.erro_endereco.show()
+
+    def _salvar_pasta(self, pasta: str) -> None:
+        if self.settings is not None:
+            self.settings.setValue(CHAVE_PASTA, pasta)
+            self.settings.sync()
+
+    def _aplicar_endereco(self, texto: str, no_console: bool) -> str | None:
+        """Normaliza (exe → pasta), valida e, se ok, passa ao console. Devolve a pasta ou None se inválida."""
+        pasta = normalizar_pasta(texto)
+        self.campo_endereco.setText(pasta)
+        erro = self.console.validar_pasta(pasta)
+        if erro:
+            mensagem = f"{erro}. Use o botão … para escolher a pasta do mosquitto.exe."
+            self._mostrar_erro_endereco(mensagem)
+            if no_console:
+                self.caixa.adicionar("prompt", f"{pasta}>{self.console.comando}")
+                self.caixa.adicionar("erro", mensagem)
+                self.caixa.ir_para_fim()
+            log.warning("Mosquitto: endereço inválido: %s", erro)
+            return None
+        self._limpar_erro_endereco()
+        self.console.definir_pasta(pasta)
+        return pasta
+
+    def confirmar_endereco(self) -> bool:
+        """Enter no campo: valida e salva (sem iniciar)."""
+        if self.console.rodando or self.campo_endereco.isReadOnly():
+            return False
+        pasta = self._aplicar_endereco(self.campo_endereco.text(), no_console=False)
+        if pasta is None:
+            return False
+        self._salvar_pasta(pasta)
+        return True
+
+    def procurar(self) -> bool:
+        """Botão …: escolhe a pasta (ou o mosquitto.exe, e usa a pasta dele), valida e salva."""
+        if self.console.rodando or self.campo_endereco.isReadOnly():
+            return False
+        escolher = self._escolher or escolher_pasta
+        caminho = escolher(self, normalizar_pasta(self.campo_endereco.text()) or self.console.pasta)
+        if not caminho:
+            return False
+        pasta = self._aplicar_endereco(caminho, no_console=False)
+        if pasta is None:
+            return False
+        self._salvar_pasta(pasta)
+        return True
+
+    def restaurar_padrao(self) -> None:
+        """Volta ao `[mosquitto] pasta` do config.toml e apaga o valor salvo."""
+        if self.console.rodando or self.campo_endereco.isReadOnly():
+            return
+        self.console.definir_pasta(None)
+        self.campo_endereco.setText(self.console.pasta)
+        self._limpar_erro_endereco()
+        if self.settings is not None:
+            self.settings.remove(CHAVE_PASTA)
+            self.settings.sync()
+
+    def iniciar(self) -> bool:
+        """Botão Iniciar: usa a pasta do campo; pasta sem mosquitto.exe não inicia (erro no console e no campo)."""
+        if self.console.rodando:
+            return False
+        pasta = self._aplicar_endereco(self.campo_endereco.text(), no_console=True)
+        if pasta is None:
+            return False
+        ok = self.console.iniciar()
+        if ok:
+            self._salvar_pasta(pasta)
+            self.caixa.ir_para_fim()
+        return ok
 
     def _ao_comando(self, rodando: bool) -> None:
         self.botao_executar.setText("Parar" if rodando else "Executar")

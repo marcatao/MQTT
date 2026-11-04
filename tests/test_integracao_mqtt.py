@@ -189,7 +189,7 @@ def test_com_sql_falso_grava_em_lote(broker, tmp_path):
     assert sorted(r[3] for r in gravados) == [Decimal(i).quantize(Decimal("0.0001")) for i in range(n)]
     assert {r[1] for r in gravados} == {"d0", "d1", "d2"}                         # device_id do tópico
     assert all(len(r) == 8 for r in gravados)
-    assert ev.tem_log("registros no SQL Server")
+    assert ev.tem_log("no SQL Server") and ev.tem_log("leitura")   # log por leitura ou por rajada (por device)
     assert not (tmp_path / "contingencia").exists()
     print(f"\n{n} mensagens publicadas e gravadas (SQL falso) em {duracao:.2f}s")
 

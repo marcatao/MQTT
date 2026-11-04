@@ -319,9 +319,10 @@ def test_intervalo_zero_mantem_comportamento_antigo(montar, inicio):
     for i in range(6):
         relogio.ir(inicio + i)
         cli.entregar("NOVUS/Teste_Alumbra/events", novus(i))
-    assert esperar(lambda: len(_linhas(conexao)) == 6)    # sem esperar ciclo: lote_segundos
+    assert esperar(lambda: len(_linhas(conexao)) == 6)    # sem esperar ciclo: gravação imediata
     assert esperar(lambda: p.contadores == (6, 6, 0))
-    assert ev.com("Gravados ")                            # log por lote, como antes
+    assert esperar(lambda: len(ev.com("Teste_Alumbra (")) >= 1)   # log por leitura/rajada, no lugar do do sink
+    assert not ev.com("Gravados ")
     assert not ev.com("Gravação ") and not ev.com("Amostragem")
     relogio.ir(inicio + 120)
     time.sleep(0.3)

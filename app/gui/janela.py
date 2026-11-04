@@ -4,8 +4,10 @@ A janela não sabe nada de MQTT nem de SQL: recebe um objeto que segue o contrat
 (Signals `status_alterado`, `log`, `contadores`, `teste_sql_concluido`, `proxima_gravacao`, `ultima_gravacao_ok`,
 `ultima_leitura`; métodos `definir_sql`, `testar_sql`, `conectar`, `desconectar`, `encerrar`).
 
-Operação contínua (CLAUDE.md): contagem até a próxima gravação e última gravação no topo da caixa ATIVIDADE,
-limpeza da caixa à meia-noite (hora local) e o vigia, que reinicia o programa se faltar leitura ou gravação.
+Operação contínua (CLAUDE.md): no topo da caixa ATIVIDADE, a contagem regressiva do vigia ("Reinício automático em
+59:12 se nada for gravado", recomeça a cada gravação com sucesso) e a última gravação; o chip "Próxima gravação" só
+aparece com amostragem ligada ([gravacao] intervalo_gravacao_segundos > 0). Limpeza da caixa à meia-noite (hora
+local) e o vigia, que reinicia o programa se faltar gravação (ou leitura, sem SQL) por `[vigia] minutos`.
 
 O cartão da direita tem três abas: "Atividade" (a caixa de logs), "Mosquitto" (console do broker local, processo
 filho do app; ver app/gui/mosquitto.py) e "Clientes" (quem envia dados, com IP e MAC; ver app/gui/clientes.py).
@@ -205,7 +207,12 @@ class JanelaPrincipal(QMainWindow):
         self._proxima: float | None = None       # epoch do próximo ciclo de gravação
         self._ultima_gravacao: str | None = None  # ISO local da última gravação ok
         self._dia_atividade: date = date.fromtimestamp(self._relogio())
-        minutos = getattr(getattr(config, "vigia", None), "minutos", 10)
+        minutos = getattr(getattr(config, "vigia", None), "minutos", 60)
+        intervalo = getattr(getattr(config, "gravacao", None), "intervalo_gravacao_segundos", 0)
+        try:
+            self._com_amostragem = float(intervalo or 0) > 0
+        except (TypeError, ValueError):
+            self._com_amostragem = False
         self.vigia = vigia_mod.Vigia(minutos, self._reiniciar, sql_configurado=self._sql_configurado,
                                      relogio=self._relogio)
         if console_mosquitto is None:
@@ -333,13 +340,16 @@ class JanelaPrincipal(QMainWindow):
         self.logs = PainelLogs(parent=self.abas)
         self.logs.corpo.setContentsMargins(0, 12, 0, 0)
         self.logs.titulo.hide()
+        self.logs.chip_proxima.setVisible(self._com_amostragem)
         self.abas.addTab(self.logs, "Atividade")
         self.abas.setTabToolTip(0, "Eventos da conexão, das mensagens e das gravações no SQL Server.")
 
-        self.painel_mosquitto = PainelMosquitto(self.mosquitto, self.abas)
+        self.painel_mosquitto = PainelMosquitto(self.mosquitto, self.abas, settings=self.settings)
         self.abas.addTab(self.painel_mosquitto, "Mosquitto")
         self.abas.setTabToolTip(1, f"Broker Mosquitto local: {self.mosquitto.prompt()}")
         self.mosquitto.estado_alterado.connect(lambda estado, _t: self._icone_aba_mosquitto(estado))
+        self.mosquitto.pasta_alterada.connect(
+            lambda _p: self.abas.setTabToolTip(1, f"Broker Mosquitto local: {self.mosquitto.prompt()}"))
         self._icone_aba_mosquitto(self.mosquitto.estado)
 
         self.painel_clientes = PainelClientes(self.abas, relogio=self._relogio, executor_arp=self._executor_arp,
@@ -566,7 +576,9 @@ class JanelaPrincipal(QMainWindow):
                  self.opcao_confiar, self.botao_testar, self.abas.tabBar(), self.logs.botao_limpar,
                  self.logs.botao_copiar, self.logs.botao_salvar, self.logs.caixa,
                  self.painel_mosquitto.botao_iniciar, self.painel_mosquitto.botao_parar,
-                 self.painel_mosquitto.botao_limpar, self.painel_mosquitto.caixa,
+                 self.painel_mosquitto.botao_limpar, self.painel_mosquitto.campo_endereco,
+                 self.painel_mosquitto.botao_procurar, self.painel_mosquitto.botao_restaurar,
+                 self.painel_mosquitto.caixa,
                  self.painel_mosquitto.campo_comando, self.painel_mosquitto.botao_executar,
                  self.painel_clientes.opcao_assinantes, self.painel_clientes.botao_diag,
                  self.painel_clientes.botao_mac, self.painel_clientes.botao_colunas,
@@ -727,6 +739,7 @@ class JanelaPrincipal(QMainWindow):
             self._conectar()
         else:
             self.vigia.parar()  # o usuário não quer mais estar conectado
+            self._atualizar_tempo()
             self.botao_conectar.setEnabled(False)
             self.botao_conectar.setText("Desconectando…")
             self.bridge.desconectar()
@@ -766,6 +779,7 @@ class JanelaPrincipal(QMainWindow):
         self._enviar_sql()
         self._aplicar_estado("conectando", f"{broker}:{porta}")
         self.vigia.iniciar()
+        self._atualizar_tempo()
         if avisar_senha and self.vigia.ligado and self._precisa_lembrar_senha():
             self._log_local("AVISO", AVISO_LEMBRAR_SENHA)
         self.bridge.conectar(broker, porta, topico, qos)
@@ -887,18 +901,39 @@ class JanelaPrincipal(QMainWindow):
 
     def _ao_ultima_gravacao(self, iso: str) -> None:
         self._ultima_gravacao = iso or None
-        self.vigia.registrar_gravacao(vigia_mod.epoch_de_iso(iso, self._relogio()))
+        epoch = vigia_mod.epoch_de_iso(iso, self._relogio())
+        self.vigia.registrar_gravacao(epoch)
+        if (self.vigia.ultima_leitura or 0.0) < epoch:  # gravou = chegou leitura: o contador recomeça inteiro
+            self.vigia.registrar_leitura(epoch)
         self._atualizar_tempo()
 
     def _ao_ultima_leitura(self, iso: str) -> None:
         self.vigia.registrar_leitura(vigia_mod.epoch_de_iso(iso, self._relogio()))
+        self._atualizar_tempo()
 
     def _atualizar_tempo(self) -> None:
-        prefixo, valor = tempo.contagem_proxima(self._proxima, self._relogio())
-        estado = "neutro" if valor == tempo.SEM_VALOR else ("ocupado" if valor == tempo.GRAVANDO else "ativo")
-        self.logs.chip_proxima.definir(prefixo, valor, estado)
+        sql = self._sql_configurado()
+        prefixo, valor, sufixo, estado = tempo.contagem_reinicio(self.vigia.restante(), self.vigia.ligado, sql)
+        chip = self.logs.chip_reinicio
+        chip.definir(prefixo, valor, estado, sufixo)
+        limite = vigia_mod.minutos_txt(self.vigia.minutos)
+        if not self.vigia.ligado:
+            dica = "Reinício automático desligado ([vigia] minutos = 0 no config.toml)."
+        elif sql:
+            dica = (f"Se passar {limite} sem nenhuma gravação com sucesso no SQL Server, o programa se reinicia "
+                    "e reconecta sozinho. A contagem recomeça a cada gravação.")
+        else:
+            dica = (f"Sem SQL Server configurado: se passar {limite} sem nenhuma leitura recebida, o programa se "
+                    "reinicia e reconecta sozinho. A contagem recomeça a cada leitura.")
+        if chip.toolTip() != dica:
+            chip.setToolTip(dica)
+        if self._com_amostragem:
+            prefixo, valor = tempo.contagem_proxima(self._proxima, self._relogio())
+            estado = "neutro" if valor == tempo.SEM_VALOR else ("ocupado" if valor == tempo.GRAVANDO else "ativo")
+            self.logs.chip_proxima.definir(prefixo, valor, estado)
         prefixo, valor = tempo.texto_ultima(self._ultima_gravacao)
         self.logs.chip_ultima.definir(prefixo, valor, "ok" if self._ultima_gravacao else "neutro")
+        self.logs.ajustar_chips()
 
     def _tique(self) -> None:
         self._conferir_dia()

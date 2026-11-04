@@ -343,8 +343,7 @@ que o integrador não ouvia.
 ## Pendências conhecidas
 
 - Índice único `(device_id, ts_unix)` na IOT001 (opcional, decidir com o usuário).
-- Lacunas do DigiRail ainda abertas (seção 7 de `docs/digirail_iot_mqtt.md`): L6 vigia de 10 min × intervalo de envio
-  ≥ 10 min; L7 JSON inválido do firmware (parcial, confirmar com captura real); L11 canais além de chd1–chd3 só no
+- Lacunas do DigiRail ainda abertas (seção 7 de `docs/digirail_iot_mqtt.md`): L6 vigia × intervalo de envio (agora só se o envio passar de 60 min); L7 JSON inválido do firmware (parcial, confirmar com captura real); L11 canais além de chd1–chd3 só no
   `payload_json`. L1–L5, L8–L10 resolvidas na v0.1.10 (L5 só em memória: some ao reiniciar o programa).
 
 - Reprocessar os arquivos de `contingencia/` (`.jsonl`) no SQL Server quando o banco voltar.
@@ -353,7 +352,7 @@ que o integrador não ouvia.
 
 ## Estado atual
 
-- v0.1.3 validada pelo usuário em produção (NOVUS → dbo.IOT001). v0.1.4: amostragem de 1 min, contagem regressiva, limpeza diária e vigia. v0.1.5: conexão automática ao abrir. v0.1.6: abas Atividade/Mosquitto e título Integrador Alumbra. v0.1.7: aba Clientes e janela de erros (card ERROS). v0.1.8: queda do broker conta como erro (1 por queda). v0.1.10: DigiRail (classificação, amostragem por ts_unix, sem duplicatas), diagnóstico e Zerar contadores na aba Clientes. v0.1.11: tópicos por dispositivo (dispositivos.json), aviso de tópicos não ouvidos e diagnóstico "sem resposta".
+- v0.1.3 validada pelo usuário em produção (NOVUS → dbo.IOT001). v0.1.4: amostragem de 1 min, contagem regressiva, limpeza diária e vigia. v0.1.5: conexão automática ao abrir. v0.1.6: abas Atividade/Mosquitto e título Integrador Alumbra. v0.1.7: aba Clientes e janela de erros (card ERROS). v0.1.8: queda do broker conta como erro (1 por queda). v0.1.10: DigiRail (classificação, amostragem por ts_unix, sem duplicatas), diagnóstico e Zerar contadores na aba Clientes. v0.1.11: tópicos por dispositivo (dispositivos.json), aviso de tópicos não ouvidos e diagnóstico "sem resposta". Seguinte: gravação imediata (sem amostragem), vigia de 1 h com contador, Endereço Mosquitto salvo.
 
 ## Idioma
 

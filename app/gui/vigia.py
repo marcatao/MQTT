@@ -32,8 +32,15 @@ def epoch_de_iso(texto: str, padrao: float | None = None) -> float | None:
         return padrao
 
 
-def _minutos_txt(minutos: float) -> str:
+def minutos_txt(minutos: float) -> str:
+    """60 → "1 h"; 90 → "1 h 30 min"; 10 → "10 min"; 0,5 → "0.5 min"."""
+    if minutos >= 60 and float(minutos).is_integer():
+        h, m = divmod(int(minutos), 60)
+        return f"{h} h" + (f" {m} min" if m else "")
     return f"{minutos:g} min"
+
+
+_minutos_txt = minutos_txt  # nome antigo
 
 
 class Vigia:
@@ -77,6 +84,22 @@ class Vigia:
 
     def registrar_gravacao(self, epoch: float | None = None) -> None:
         self.ultima_gravacao = self._relogio() if epoch is None else float(epoch)
+
+    @property
+    def sql_configurado(self) -> bool:
+        return bool(self._sql_configurado())
+
+    def restante(self) -> float | None:
+        """Segundos até o reinício automático (o menor dos prazos que valem agora); None se não está vigiando.
+
+        Mesma regra de `motivo()`: o prazo da leitura sempre vale; o da gravação só com o SQL configurado."""
+        if not self.ativo:
+            return None
+        limite = self.minutos * 60.0
+        prazo = max(self.inicio, self.ultima_leitura or 0.0) + limite
+        if self._sql_configurado():
+            prazo = min(prazo, max(self.inicio, self.ultima_gravacao or 0.0) + limite)
+        return prazo - self._relogio()
 
     def motivo(self) -> str | None:
         """Motivo para reiniciar agora, ou None se está tudo bem."""

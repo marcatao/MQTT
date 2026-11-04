@@ -21,7 +21,7 @@ class PipelineBridge(QObject):
     log = Signal(str, str, str)              # (hora "HH:MM:SS", nivel "INFO" | "AVISO" | "ERRO", mensagem)
     contadores = Signal(int, int, int)       # (mensagens recebidas, registros gravados, erros), máx. ~5x/s
     teste_sql_concluido = Signal(bool, str)  # (sucesso, mensagem multilinha em português)
-    proxima_gravacao = Signal(float)         # epoch (s) do próximo ciclo de gravação; ao conectar e a cada ciclo
+    proxima_gravacao = Signal(float)         # epoch (s) do próximo ciclo; só com amostragem (intervalo > 0)
     ultima_gravacao_ok = Signal(str)         # "AAAA-MM-DDTHH:MM:SS" local do último INSERT com commit no SQL Server
     ultima_leitura = Signal(str)             # "AAAA-MM-DDTHH:MM:SS" local da última mensagem MQTT (máx. 1 a cada 5 s)
     dispositivo_visto = Signal(str, str, str)  # (device_id, tópico, ISO local) de leitura recebida; máx. 1/5 s por device

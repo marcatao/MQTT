@@ -242,6 +242,10 @@ QPushButton#botaoDiscreto {
 }
 QPushButton#botaoDiscreto:hover { background: $neutro_suave; color: $texto; }
 QPushButton#botaoDiscreto:focus { border: 1px solid $destaque; }
+QPushButton#botaoDiscreto:disabled { color: $texto_fraco; background: transparent; border-color: transparent; }
+/* Endereço Mosquitto: somente leitura com o Mosquitto rodando (não dá para trocar a pasta do processo vivo) */
+QLineEdit#campoEndereco[readOnly="true"] { background: $superficie_alt; color: $texto_sec; border-color: $borda; }
+QLineEdit#campoEndereco[readOnly="true"]:focus { border: 1px solid $borda_forte; padding: 0 10px; }
 
 QPushButton#chipPausa {
     background: $aviso_suave; color: $aviso; border: none; border-radius: 13px;
@@ -265,6 +269,9 @@ QLabel#chipPonto { border-radius: 4px; background: $texto_fraco; }
 QLabel#chipPonto[estado="ativo"] { background: $destaque_texto; }
 QLabel#chipPonto[estado="ocupado"] { background: $aviso; }
 QLabel#chipPonto[estado="ok"] { background: $sucesso; }
+QFrame#chipInfo[estado="aviso"] { background: $aviso_suave; border-color: $aviso_suave; }
+QLabel#chipValor[estado="aviso"] { color: $aviso; }
+QLabel#chipPonto[estado="aviso"] { background: $aviso; }
 QFrame#chipInfo[estado="erro"] { background: $erro_suave; border-color: $erro_suave; }
 QLabel#chipValor[estado="erro"] { color: $erro; }
 QLabel#chipPonto[estado="erro"] { background: $erro; }
@@ -408,6 +415,7 @@ QPushButton#botaoLink {
 }
 QPushButton#botaoLink:hover { text-decoration: underline; }
 QPushButton#botaoLink:focus { border: 1px solid $destaque; }
+QPushButton#botaoLink:disabled { color: $texto_fraco; text-decoration: none; }
 QPushButton#botaoPerigo {
     background: $erro; color: $superficie; border: 1px solid $erro; font-weight: 600; min-height: 34px;
     padding: 0 18px;

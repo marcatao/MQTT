@@ -31,6 +31,35 @@ def contagem_proxima(proxima_epoch: float | None, agora: float) -> tuple[str, st
     return "Próxima gravação em", formatar_contagem(restante)
 
 
+AVISO_REINICIO_S = 10 * 60   # âmbar faltando menos de 10 min
+ALERTA_REINICIO_S = 60       # vermelho faltando menos de 1 min
+REINICIANDO = "reiniciando…"
+
+
+def contagem_reinicio(restante: float | None, ligado: bool = True,
+                      sql_configurado: bool = True) -> tuple[str, str, str, str]:
+    """(prefixo, valor, sufixo, estado) do chip do vigia na aba Atividade.
+
+    Desligado ([vigia] minutos = 0) → "Reinício automático desligado"; sem vigiar (desconectado) → "—";
+    vigiando → "Reinício automático em 59:12 se nada for gravado" (h:mm:ss a partir de 1 h). Estado do chip:
+    "neutro" normalmente, "aviso" (âmbar) com menos de 10 min e "erro" (vermelho) com menos de 1 min.
+    """
+    if not ligado:
+        return "Reinício automático", "desligado", "", "neutro"
+    if restante is None:
+        return "Reinício automático", SEM_VALOR, "", "neutro"
+    sufixo = "se nada for gravado" if sql_configurado else "se nenhuma leitura chegar"
+    if restante <= 0:
+        return "Reinício automático:", REINICIANDO, "", "erro"
+    if restante < ALERTA_REINICIO_S:
+        estado = "erro"
+    elif restante < AVISO_REINICIO_S:
+        estado = "aviso"
+    else:
+        estado = "neutro"
+    return "Reinício automático em", formatar_contagem(restante), sufixo, estado
+
+
 def formatar_data_hora(iso: str) -> str:
     """ISO 8601 local "AAAA-MM-DDTHH:MM:SS" → "dd/mm/aaaa HH:MM:SS". Texto inválido volta como veio."""
     try:

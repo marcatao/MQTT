@@ -12,15 +12,22 @@ para amostragem/sink. **Eventos** (``events``) viram um log INFO resumido; **res
 tópicos ``.../ack/command``/``.../ack/config``) não são leitura nem erro: ``diag`` e ``reset_counters`` são tratados
 (ver "Comandos").
 
-Amostragem pelo minuto da leitura (``[gravacao] intervalo_gravacao_segundos``, padrão 60; 0 desliga): as leituras
+Gravação imediata (``[gravacao] intervalo_gravacao_segundos = 0``, padrão desde 04/11/2026): cada leitura completa
+nova vai ao sink assim que chega. A thread de processamento esvazia o que já está na fila (sem esperar) e grava logo
+em seguida: uma leitura isolada chega ao banco em milissegundos; uma rajada (reenvio da memória circular) vira um
+único lote, com ``lote_max`` como teto. ``lote_segundos`` não é espera nesse modo. Um log por leitura gravada
+("Gravada leitura de X (14:31:05) no SQL Server") ou, quando várias saem no mesmo lote, um resumo por device
+("Gravadas 42 leituras de X (13:02–13:44) no SQL Server"); destino contingência é dito no texto. Não há ciclo nem
+``ao_proxima_gravacao``.
+
+Amostragem pelo minuto da leitura (só se configurada: ``intervalo_gravacao_segundos`` > 0, ex. 60): as leituras
 completas são agrupadas por ``(device_id, ts_unix // intervalo)``; em cada balde fica a de maior ``ts_unix`` (empate:
 a última que chegou). Os ciclos são alinhados ao relógio local (14:31:00, 14:32:00…); em cada ciclo vão ao sink
 todos os baldes **já encerrados** (fim do minuto ≤ ciclo), inclusive os antigos reenviados pela memória circular do
 dispositivo depois de uma queda ("recuperadas": minutos anteriores ao ciclo anterior). O minuto corrente espera o
 próximo ciclo; leitura mais de ``FUTURO_MAX`` s à frente do relógio do PC vai no próximo ciclo (com um AVISO por
 dispositivo: relógio adiantado). Ao desconectar/encerrar, todos os baldes pendentes são gravados. Leituras
-incompletas vão na hora para o sink (contingência). Com 0, toda leitura vai ao sink (lote por
-``lote_max``/``lote_segundos``).
+incompletas vão na hora para o sink (contingência), em lote por ``lote_max``/``lote_segundos``.
 
 Sem duplicatas (``_MemoriaGravadas``, 24 h, tamanho limitado): não vão ao sink de novo o mesmo
 ``(device_id, ts_unix)`` nem (com amostragem) o mesmo ``(device_id, minuto de ts_unix)``. Mensagens retidas e
@@ -130,6 +137,41 @@ def duracao_texto(segundos: float) -> str:
     m, s = divmod(resto, 60)
     partes = ([f"{h} h"] if h else []) + ([f"{m} min"] if h or m else []) + [f"{s} s"]
     return " ".join(partes)
+
+
+def textos_gravacao(linhas: list[LinhaIot], n: int, n_sql: int) -> list[str]:
+    """Logs da gravação imediata: um por device_id do lote, com a hora local de ``ts_unix``.
+
+    ``n`` = persistidos (SQL ou contingência; inclui incompletas), ``n_sql`` = com commit no SQL Server.
+    1 leitura: "Gravada leitura de X (14:31:05) no SQL Server"; várias: "Gravadas 42 leituras de X (13:02–13:44)
+    no SQL Server". Contingência: "Guardada(s) ... na contingência"; destino misto ou falha aparecem no texto.
+    """
+    total = len(linhas)
+    if n_sql >= total:
+        verbos, onde = ("Gravada", "Gravadas"), "no SQL Server"
+    elif n_sql > 0:
+        verbos, onde = ("Gravada", "Gravadas"), f"(lote: {n_sql} no SQL Server e {total - n_sql} na contingência)"
+    elif n > 0:
+        verbos, onde = ("Guardada", "Guardadas"), "na contingência"
+    else:
+        verbos, onde = ("Não gravada", "Não gravadas"), "(ver erro acima)"
+    por_device: dict[str, list[int]] = {}
+    for linha in linhas:
+        por_device.setdefault(str(linha.device_id), []).append(int(linha.ts_unix))
+    textos = []
+    for device, tss in por_device.items():
+        a, b = datetime.fromtimestamp(min(tss)), datetime.fromtimestamp(max(tss))
+        if len(tss) == 1:
+            textos.append(f"{verbos[0]} leitura de {device} ({a:%H:%M:%S}) {onde}")
+            continue
+        if a.date() != b.date():
+            fmt = "%d/%m %H:%M"
+        elif a.strftime("%H:%M") != b.strftime("%H:%M"):
+            fmt = "%H:%M"
+        else:
+            fmt = "%H:%M:%S"
+        textos.append(f"{verbos[1]} {len(tss)} leituras de {device} ({a.strftime(fmt)}–{b.strftime(fmt)}) {onde}")
+    return textos
 
 
 def _plural(n: int, singular: str, plural: str) -> str:
@@ -349,6 +391,7 @@ class Pipeline:
         self._assinatura = ""
         self._encerrado = False
         self._amostrando = False
+        self._a_gravar: list[LinhaIot] = []    # gravação imediata: leituras novas no lote atual (para o log)
 
         # incidentes do broker (protegidos por _trava; chegam pela thread de rede do paho)
         self._geracao = 0                      # muda a cada conectar/parar: eventos de cliente antigo são ignorados
@@ -667,8 +710,9 @@ class Pipeline:
 
     def _novo_sink(self, sql: SqlServerConfig) -> Sink:
         sink = self._fabrica_sink(sql, self.config, self._log)
-        if self._amostrando and hasattr(sink, "logar_sucesso"):
-            sink.logar_sucesso = False  # um log por ciclo (no pipeline) em vez de um por lote
+        if hasattr(sink, "logar_sucesso"):
+            # o pipeline loga: um por ciclo (amostragem) ou um por leitura/rajada (gravação imediata)
+            sink.logar_sucesso = False
         if not sql.habilitado:
             if not self._avisou_sem_sql:
                 self._avisou_sem_sql = True
@@ -807,6 +851,9 @@ class Pipeline:
     def _processar(self, fila: queue.Queue, sink: Sink, intervalo: float = 0.0,
                    proximo: float | None = None) -> None:
         amostra = _Amostragem(intervalo, self._memoria) if proximo is not None else None
+        lote_max = max(1, int(getattr(self.config.gravacao, "lote_max", 500) or 500))
+        self._a_gravar = []
+        espera_ate = 0.0      # gravação imediata: depois de uma falha, não tenta de novo a cada volta
         ultimo_contador = 0.0
         enviado = (-1, -1, -1)
         limitador = _Limitador(self.LOGS_POR_SEGUNDO)
@@ -841,7 +888,15 @@ class Pipeline:
                 if amostra is not None:
                     self._ciclo(sink, amostra, intervalo, None, fechar=True, referencia=proximo)
                 else:
-                    self._descarregar(sink, fechar=True)
+                    self._gravar_imediato(sink, fechar=True)
+            elif amostra is None:
+                # gravação imediata: grava quando a fila esvaziou (o que já chegou está todo no lote) ou o lote
+                # chegou ao teto; com mensagens ainda na fila, volta e pega a próxima sem esperar (get não bloqueia)
+                pendentes = sink.pendentes()
+                if pendentes and (pendentes >= lote_max or fila.empty()) and time.monotonic() >= espera_ate:
+                    self._gravar_imediato(sink)
+                    if sink.pendentes():   # não saiu do buffer (ex.: disco da contingência): tenta em 1 s
+                        espera_ate = time.monotonic() + 1.0
             elif sink.deve_descarregar():
                 self._descarregar(sink)
 
@@ -899,6 +954,7 @@ class Pipeline:
             novas, dup = self._sem_duplicatas(completas, t_receb)
             if rejeitadas or novas:
                 sink.adicionar(rejeitadas + novas)
+                self._a_gravar.extend(novas)
         else:
             if rejeitadas:
                 sink.adicionar(rejeitadas)  # incompletas: contingência na hora, como sem amostragem
@@ -1241,6 +1297,15 @@ class Pipeline:
         self._avisar(self._ao_proxima_gravacao, proximo)
         return proximo
 
+    def _gravar_imediato(self, sink: Sink, fechar: bool = False) -> tuple[int, int]:
+        """Gravação imediata: descarrega o lote e loga por leitura (ou um resumo por device numa rajada)."""
+        linhas, self._a_gravar = self._a_gravar, []
+        n, n_sql = self._descarregar(sink, fechar=fechar)
+        if linhas:
+            for texto in textos_gravacao(linhas, n, n_sql):
+                self._log("INFO", texto)
+        return n, n_sql
+
     def _descarregar(self, sink: Sink, fechar: bool = False) -> tuple[int, int]:
         """Devolve (persistidos no SQL ou na contingência, gravados no SQL Server com commit)."""
         antes = getattr(sink, "gravados_sql", 0)
@@ -1279,5 +1344,8 @@ class Pipeline:
         except Exception as exc:  # noqa: BLE001 - tabela inválida
             self._log("ERRO", f"Configuração do SQL Server rejeitada: {exc}")
             return sink
-        self._descarregar(sink, fechar=True)
+        if self._amostrando:
+            self._descarregar(sink, fechar=True)
+        else:
+            self._gravar_imediato(sink, fechar=True)
         return substituto

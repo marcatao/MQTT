@@ -203,7 +203,7 @@ def test_executavel_ausente(abrir, tmp_path):
     assert esperar(lambda: "não encontrado" in _texto(painel), 3)
     linhas = painel.caixa.linhas_texto()
     assert linhas[0] == f"{vazia}>mosquitto -v"
-    assert f"mosquitto.exe não encontrado em {vazia} — confira [mosquitto] pasta no config.toml." in linhas
+    assert f"mosquitto.exe não encontrado em {vazia} — confira o Endereço Mosquitto (botão …)." in linhas
     assert console.estado == "erro"
     assert painel.chip_estado.estado == "erro"
     assert painel.chip_estado.valor().startswith("Erro:")
@@ -217,7 +217,7 @@ def test_pasta_padrao_inexistente_no_linux_nao_quebra(qapp):  # noqa: F811
     assert console.iniciar() is False
     assert saidas[0] == ("prompt", r"C:\Program Files\mosquitto168>mosquitto -v")
     assert saidas[1] == ("erro", "mosquitto.exe não encontrado em C:\\Program Files\\mosquitto168 — confira "
-                                 "[mosquitto] pasta no config.toml.")
+                                 "o Endereço Mosquitto (botão …).")
     assert console.estado == "erro"
 
 

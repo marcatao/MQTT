@@ -11,6 +11,7 @@ from PySide6.QtCore import QLocale, QModelIndex, QObject, QRectF, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QFontMetrics, QGuiApplication, QKeyEvent, QMouseEvent, QPainter, QTextCharFormat, QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
+    QBoxLayout,
     QButtonGroup,
     QStyle,
     QStyledItemDelegate,
@@ -342,7 +343,8 @@ class ResultadoTeste(QFrame):
 class ChipInfo(QFrame):
     """Pílula discreta com ponto, prefixo (texto secundário) e valor (destacado). Ex.: "Próxima gravação em 0:42".
 
-    `estado` (propriedade dinâmica usada no QSS): "neutro" | "ativo" | "ok" | "ocupado".
+    `estado` (propriedade dinâmica usada no QSS): "neutro" | "ativo" | "ok" | "ocupado" | "aviso" | "erro".
+    `sufixo` (opcional): texto secundário depois do valor ("Reinício automático em 59:12 se nada for gravado").
     """
 
     def __init__(self, nome_objeto: str, nome_acessivel: str, parent: QWidget | None = None):
@@ -361,19 +363,26 @@ class ChipInfo(QFrame):
         self._valor = QLabel(self)
         self._valor.setObjectName("chipValor")
         self._valor.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self._sufixo = QLabel(self)
+        self._sufixo.setObjectName("chipPrefixo")
+        self._sufixo.hide()
         lay.addWidget(self._ponto)
         lay.addWidget(self._prefixo)
         lay.addWidget(self._valor)
+        lay.addWidget(self._sufixo)
         self.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
         self.estado = ""
         self.definir("", "", "neutro")
 
-    def definir(self, prefixo: str, valor: str, estado: str = "neutro") -> None:
+    def definir(self, prefixo: str, valor: str, estado: str = "neutro", sufixo: str = "") -> None:
         if self._prefixo.text() != prefixo:
             self._prefixo.setText(prefixo)
             self._prefixo.setVisible(bool(prefixo))
         if self._valor.text() != valor:
             self._valor.setText(valor)
+        if self._sufixo.text() != sufixo:
+            self._sufixo.setText(sufixo)
+            self._sufixo.setVisible(bool(sufixo))
         self.setAccessibleDescription(self.texto())
         if estado != self.estado:
             self.estado = estado
@@ -382,7 +391,7 @@ class ChipInfo(QFrame):
             repolir(self, self._ponto, self._valor)
 
     def texto(self) -> str:
-        return f"{self._prefixo.text()} {self._valor.text()}".strip()
+        return " ".join(t for t in (self._prefixo.text(), self._valor.text(), self._sufixo.text()) if t)
 
     def valor(self) -> str:
         return self._valor.text()
@@ -432,12 +441,18 @@ class PainelLogs(Cartao):
         faixa.setSpacing(8)
         self.chip_proxima = ChipInfo("proxima", "Próxima gravação", self)
         self.chip_proxima.setToolTip("Tempo até o próximo ciclo de gravação no SQL Server (uma leitura por minuto).")
+        self.chip_reinicio = ChipInfo("reinicio", "Reinício automático", self)
+        self.chip_reinicio.setToolTip("Se nada for gravado no SQL Server nesse tempo, o programa se reinicia e "
+                                      "reconecta sozinho. A contagem recomeça a cada gravação com sucesso.")
         self.chip_ultima = ChipInfo("ultima", "Última gravação", self)
         self.chip_ultima.setToolTip("Dia e hora da última gravação bem-sucedida no SQL Server "
                                     "(o que foi para a contingência não conta).")
-        faixa.addWidget(self.chip_proxima)
-        faixa.addWidget(self.chip_ultima)
+        for chip in (self.chip_reinicio,
+                     self.chip_proxima,  # só com amostragem ([gravacao] intervalo_gravacao_segundos > 0)
+                     self.chip_ultima):
+            faixa.addWidget(chip, 0, Qt.AlignmentFlag.AlignLeft)
         faixa.addStretch(1)
+        self._faixa_chips = faixa  # empilha os chips quando não cabem lado a lado (janela estreita)
 
         # Caixa
         self.caixa = QPlainTextEdit(self)
@@ -463,6 +478,23 @@ class PainelLogs(Cartao):
         self._timer.timeout.connect(self.descarregar)
         self._timer.start()
         self.definir_paleta(CLARA)
+
+    def ajustar_chips(self) -> None:
+        """Chips lado a lado quando cabem; um embaixo do outro na janela estreita (nada fica cortado).
+
+        Chamado no resize e quando o texto dos chips muda (a contagem cresce/encolhe a cada segundo)."""
+        chips = [c for c in (self.chip_reinicio, self.chip_proxima, self.chip_ultima) if not c.isHidden()]
+        m = self.corpo.contentsMargins()
+        disponivel = self.contentsRect().width() - m.left() - m.right()
+        necessario = sum(c.sizeHint().width() for c in chips) + self._faixa_chips.spacing() * max(0, len(chips) - 1)
+        direcao = (QBoxLayout.Direction.LeftToRight if necessario <= disponivel
+                   else QBoxLayout.Direction.TopToBottom)
+        if self._faixa_chips.direction() != direcao:
+            self._faixa_chips.setDirection(direcao)
+
+    def resizeEvent(self, evento) -> None:  # noqa: N802 - API do Qt
+        super().resizeEvent(evento)
+        self.ajustar_chips()
 
     def _botao(self, texto: str, dica: str) -> QPushButton:
         b = QPushButton(texto, self)
