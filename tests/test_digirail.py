@@ -522,13 +522,15 @@ def test_diagnostico_automatico_na_primeira_vez_e_periodico(montar, inicio):
     cli.entregar(T_ACK_CMD, resposta_diag(int(inicio + 1)))
     assert esperar(lambda: col.diags)
     assert col.diags == [(DEV, DIAG)] and col.respostas == []   # automático: sem resposta_comando
-    # 30 min depois: pede de novo; desta vez sem resposta → só AVISO, sem erro
+    # 30 min depois: pede de novo; desta vez sem resposta → AVISO e resposta_comando com os tópicos, sem erro
     relogio.ir(inicio + 1 + 30 * 60)
     assert esperar(lambda: len(cli.publicados) == 2)
     assert json.loads(cli.publicados[1][1]) == {"timestamp": int(inicio + 1 + 30 * 60), "desired": {"diag": {}}}
     relogio.ir(inicio + 1 + 30 * 60 + 15)
     assert esperar(lambda: col.com("Diagnóstico de Teste_Alumbra: Sem resposta", "AVISO"))
-    assert p.contadores[2] == 0 and col.erros == [] and col.respostas == []
+    assert p.contadores[2] == 0 and col.erros == []
+    assert col.respostas == [(DEV, "diag", False, "Sem resposta do dispositivo em 15 s (pedido em "
+                              "'NOVUS/Teste_Alumbra/command', resposta esperada em 'NOVUS/Teste_Alumbra/ack/command').")]
     # nova conexão: pede de novo ao ver o dispositivo
     p.conectar("127.0.0.1", 1883, ASSINATURA, 1).result(5)
     cli2 = ClienteFalso.ultimo

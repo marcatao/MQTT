@@ -12,9 +12,15 @@ import threading
 import time
 from datetime import datetime
 
+from paho.mqtt.client import topic_matches_sub
 from PySide6.QtCore import QObject, Signal
 
 from app.config import Config, SqlServerConfig
+
+# Tópicos por dispositivo (CLAUDE.md, "Tópicos por dispositivo e tópicos não ouvidos"): os que o aparelho publica e
+# os que ele recebe (o integrador publica neles).
+CHAVES_TOPICOS = ("events", "config", "ack_config", "command", "ack_command")
+CHAVES_PUBLICADAS = ("events", "ack_config", "ack_command")
 
 AMOSTRAS = [
     ("NOVUS/Teste_Alumbra/logbox01", "JSON", 6),
@@ -60,6 +66,10 @@ class FakePipelineBridge(QObject):
         self.atraso_resposta = atraso_resposta
         self.comandos_ok = comandos_ok
         self._diag_enviado: set[str] = set()
+        # Tópicos por dispositivo, em memória (o bridge real grava em dispositivos.json).
+        self._topicos_salvos: dict[str, dict[str, str]] = {}
+        self._assinatura = config.mqtt.topico  # última assinatura usada (antes de conectar: a do config)
+        self.conectado_broker = False
 
     # ----- ajudas para testes e capturas (emitem como o bridge real) -----
     def emitir_dispositivo(self, device_id: str, topico: str, iso: str | None = None) -> None:
@@ -101,6 +111,7 @@ class FakePipelineBridge(QObject):
 
     def conectar(self, broker: str, porta: int, topico: str, qos: int) -> None:
         self.chamadas.append(("conectar", broker, porta, topico, qos))
+        self._assinatura = topico
         self._parar_thread()
         self._parar.clear()
         self._thread = threading.Thread(target=self._rodar, args=(broker, porta, topico, qos), daemon=True)
@@ -111,6 +122,7 @@ class FakePipelineBridge(QObject):
 
         def trabalho():
             self._parar_thread()
+            self.conectado_broker = False
             self._log("INFO", "Desconectado do broker.")
             self.status_alterado.emit("desconectado", "")
 
@@ -149,6 +161,55 @@ class FakePipelineBridge(QObject):
 
         threading.Thread(target=trabalho, daemon=True).start()
 
+    # ----- tópicos por dispositivo (versão em memória, fiel ao contrato) -----
+    def topicos_padrao(self, device_id: str) -> dict[str, str]:
+        d = self.config.dispositivos
+        return {
+            "events": f"NOVUS/{device_id}/events",
+            "config": f"NOVUS/{device_id}/config",
+            "ack_config": f"NOVUS/{device_id}/ack/config",
+            "command": d.topico_comando.replace("{id}", device_id),
+            "ack_command": d.topico_resposta.replace("{id}", device_id),
+        }
+
+    def topicos_do_dispositivo(self, device_id: str) -> dict[str, str]:
+        self.chamadas.append(("topicos_do_dispositivo", device_id))
+        salvos = self._topicos_salvos.get(device_id)
+        return dict(salvos) if salvos is not None else self.topicos_padrao(device_id)
+
+    def salvar_topicos_dispositivo(self, device_id: str, topicos: dict[str, str]) -> None:
+        self.chamadas.append(("salvar_topicos_dispositivo", device_id, dict(topicos)))
+        faltando = [k for k in CHAVES_TOPICOS if not str(topicos.get(k) or "").strip()]
+        if faltando:
+            raise ValueError(f"Tópicos vazios: {', '.join(faltando)}.")
+        invalidos = [k for k in CHAVES_TOPICOS if any(c in topicos[k] for c in "+#")]
+        if invalidos:
+            raise ValueError(f"Tópico com + ou #: {', '.join(invalidos)}.")
+        # Exatamente como veio (só strip nas pontas): "NOÏUS" continua "NOÏUS".
+        self._topicos_salvos[device_id] = {k: str(topicos[k]).strip() for k in CHAVES_TOPICOS}
+
+    def restaurar_topicos_padrao(self, device_id: str) -> None:
+        self.chamadas.append(("restaurar_topicos_padrao", device_id))
+        self._topicos_salvos.pop(device_id, None)
+
+    def topicos_ouvidos(self) -> list[str]:
+        """Filtros assinados agora: vazio sem conexão (como o bridge real)."""
+        return self._filtros() if self.conectado_broker else []
+
+    def _filtros(self) -> list[str]:
+        """Assinatura do usuário + os tópicos publicados pelos aparelhos (salvos) que ela não cobre."""
+        filtros = [self._assinatura] if self._assinatura else []
+        for topicos in self._topicos_salvos.values():
+            for chave in CHAVES_PUBLICADAS:
+                t = topicos[chave]
+                if t not in filtros and not any(_casa(f, t) for f in filtros):
+                    filtros.append(t)
+        return filtros
+
+    def topico_coberto(self, topico: str) -> bool:
+        """Mesmo desconectado responde pela última assinatura usada + os extras (como o bridge real)."""
+        return any(_casa(f, topico) for f in self._filtros())
+
     # ----- simulação -----
     def _parar_thread(self, timeout: float = 2.0) -> None:
         self._parar.set()
@@ -177,6 +238,7 @@ class FakePipelineBridge(QObject):
             self._log("ERRO", f"Não foi possível conectar a {broker}:{porta}: conexão recusada.")
             self.status_alterado.emit("erro", "Conexão recusada pelo broker")
             return
+        self.conectado_broker = True
         self.status_alterado.emit("conectado", f"{broker}:{porta} · {topico}")
         self._log("INFO", f"Conectado. Assinando “{topico}” com QoS {qos}.")
         if self.sql and self.sql.habilitado:
@@ -234,6 +296,13 @@ def diag_exemplo(device_id: str) -> dict:
             "cfg_timestamp": int(time.time()) - 86400, "fw_v": "1.23", "mqtt_queue": 0, "sn": f"{21000000 + n:08d}",
             "curr_rssi": str(50 + n % 20), "min_rssi": "-46", "max_rssi": "-87", "avg_rssi": "-58",
             "ipv4": [192, 168, 100, 50 + n], "gateway": [192, 168, 100, 1], "mask": [255, 255, 255, 0]}
+
+
+def _casa(filtro: str, topico: str) -> bool:
+    try:
+        return topic_matches_sub(filtro, topico)
+    except (ValueError, TypeError):
+        return False
 
 
 def _iso_agora() -> str:

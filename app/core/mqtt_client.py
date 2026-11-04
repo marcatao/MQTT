@@ -12,8 +12,8 @@ Nada é avisado quando a desconexão foi pedida (``parar``). O cliente avisa tod
 (``ao_evento("assinatura_recusada", motivo, topico)``).
 
 Publicação (``publicar``): usada para os comandos aos dispositivos; não bloqueia (o paho envia na thread de rede).
-Assinaturas extras (``assinar_extra``): ex. o tópico de resposta dos comandos; refeitas a cada conexão, como a
-principal.
+Assinaturas extras (``assinar_extra``/``desassinar_extra``): ex. o tópico de resposta dos comandos ou os tópicos
+salvos de um dispositivo fora da assinatura do usuário; refeitas a cada conexão, como a principal.
 """
 from __future__ import annotations
 
@@ -226,6 +226,24 @@ class ClienteMqtt:
         self._extras[filtro] = qos
         if self._conectado:
             self._assinar(self._cliente, filtro, qos)
+
+    def desassinar_extra(self, filtro: str) -> None:
+        """Tira um filtro extra (UNSUBSCRIBE agora, se conectado; não volta nas reconexões). Ausente: nada."""
+        filtro = (filtro or "").strip()
+        if filtro not in self._extras:
+            return
+        del self._extras[filtro]
+        if filtro == self.topico or not self._conectado:
+            return
+        try:
+            resultado, _mid = self._cliente.unsubscribe(filtro)
+        except Exception as exc:  # noqa: BLE001
+            self._logar("AVISO", f"Falha ao cancelar a assinatura de {filtro}: {exc}")
+            return
+        if resultado == MQTTErrorCode.MQTT_ERR_SUCCESS:
+            self._logar("INFO", f"Assinatura de {filtro} cancelada")
+        else:
+            self._logar("AVISO", f"Falha ao cancelar a assinatura de {filtro}: {mqtt.error_string(resultado)}")
 
     def _assinar(self, client, filtro: str, qos: int) -> None:
         with self._trava_mids:

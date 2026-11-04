@@ -40,6 +40,15 @@ pela 1ª vez em cada conexão e a cada ``diagnostico_minutos`` (0 desliga); time
 (pedido ou periódico do próprio aparelho) sai em ``ao_diagnostico``. Antes de publicar, garante a assinatura do
 tópico de resposta (se a assinatura do usuário não cobre, assina o filtro do modelo, ex. ``NOVUS/+/ack/command``).
 O eco dos nossos próprios comandos (quando a assinatura cobre o tópico de comando) é ignorado sem contar.
+Diagnóstico automático sem resposta: AVISO e ``ao_resposta_comando(device, "diag", False, msg)`` com os tópicos do
+pedido e da resposta esperada (não é erro).
+
+Tópicos por dispositivo (``app.core.topicos``, ``dispositivos.json``): os comandos vão para o ``command`` efetivo do
+device; mensagem num tópico salvo ``ack_command``/``ack_config`` é resposta daquele device (mesmo fora do padrão
+``NOVUS/{id}``, ex. ``NOÏUS/Teste_Alumbra/ack/command``) e no ``events`` salvo identifica o device quando o payload
+não traz ``device_id``. Os ``events``/``ack_command``/``ack_config`` salvos que a assinatura do usuário não cobre
+viram assinaturas extras (QoS 1): registradas ao conectar (o cliente refaz em cada reconexão) e recalculadas na
+thread de controle depois de salvar/restaurar (assina os novos, desassina os que sobraram).
 
 Erros (``ao_erro``): todo +1 no contador de erros passa por ``_erro``, que soma, monta o registro JSON
 (``app.core.erros``), grava em ``<pasta_logs>/erros_AAAAMMDD.jsonl`` e avisa o callback. Assim contador e registros
@@ -75,6 +84,7 @@ import paho.mqtt.client as _paho
 from app.config import Config, DispositivosConfig, SqlServerConfig, pasta_base
 from app.core import digirail
 from app.core import erros as _erros
+from app.core import topicos as _topicos
 from app.core.mqtt_client import ClienteMqtt, validar_parametros
 from app.core.mapeamento import EVENTO, RESPOSTA, LinhaIot, ResultadoMapa, _device_da_mensagem, mapear
 from app.core.parser import trecho
@@ -243,8 +253,9 @@ class _Comando:
     timestamp: int
     inicio: float           # relógio do pipeline
     topico: str
-    manual: bool = True     # diag automático não responde em ao_resposta_comando
+    manual: bool = True     # diag automático só responde em ao_resposta_comando quando falha por falta de resposta
     canais: list[int] = field(default_factory=list)
+    topico_resposta: str = ""   # ack_command efetivo do device (para a mensagem de "sem resposta")
 
 
 class _Limitador:
@@ -354,6 +365,13 @@ class Pipeline:
         self._diag_t: dict[str, float] = {}          # device_id → último diag automático (por conexão)
         self._topicos_publicados: set[str] = set()   # eco dos nossos comandos é ignorado
 
+        # tópicos por dispositivo (dispositivos.json) e as assinaturas extras que eles exigem
+        self._topicos = _topicos.TopicosDispositivos(self._caminho_topicos(), self._cfg_dispositivos(),
+                                                     logar=lambda n, m: logger.log(_NIVEIS.get(n, 20), m))
+        self._avisos_topicos = list(self._topicos.avisos)   # repetidos no log da tela na 1ª conexão
+        self._trava_topicos = threading.Lock()
+        self._extras_dispositivos: list[str] = []    # tópicos salvos assinados como extra (exatos)
+
     # ------------------------------------------------------------------------------ API pública
 
     def conectar(self, broker: str, porta: int, topico: str, qos: int) -> Future:
@@ -394,6 +412,138 @@ class Pipeline:
     def pedir_diagnostico(self, device_id: str) -> Future | None:
         """Não bloqueia: publica ``diag``; a resposta sai em ``ao_diagnostico`` e ``ao_resposta_comando``."""
         return self._submeter(self._pedir_diag, device_id, True, comando="diag", device_id=device_id)
+
+    # -- tópicos por dispositivo ----------------------------------------------------------------------------
+
+    def topicos_do_dispositivo(self, device_id: str) -> dict[str, str]:
+        """Os 5 tópicos efetivos do device (salvos ou padrão). Não bloqueia."""
+        return self._topicos.efetivos(str(device_id or "").strip())
+
+    def salvar_topicos_dispositivo(self, device_id: str, topicos: dict[str, str]) -> Future | None:
+        """Valida e grava ``dispositivos.json`` na hora (ValueError em português se inválido); a (des)assinatura
+        dos extras vai para a thread de controle."""
+        device = str(device_id or "").strip()
+        try:
+            self._topicos.salvar(device, dict(topicos or {}))
+        except ValueError as exc:
+            self._log("ERRO", f"Tópicos de {device or '?'} não salvos: {exc}")
+            raise
+        except OSError as exc:
+            msg = f"Não foi possível gravar {self._topicos.caminho}: {exc}"
+            self._log("ERRO", f"Tópicos de {device} não salvos: {msg}")
+            raise ValueError(msg) from exc
+        return self._aplicar_topicos_depois(device, "salvos")
+
+    def restaurar_topicos_padrao(self, device_id: str) -> Future | None:
+        """Apaga os tópicos salvos do device (volta ao padrão de ``[dispositivos]``) e refaz os extras."""
+        device = str(device_id or "").strip()
+        try:
+            self._topicos.restaurar(device)
+        except ValueError as exc:
+            self._log("ERRO", f"Tópicos de {device or '?'} não restaurados: {exc}")
+            raise
+        except OSError as exc:
+            msg = f"Não foi possível gravar {self._topicos.caminho}: {exc}"
+            self._log("ERRO", f"Tópicos de {device} não restaurados: {msg}")
+            raise ValueError(msg) from exc
+        return self._aplicar_topicos_depois(device, "restaurados para o padrão")
+
+    def topicos_ouvidos(self) -> list[str]:
+        """Filtros assinados agora: a assinatura do usuário + extras. Vazio se não houver conexão."""
+        cliente = self._cliente
+        if cliente is None or not self._assinatura:
+            return []
+        extras = list(getattr(cliente, "assinaturas_extras", []) or [])
+        return [self._assinatura] + [f for f in extras if f != self._assinatura]
+
+    def topico_coberto(self, topico: str) -> bool:
+        """O integrador recebe mensagens deste tópico? (assinatura do usuário + extras ativos, ``topic_matches_sub``)
+
+        Desconectado, responde pela última assinatura usada (ou a de ``[mqtt]``) + os extras que seriam assinados.
+        """
+        if not isinstance(topico, str) or not topico or "+" in topico or "#" in topico:
+            return False
+        assinatura = self._assinatura or self.config.mqtt.topico
+        filtros = [assinatura] if assinatura else []
+        cliente = self._cliente
+        if cliente is not None:
+            filtros += list(getattr(cliente, "assinaturas_extras", []) or [])
+        with self._trava_topicos:
+            filtros += self._extras_dispositivos
+        if cliente is None:
+            filtros += self._extras_desejados(assinatura)
+        for f in filtros:
+            try:
+                if _paho.topic_matches_sub(f, topico):
+                    return True
+            except Exception:  # noqa: BLE001 - filtro estranho: não cobre
+                continue
+        return False
+
+    def _caminho_topicos(self) -> Path:
+        nome = getattr(self._cfg_dispositivos(), "arquivo_topicos", "") or "dispositivos.json"
+        caminho = Path(nome)
+        return caminho if caminho.is_absolute() else self._pasta / caminho
+
+    def _extras_desejados(self, assinatura: str) -> list[str]:
+        """Tópicos salvos (events/ack_command/ack_config) que a assinatura do usuário não cobre, sem repetição."""
+        desejados: list[str] = []
+        for device, tops in sorted(self._topicos.todos_salvos().items()):
+            for chave in _topicos.PUBLICADOS_PELO_APARELHO:
+                t = tops[chave]
+                coberto = False
+                if assinatura:
+                    try:
+                        coberto = _paho.topic_matches_sub(assinatura, t)
+                    except Exception:  # noqa: BLE001
+                        coberto = False
+                if not coberto and t not in desejados:
+                    desejados.append(t)
+        return desejados
+
+    def _aplicar_topicos_depois(self, device: str, acao: str) -> Future | None:
+        try:
+            return self._controle.submit(self._aplicar_topicos, device, acao)
+        except RuntimeError:   # programa encerrando
+            return None
+
+    def _aplicar_topicos(self, device: str | None = None, acao: str = "") -> None:
+        """Thread de controle: assina os extras novos e desassina os que não servem mais (cliente atual)."""
+        cliente = self._cliente
+        assinatura = self._assinatura if cliente is not None else (self._assinatura or self.config.mqtt.topico)
+        desejados = self._extras_desejados(assinatura) if assinatura else []
+        with self._trava_topicos:
+            antigos = list(self._extras_dispositivos)
+            self._extras_dispositivos = desejados if cliente is not None else []
+        novos = [t for t in desejados if t not in antigos]
+        sobrando = [t for t in antigos if t not in desejados]
+        if cliente is not None:
+            assinar = getattr(cliente, "assinar_extra", None)
+            desassinar = getattr(cliente, "desassinar_extra", None)
+            for t in sobrando:
+                if desassinar is not None:
+                    desassinar(t)
+            for t in novos:
+                if assinar is not None:
+                    try:
+                        assinar(t, 1)
+                    except ValueError as exc:
+                        self._log("ERRO", f"Não foi possível assinar {t!r}: {exc}")
+        if device is None:
+            return
+        do_device = set(self._topicos.efetivos(device).values())
+        partes = []
+        meus_novos = [t for t in novos if t in do_device]
+        if meus_novos:
+            verbo = "assinando" if cliente is not None else "serão assinados ao conectar"
+            partes.append(f"{verbo} {', '.join(repr(t) for t in meus_novos)}")
+        if sobrando:
+            verbo = "assinatura cancelada de" if cliente is not None else "não serão mais assinados"
+            partes.append(f"{verbo} {', '.join(repr(t) for t in sobrando)}")
+        if not partes:
+            partes.append("a assinatura atual já cobre os tópicos do dispositivo" if cliente is not None
+                          else "valem na próxima conexão")
+        self._log("INFO", f"Tópicos de {device} {acao}; {'; '.join(partes)}.")
 
     def _submeter(self, fn, *args, comando: str, device_id: str) -> Future | None:
         try:
@@ -573,6 +723,7 @@ class Pipeline:
                 sessao_persistente=self._sessao_persistente,
                 ao_evento=lambda tipo, motivo, topico=None, g=geracao: self._evento_mqtt(g, tipo, motivo, topico),
             )
+            self._registrar_extras_ao_conectar()
             self._cliente.iniciar()
         except Exception as exc:  # noqa: BLE001
             self._log("ERRO", f"Não foi possível iniciar a conexão com {broker}:{porta}: {exc}")
@@ -580,11 +731,32 @@ class Pipeline:
             self._cliente = None
             self._finalizar_processador()
 
+    def _registrar_extras_ao_conectar(self) -> None:
+        """Antes de ``iniciar``: os extras dos tópicos salvos entram no cliente (assinados em cada CONNACK)."""
+        for aviso in self._avisos_topicos:
+            self._log("AVISO", aviso)
+        self._avisos_topicos = []
+        desejados = self._extras_desejados(self._assinatura)
+        assinar = getattr(self._cliente, "assinar_extra", None)
+        with self._trava_topicos:
+            self._extras_dispositivos = list(desejados)
+        if not desejados or assinar is None:
+            return
+        for t in desejados:
+            try:
+                assinar(t, 1)
+            except ValueError as exc:
+                self._log("ERRO", f"Não foi possível assinar {t!r}: {exc}")
+        self._log("INFO", "Assinando também os tópicos salvos fora da assinatura: "
+                          f"{', '.join(repr(t) for t in desejados)}.")
+
     def _parar(self, silencioso: bool = False) -> None:
         with self._trava:
             self._geracao += 1          # a partir daqui, eventos do cliente que está saindo não contam
             self._incidente_inicio = None
         cliente, self._cliente = self._cliente, None
+        with self._trava_topicos:
+            self._extras_dispositivos = []
         if cliente is None and self._processador is None:
             if not silencioso:
                 self._status("desconectado", "Desconectado")
@@ -689,7 +861,13 @@ class Pipeline:
 
     def _tratar_mensagem(self, item: tuple, sink: Sink, amostra: _Amostragem | None, limitador: _Limitador) -> None:
         topico, payload, recebido_em, retida, t_receb = item
-        res = mapear(topico, payload, recebido_em, self._assinatura, self.config.mapeamento)
+        dono = self._topicos.por_topico(topico)    # tópico salvo de algum device (exato), ex. NOÏUS/.../ack/command
+        dev_dono, chave_dono = dono if dono is not None else (None, None)
+        eh_ack = chave_dono in _topicos.ACKS
+        res = mapear(topico, payload, recebido_em, self._assinatura, self.config.mapeamento,
+                     device_topico=dev_dono, resposta=eh_ack)
+        if eh_ack:
+            res.device_id = dev_dono    # resposta no ack daquele device é dele, diga o payload o que disser
         extra = " (retida)" if retida else ""
         if res.tipo == EVENTO:
             self._avisar_dispositivos([res.device_id], topico, t_receb)
@@ -715,7 +893,7 @@ class Pipeline:
         for linha in completas:
             self._visto_para_diagnostico(linha.device_id)
             self._conferir_relogio(linha, t_receb)
-        self._conferir_canais(res, topico)
+        self._conferir_canais(res, topico, dev_dono)
 
         if amostra is None:
             novas, dup = self._sem_duplicatas(completas, t_receb)
@@ -764,7 +942,7 @@ class Pipeline:
                            f"{datetime.fromtimestamp(t_receb):%H:%M:%S}. A leitura é gravada assim mesmo; confira "
                            "o relógio/NTP no NXperience. Este aviso não se repete.")
 
-    def _conferir_canais(self, res: ResultadoMapa, topico: str) -> None:
+    def _conferir_canais(self, res: ResultadoMapa, topico: str, dev_dono: str | None = None) -> None:
         obj = res.objeto
         itens = [obj] if isinstance(obj, dict) else obj if isinstance(obj, list) else []
         for item in itens:
@@ -773,7 +951,7 @@ class Pipeline:
             channels = next((v for k, v in item.items() if str(k).lower() == "channels"), None)
             if not isinstance(channels, dict):
                 continue
-            device = _device_da_mensagem(item, topico, self._assinatura)
+            device = _device_da_mensagem(item, topico, self._assinatura, dev_dono)
             if not device:
                 continue
             canais = tuple(digirail.canais_presentes(channels))
@@ -808,7 +986,24 @@ class Pipeline:
         return valor if valor > 0 else 15.0
 
     def _garantir_resposta(self, cliente, device: str) -> None:
-        """Assina o tópico de resposta se a assinatura do usuário não cobrir o deste device."""
+        """Assina o tópico de resposta se a assinatura do usuário não cobrir o deste device.
+
+        Device com tópicos salvos: o ``ack_command`` exato já é extra (``_aplicar_topicos``); garante de novo aqui.
+        Sem tópicos salvos: o filtro do modelo (ex. ``NOVUS/+/ack/command``), que serve a todos os devices.
+        """
+        salvos = self._topicos.salvos(device)
+        if salvos is not None:
+            ack = salvos["ack_command"]
+            if _paho.topic_matches_sub(self._assinatura, ack):
+                return
+            assinar = getattr(cliente, "assinar_extra", None)
+            if assinar is not None and ack not in getattr(cliente, "assinaturas_extras", []):
+                try:
+                    assinar(ack, 1)
+                    self._log("INFO", f"Assinando {ack!r} para receber as respostas de {device}.")
+                except ValueError as exc:
+                    self._log("ERRO", f"Tópico de confirmação de comando de {device} inválido: {exc}")
+            return
         modelo = self._cfg_dispositivos().topico_resposta
         if _paho.topic_matches_sub(self._assinatura, digirail.topico_do_modelo(modelo, device)):
             return
@@ -856,12 +1051,12 @@ class Pipeline:
     def _enviar(self, device: str, comando: str, desejado: dict, manual: bool,
                 canais: list[int] | None = None) -> _Comando | None:
         """Publica o comando e registra como pendente. Em falha, avisa e devolve None."""
-        cfg = self._cfg_dispositivos()
-        topico = digirail.topico_do_modelo(cfg.topico_comando, device)
+        efetivos = self._topicos.efetivos(device)
+        topico, ack = efetivos["command"], efetivos["ack_command"]
         cliente = self._cliente
         publicar = getattr(cliente, "publicar", None)
         if cliente is None or publicar is None:
-            self._falha_comando(_Comando(device, comando, 0, self._relogio(), topico, manual, canais or []),
+            self._falha_comando(_Comando(device, comando, 0, self._relogio(), topico, manual, canais or [], ack),
                                 "Não conectado ao broker.", registrar=False)
             return None
         agora = self._relogio()
@@ -869,7 +1064,7 @@ class Pipeline:
             ts = int(agora)
             while (device, ts) in self._comandos:   # o timestamp é o id de correlação: único por device
                 ts += 1
-            cmd = _Comando(device, comando, ts, agora, topico, manual, canais or [])
+            cmd = _Comando(device, comando, ts, agora, topico, manual, canais or [], ack)
             self._comandos[(device, ts)] = cmd
         self._garantir_resposta(cliente, device)
         self._topicos_publicados.add(topico)
@@ -885,8 +1080,13 @@ class Pipeline:
             return None
         return cmd
 
-    def _falha_comando(self, cmd: _Comando, mensagem: str, registrar: bool = True) -> None:
-        """Falha de comando. ``reset_counters``: ERRO, erro "comando" (se ``registrar``) e resposta; ``diag``: AVISO."""
+    def _falha_comando(self, cmd: _Comando, mensagem: str, registrar: bool = True, sem_resposta: bool = False
+                       ) -> None:
+        """Falha de comando. ``reset_counters``: ERRO, erro "comando" (se ``registrar``) e resposta; ``diag``: AVISO.
+
+        ``diag`` manual sempre responde em ``ao_resposta_comando``; o automático só quando ``sem_resposta`` (timeout),
+        com a mensagem citando os tópicos do pedido e da resposta esperada (dica na aba Clientes).
+        """
         if cmd.comando == "reset_counters":
             self._log("ERRO", f"Zerar contadores em {cmd.device_id} falhou: {mensagem}")
             if registrar:
@@ -894,10 +1094,16 @@ class Pipeline:
                 self._erro("comando", f"Zerar contadores em {cmd.device_id} falhou", cmd.topico,
                            f"{mensagem} Canais: {nomes}; timestamp do pedido: {cmd.timestamp}.")
             self._avisar(self._ao_resposta_comando, cmd.device_id, cmd.comando, False, mensagem)
+        elif cmd.manual:
+            self._log("AVISO", f"Diagnóstico de {cmd.device_id}: {mensagem}")
+            self._avisar(self._ao_resposta_comando, cmd.device_id, cmd.comando, False, mensagem)
+        elif sem_resposta:
+            detalhada = (f"{mensagem.rstrip('.')} (pedido em '{cmd.topico}', resposta esperada em "
+                         f"'{cmd.topico_resposta}').")
+            self._log("AVISO", f"Diagnóstico de {cmd.device_id}: {detalhada}")
+            self._avisar(self._ao_resposta_comando, cmd.device_id, cmd.comando, False, detalhada)
         else:
             self._log("AVISO", f"Diagnóstico de {cmd.device_id}: {mensagem}")
-            if cmd.manual:
-                self._avisar(self._ao_resposta_comando, cmd.device_id, cmd.comando, False, mensagem)
 
     def _verificar_comandos(self) -> None:
         """Na thread de processamento: timeouts e diagnóstico periódico."""
@@ -908,7 +1114,7 @@ class Pipeline:
             for c in vencidos:
                 self._comandos.pop((c.device_id, c.timestamp), None)
         for c in vencidos:
-            self._falha_comando(c, f"Sem resposta do dispositivo em {limite:g} s.")
+            self._falha_comando(c, f"Sem resposta do dispositivo em {limite:g} s.", sem_resposta=True)
         minutos = self._minutos_diag()
         if minutos > 0:
             for device, t in list(self._diag_t.items()):

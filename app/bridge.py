@@ -84,3 +84,29 @@ class PipelineBridge(QObject):
     def pedir_diagnostico(self, device_id: str) -> None:
         """Não bloqueia: publica ``diag``; responde em ``diagnostico_dispositivo`` e ``resposta_comando``."""
         self._pipeline.pedir_diagnostico(device_id)
+
+    # -- tópicos por dispositivo (v0.1.11): chaves "events", "config", "ack_config", "command", "ack_command" --
+
+    def topicos_do_dispositivo(self, device_id: str) -> dict[str, str]:
+        """Os 5 tópicos efetivos do device: os salvos em dispositivos.json ou o padrão de [dispositivos]."""
+        return self._pipeline.topicos_do_dispositivo(device_id)
+
+    def salvar_topicos_dispositivo(self, device_id: str, topicos: dict[str, str]) -> None:
+        """Grava na hora (arquivo pequeno) e (des)assina os extras na thread de controle; o resultado vai para o log.
+
+        Levanta ``ValueError`` (mensagem em português) se algum tópico for inválido (vazio, com '+'/'#', nulo ou
+        longo demais) ou se o arquivo não puder ser gravado; nada é salvo nesse caso.
+        """
+        self._pipeline.salvar_topicos_dispositivo(device_id, dict(topicos))
+
+    def restaurar_topicos_padrao(self, device_id: str) -> None:
+        """Apaga os tópicos salvos do device (volta ao padrão) e desassina os extras que sobraram."""
+        self._pipeline.restaurar_topicos_padrao(device_id)
+
+    def topicos_ouvidos(self) -> list[str]:
+        """Filtros assinados agora (assinatura do usuário + extras); vazio sem conexão."""
+        return self._pipeline.topicos_ouvidos()
+
+    def topico_coberto(self, topico: str) -> bool:
+        """O integrador recebe mensagens desse tópico? (sem conexão: pela última assinatura usada)"""
+        return self._pipeline.topico_coberto(topico)

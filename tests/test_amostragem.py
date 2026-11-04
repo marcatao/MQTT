@@ -65,6 +65,10 @@ class ClienteFalso:
         if filtro not in self.assinaturas_extras:
             self.assinaturas_extras.append(filtro)
 
+    def desassinar_extra(self, filtro: str) -> None:
+        if filtro in self.assinaturas_extras:
+            self.assinaturas_extras.remove(filtro)
+
     def parar(self) -> None:
         pass
 

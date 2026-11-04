@@ -83,3 +83,29 @@ def test_definir_sql_repassa_copia(app):
     b.definir_sql(novo)
     assert cfg.sqlserver == novo and cfg.sqlserver is not novo
     b.encerrar(1)
+
+
+def test_topicos_por_dispositivo_pelo_bridge(app, tmp_path):
+    cfg = Config()
+    cfg.sqlserver = SqlServerConfig(servidor="", banco="")
+    cfg.gravacao.pasta_contingencia = str(tmp_path)
+    cfg.gravacao.pasta_logs = str(tmp_path / "logs")
+    cfg.mqtt.topico = "NOVUS/Teste_Alumbra/#"
+    cfg.dispositivos.arquivo_topicos = str(tmp_path / "dispositivos.json")   # absoluto: fora da pasta do programa
+    b = PipelineBridge(cfg)
+    logs = []
+    b.log.connect(lambda h, n, m: logs.append((n, m)))
+    try:
+        ack = "NOÏUS/Teste_Alumbra/ack/command"
+        assert b.topicos_do_dispositivo("Teste_Alumbra")["ack_command"] == "NOVUS/Teste_Alumbra/ack/command"
+        assert b.topicos_ouvidos() == [] and not b.topico_coberto(ack)
+        b.salvar_topicos_dispositivo("Teste_Alumbra", {"ack_command": ack})
+        assert b.topicos_do_dispositivo("Teste_Alumbra")["ack_command"] == ack
+        assert _esperar(app, lambda: any("Tópicos de Teste_Alumbra salvos" in m for _, m in logs))
+        assert b.topico_coberto(ack)
+        with pytest.raises(ValueError):
+            b.salvar_topicos_dispositivo("Teste_Alumbra", {"command": "NOVUS/#"})
+        b.restaurar_topicos_padrao("Teste_Alumbra")
+        assert b.topicos_do_dispositivo("Teste_Alumbra")["ack_command"] == "NOVUS/Teste_Alumbra/ack/command"
+    finally:
+        b.encerrar(2)

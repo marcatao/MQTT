@@ -100,10 +100,32 @@ def interpretador_padrao() -> tuple[str, list[str]]:
 
 
 class _Leitor:
-    """Junta os pedaços lidos do processo em linhas inteiras (um caractere UTF-8 pode vir partido)."""
+    """Junta os pedaços lidos do processo em linhas inteiras (um caractere UTF-8 pode vir partido).
 
-    def __init__(self) -> None:
+    Decodifica LINHA A LINHA. Tópicos com caracteres fora do ASCII (o `Teste_Alumbra` publica em
+    `NOÏUS/Teste_Alumbra/ack/command`) precisam chegar íntegros à aba Clientes, que compara o texto do log com os
+    tópicos assinados e oferece "Usar como…" com esse texto.
+
+    Por que costuma dar certo: o MQTT exige tópicos em UTF-8 (o Mosquitto desconecta quem manda outra coisa) e o
+    `mosquitto -v` escreve o tópico com os bytes que recebeu; pelo QProcess não há console no meio convertendo a
+    página de código, então chegam aqui os mesmos bytes UTF-8 do tópico e `decodificar` devolve o texto exato.
+
+    Risco: se uma linha não for UTF-8 válido (mensagem do Windows/console em cp850 ou cp1252, ou a saída de outro
+    programa), ela é decodificada pela codificação do console. Antes isso era feito no pedaço inteiro lido e
+    estragava também as linhas vizinhas (o "Ï" UTF-8 virava "├Å" em cp850); por linha, só a linha estranha é
+    afetada. Mesmo assim, o texto mostrado no log pode não bater byte a byte com o tópico real em casos raros
+    (linha com UTF-8 e cp850 misturados, caracteres invisíveis ou parecidos, como Ï × I). Como o usuário confere:
+    no diálogo Tópicos…, a dica do tópico listado mostra os caracteres fora do ASCII com o código (ex.: "Ï (U+00CF)");
+    depois de salvar, o indicador fica "ouvido" e o ⚠ some quando o aparelho publicar de novo nesse tópico. Também
+    dá para testar na aba Mosquitto com `mosquitto_sub -t "<tópico>" -v`.
+    """
+
+    def __init__(self, alternativa: str | None = None) -> None:
         self._resto = b""
+        self._alternativa = alternativa
+
+    def _decodificar(self, dados: bytes) -> str:
+        return "\n".join(decodificar(linha, self._alternativa) for linha in dados.split(b"\n")).replace("\r", "")
 
     def ler(self, dados: bytes) -> str | None:
         dados = self._resto + dados
@@ -112,11 +134,11 @@ class _Leitor:
             self._resto = dados
             return None
         self._resto = dados[corte + 1:]
-        return decodificar(dados[:corte]).replace("\r", "")
+        return self._decodificar(dados[:corte])
 
     def final(self) -> str | None:
         resto, self._resto = self._resto, b""
-        return decodificar(resto).replace("\r", "") if resto else None
+        return self._decodificar(resto) if resto else None
 
 
 # ---------------------------------------------------------------------- lógica

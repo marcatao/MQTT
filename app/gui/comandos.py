@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Callable, Iterable
 
-from PySide6.QtCore import QEvent, QModelIndex, QRectF, Qt, Signal
+from PySide6.QtCore import QEvent, QModelIndex, QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPen
 from PySide6.QtWidgets import (
     QApplication,
@@ -32,6 +32,7 @@ from PySide6.QtWidgets import (
     QStyle,
     QStyledItemDelegate,
     QStyleOptionViewItem,
+    QToolTip,
     QVBoxLayout,
     QWidget,
 )
@@ -46,6 +47,11 @@ AVISO_ZERAR = ("O contador volta a zero no aparelho e não pode ser desfeito. S�
 
 PAPEL_WIFI = Qt.ItemDataRole.UserRole + 2   # int (dBm, negativo) ou None
 PAPEL_ACAO = Qt.ItemDataRole.UserRole + 3   # (estado, texto) ou None; estado: ver DelegadoAcao.CLICAVEIS
+PAPEL_TOPICOS = Qt.ItemDataRole.UserRole + 4  # botão "Tópicos" da linha: None (sem), "normal" ou "aviso"
+TEXTO_TOPICOS = "Tópicos"
+DICA_TOPICOS = "Tópicos deste aparelho (os mesmos do NXperience)…"
+DICA_TOPICOS_AVISO = ("Este aparelho publica em tópicos que o integrador não ouve.\n"
+                      "Clique para ver e usar esses tópicos.")
 
 
 # ---------------------------------------------------------------------- diagnóstico (lógica pura)
@@ -321,14 +327,23 @@ class DelegadoWifi(QStyledItemDelegate):
 
 class DelegadoAcao(QStyledItemDelegate):
     """Desenha o botão da coluna de ação a partir de `PAPEL_ACAO` = (estado, texto) e emite `acionado(índice)`
-    quando o botão é clicado. Estados: "pronto", "ok", "falha" (clicáveis), "desabilitado", "enviando"."""
+    quando o botão é clicado. Estados: "pronto", "ok", "falha" (clicáveis), "desabilitado", "enviando".
+
+    Ao lado, um botão compacto só com ícone (lista), "Tópicos" (`PAPEL_TOPICOS`: "normal" ou "aviso", âmbar quando
+    o aparelho publica em tópicos que o integrador não ouve), com dica própria, que emite `topicos_acionado(índice)`.
+    É só ícone para caber na largura da tabela em 1440 px; o mesmo comando está no menu de contexto ("Tópicos…"). O realce de passagem do mouse é por
+    botão: `posicao_mouse` (coordenadas do viewport) é atualizada pelo painel.
+    """
 
     CLICAVEIS = ("pronto", "ok", "falha")
+    ESPACO = 6
     acionado = Signal(QModelIndex)
+    topicos_acionado = Signal(QModelIndex)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.paleta: Paleta = CLARA
+        self.posicao_mouse = None  # QPointF no viewport, ou None
 
     def definir_paleta(self, p: Paleta) -> None:
         self.paleta = p
@@ -338,12 +353,53 @@ class DelegadoAcao(QStyledItemDelegate):
         fonte.setWeight(QFont.Weight.DemiBold)
         return fonte
 
-    def retangulo_botao(self, opcao: QStyleOptionViewItem, texto: str) -> QRectF:
+    LARGURA_TOPICOS = 30
+
+    def largura_topicos(self, opcao: QStyleOptionViewItem) -> int:
+        return self.LARGURA_TOPICOS
+
+    def retangulo_botao(self, opcao: QStyleOptionViewItem, texto: str, com_topicos: bool = False) -> QRectF:
         metricas = QFontMetrics(self._fonte(opcao))
         r = opcao.rect
         altura = min(26, r.height() - 6)
-        largura = min(metricas.horizontalAdvance(texto) + 24, r.width() - 12)
+        reserva = self.largura_topicos(opcao) + self.ESPACO if com_topicos else 0
+        largura = min(metricas.horizontalAdvance(texto) + 24, r.width() - 12 - reserva)
         return QRectF(r.left() + 6, r.top() + (r.height() - altura) / 2, max(0, largura), altura)
+
+    def retangulo_topicos(self, opcao: QStyleOptionViewItem, texto_acao: str) -> QRectF:
+        principal = self.retangulo_botao(opcao, texto_acao, com_topicos=True)
+        x = principal.right() + self.ESPACO
+        largura = min(self.largura_topicos(opcao), max(0.0, opcao.rect.right() - 6 - x))
+        return QRectF(x, principal.top(), largura, principal.height())
+
+    def cores_topicos(self, estado: str, sobre: bool) -> tuple[str, str, str]:
+        p = self.paleta
+        if estado == "aviso":
+            return (p.aviso_suave, p.aviso if sobre else p.aviso_suave, p.aviso)
+        return (p.neutro_suave if sobre else p.superficie, p.texto_fraco if sobre else p.borda_forte, p.texto)
+
+    def _sobre(self, opt: QStyleOptionViewItem, caixa: QRectF) -> bool:
+        if not (opt.state & QStyle.StateFlag.State_MouseOver):
+            return False
+        return self.posicao_mouse is None or caixa.contains(self.posicao_mouse)
+
+    def _desenhar_botao(self, pintor: QPainter, caixa: QRectF, fonte: QFont, texto: str,
+                        cores: tuple[str, str, str]) -> None:
+        fundo, borda, cor_texto = cores
+        pintor.setPen(QPen(QColor(borda), 1))
+        pintor.setBrush(QColor(fundo))
+        pintor.drawRoundedRect(caixa.adjusted(0.5, 0.5, -0.5, -0.5), 6, 6)
+        if texto == TEXTO_TOPICOS:  # ícone de lista: três marcadores e três linhas
+            pintor.setPen(QPen(QColor(cor_texto), 1.6, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+            cx, cy = caixa.center().x(), caixa.center().y()
+            for dy in (-4.5, 0, 4.5):
+                pintor.drawPoint(QPointF(cx - 6, cy + dy))
+                pintor.drawLine(QPointF(cx - 2.5, cy + dy), QPointF(cx + 6.5, cy + dy))
+            return
+        pintor.setFont(fonte)
+        pintor.setPen(QColor(cor_texto))
+        visivel = QFontMetrics(fonte).elidedText(texto, Qt.TextElideMode.ElideRight, int(caixa.width()) - 12)
+        pintor.drawText(caixa, int(Qt.AlignmentFlag.AlignCenter), visivel)
 
     def cores(self, estado: str, sobre: bool) -> tuple[str, str, str]:
         """(fundo, borda, texto)."""
@@ -366,38 +422,64 @@ class DelegadoAcao(QStyledItemDelegate):
         if not acao:
             return
         estado, texto = acao
-        sobre = bool(opt.state & QStyle.StateFlag.State_MouseOver) and estado in self.CLICAVEIS
-        fundo, borda, cor_texto = self.cores(estado, sobre)
-        caixa = self.retangulo_botao(opt, texto)
+        topicos = indice.data(PAPEL_TOPICOS)
+        caixa = self.retangulo_botao(opt, texto, com_topicos=bool(topicos))
+        sobre = estado in self.CLICAVEIS and self._sobre(opt, caixa)
         fonte = self._fonte(opt)
         pintor.save()
         pintor.setRenderHint(QPainter.RenderHint.Antialiasing)
-        pintor.setPen(QPen(QColor(borda), 1))
-        pintor.setBrush(QColor(fundo))
-        pintor.drawRoundedRect(caixa.adjusted(0.5, 0.5, -0.5, -0.5), 6, 6)
-        pintor.setFont(fonte)
-        pintor.setPen(QColor(cor_texto))
-        visivel = QFontMetrics(fonte).elidedText(texto, Qt.TextElideMode.ElideRight, int(caixa.width()) - 16)
-        pintor.drawText(caixa, int(Qt.AlignmentFlag.AlignCenter), visivel)
+        self._desenhar_botao(pintor, caixa, fonte, texto, self.cores(estado, sobre))
+        if topicos:
+            caixa_t = self.retangulo_topicos(opt, texto)
+            if caixa_t.width() > 16:
+                self._desenhar_botao(pintor, caixa_t, fonte, TEXTO_TOPICOS,
+                                     self.cores_topicos(topicos, self._sobre(opt, caixa_t)))
         pintor.restore()
+
+    def botao_em(self, opcao: QStyleOptionViewItem, indice: QModelIndex, pos) -> str | None:
+        """"acao", "topicos" ou None: qual botão da célula está em `pos` (coordenadas do viewport)."""
+        acao = indice.data(PAPEL_ACAO)
+        if not acao:
+            return None
+        topicos = indice.data(PAPEL_TOPICOS)
+        if topicos and self.retangulo_topicos(opcao, acao[1]).contains(pos):
+            return "topicos"
+        if acao[0] in self.CLICAVEIS and self.retangulo_botao(opcao, acao[1], bool(topicos)).contains(pos):
+            return "acao"
+        return None
 
     def editorEvent(self, evento: QEvent, modelo, opcao: QStyleOptionViewItem,  # noqa: N802
                     indice: QModelIndex) -> bool:
         if evento.type() != QEvent.Type.MouseButtonRelease or evento.button() != Qt.MouseButton.LeftButton:
             return False
-        acao = indice.data(PAPEL_ACAO)
-        if not acao or acao[0] not in self.CLICAVEIS:
-            return False
-        if self.retangulo_botao(opcao, acao[1]).contains(evento.position()):
+        botao = self.botao_em(opcao, indice, evento.position())
+        if botao == "acao":
             self.acionado.emit(QModelIndex(indice))
             return True
+        if botao == "topicos":
+            self.topicos_acionado.emit(QModelIndex(indice))
+            return True
         return False
+
+    def helpEvent(self, evento, vista, opcao: QStyleOptionViewItem, indice: QModelIndex) -> bool:  # noqa: N802
+        """Dica própria do botão de tópicos (o resto da célula usa a dica do modelo)."""
+        if evento.type() == QEvent.Type.ToolTip:
+            topicos = indice.data(PAPEL_TOPICOS)
+            acao = indice.data(PAPEL_ACAO)
+            if topicos and acao and self.retangulo_topicos(opcao, acao[1]).contains(QPointF(evento.pos())):
+                QToolTip.showText(evento.globalPos(), DICA_TOPICOS_AVISO if topicos == "aviso" else DICA_TOPICOS,
+                                  vista)
+                return True
+        return super().helpEvent(evento, vista, opcao, indice)
 
     def sizeHint(self, opcao: QStyleOptionViewItem, indice: QModelIndex):  # noqa: N802
         tamanho = super().sizeHint(opcao, indice)
         acao = indice.data(PAPEL_ACAO)
         if acao:
-            tamanho.setWidth(QFontMetrics(self._fonte(opcao)).horizontalAdvance(acao[1]) + 40)
+            largura = QFontMetrics(self._fonte(opcao)).horizontalAdvance(acao[1]) + 40
+            if indice.data(PAPEL_TOPICOS):
+                largura += self.largura_topicos(opcao) + self.ESPACO
+            tamanho.setWidth(largura)
         return tamanho
 
 

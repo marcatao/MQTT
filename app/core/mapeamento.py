@@ -559,13 +559,14 @@ def topico_de_resposta(topico: str) -> bool:
     return len(niveis) >= 2 and niveis[-2] == "ack" and niveis[-1] in ("command", "config")
 
 
-def classificar(topico: str, obj: Any) -> str:
+def classificar(topico: str, obj: Any, resposta: bool = False) -> str:
     """Tipo da mensagem: ``"leitura"``, ``"evento"`` ou ``"resposta"`` (ponto único da regra; ver docstring).
 
     ``obj`` é o JSON decodificado (ou None se não for JSON válido). Formatos desconhecidos são ``"leitura"``
-    (seguem o mapeamento, e o que hoje é erro de payload continua erro).
+    (seguem o mapeamento, e o que hoje é erro de payload continua erro). ``resposta=True``: o tópico é a
+    confirmação (ack) de algum dispositivo salvo em ``dispositivos.json``, mesmo fora do padrão ``.../ack/...``.
     """
-    if topico_de_resposta(topico):
+    if resposta or topico_de_resposta(topico):
         return RESPOSTA
     if not isinstance(obj, dict):
         return LEITURA
@@ -579,25 +580,35 @@ def classificar(topico: str, obj: Any) -> str:
     return LEITURA
 
 
-def _device_da_mensagem(obj: Any, topico: str, assinatura: str | None) -> str | None:
+def _device_da_mensagem(obj: Any, topico: str, assinatura: str | None, device_topico: str | None = None
+                        ) -> str | None:
+    """device_id do payload; senão ``device_topico`` (tópico salvo de um device); senão o deduzido do tópico."""
     if isinstance(obj, dict):
         achou, valor = _resolver(obj, "device_id")
         if achou and isinstance(valor, (str, int)) and not isinstance(valor, bool) and str(valor).strip():
             return str(valor).strip()[:MAX_DEVICE_ID]
-    return dispositivo_novus(topico) or dispositivo_do_topico(topico, assinatura)
+    return device_topico or dispositivo_novus(topico) or dispositivo_do_topico(topico, assinatura)
 
 
 def mapear(topico: str, payload: bytes | bytearray | str, recebido_em: datetime | None = None,
-           assinatura: str | None = None, cfg: MapeamentoConfig | None = None) -> ResultadoMapa:
-    """Mensagem → linhas da IOT001. Nunca levanta exceção."""
+           assinatura: str | None = None, cfg: MapeamentoConfig | None = None,
+           device_topico: str | None = None, resposta: bool = False) -> ResultadoMapa:
+    """Mensagem → linhas da IOT001. Nunca levanta exceção.
+
+    ``device_topico``: dispositivo dono do tópico (tópicos salvos em ``dispositivos.json``), usado quando o
+    payload não traz ``device_id``. ``resposta``: o tópico é a confirmação (ack) de um dispositivo salvo.
+    """
     cfg = cfg or MapeamentoConfig()
     dados = bytes(payload) if isinstance(payload, (bytes, bytearray)) else str(payload).encode("utf-8")
     recebido = _utc_sem_fuso(recebido_em)
-    device_topico = dispositivo_do_topico(topico, assinatura)
+    dono = device_topico
+    device_topico = dono or dispositivo_do_topico(topico, assinatura)
+    eh_resposta = resposta or topico_de_resposta(topico)
 
     if not dados.strip():
-        if topico_de_resposta(topico):  # ex.: limpeza de mensagem retida no tópico de resposta
-            return ResultadoMapa("vazio", tipo=RESPOSTA, device_id=_device_da_mensagem(None, topico, assinatura))
+        if eh_resposta:  # ex.: limpeza de mensagem retida no tópico de resposta
+            return ResultadoMapa("vazio", tipo=RESPOSTA,
+                                 device_id=_device_da_mensagem(None, topico, assinatura, dono))
         return ResultadoMapa("vazio", erro="payload vazio")
 
     try:
@@ -606,8 +617,9 @@ def mapear(topico: str, payload: bytes | bytearray | str, recebido_em: datetime 
     except UnicodeDecodeError:
         texto, binario = "", True
 
-    if binario and topico_de_resposta(topico):
-        return ResultadoMapa("binário", tipo=RESPOSTA, device_id=_device_da_mensagem(None, topico, assinatura))
+    if binario and eh_resposta:
+        return ResultadoMapa("binário", tipo=RESPOSTA,
+                             device_id=_device_da_mensagem(None, topico, assinatura, dono))
     if binario:
         m = _Montador(cfg, topico, "base64:" + base64.b64encode(dados).decode("ascii"), recebido, device_topico)
         m.rejeitar(f"payload binário (não é texto UTF-8): {hex_abreviado(dados)}")
@@ -620,15 +632,15 @@ def mapear(topico: str, payload: bytes | bytearray | str, recebido_em: datetime 
             try:
                 obj = _json_loads(t)
             except _JSONDecodeError as exc:
-                if topico_de_resposta(topico):  # resposta ilegível (o manual tem exemplos com vírgula sobrando)
+                if eh_resposta:  # resposta ilegível (o manual tem exemplos com vírgula sobrando)
                     return ResultadoMapa("JSON", tipo=RESPOSTA, avisos=[f"resposta com JSON inválido ({exc})"],
-                                         device_id=_device_da_mensagem(None, topico, assinatura))
+                                         device_id=_device_da_mensagem(None, topico, assinatura, dono))
                 m.rejeitar(f"JSON inválido ({exc})")
                 return ResultadoMapa("JSON", m.linhas, m.avisos)
-            tipo = classificar(topico, obj)
+            tipo = classificar(topico, obj, eh_resposta)
             if tipo != LEITURA:
                 return ResultadoMapa("JSON", tipo=tipo, objeto=obj,
-                                     device_id=_device_da_mensagem(obj, topico, assinatura))
+                                     device_id=_device_da_mensagem(obj, topico, assinatura, dono))
             if isinstance(obj, dict):
                 m.objeto(obj)
                 return ResultadoMapa("JSON", m.linhas, m.avisos, objeto=obj)
@@ -640,8 +652,9 @@ def mapear(topico: str, payload: bytes | bytearray | str, recebido_em: datetime 
                 else:
                     m.rejeitar(f"item {i} da lista JSON não é um objeto: {trecho(str(item), 30)!r}")
             return ResultadoMapa("JSON lista", m.linhas, m.avisos, objeto=obj)
-        if topico_de_resposta(topico):
-            return ResultadoMapa("texto", tipo=RESPOSTA, device_id=_device_da_mensagem(None, topico, assinatura))
+        if eh_resposta:
+            return ResultadoMapa("texto", tipo=RESPOSTA,
+                                 device_id=_device_da_mensagem(None, topico, assinatura, dono))
         formato = _tabular(m, t)
         return ResultadoMapa(formato, m.linhas, m.avisos)
     except Exception as exc:  # noqa: BLE001 - payload estranho nunca derruba a thread

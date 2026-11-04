@@ -134,6 +134,9 @@ def _saida_clientes(agora: float) -> str:
     for k in range(40):
         linhas.append(f"{t - 600 + k * 10 + 3}: Received PUBLISH from NOVUS_D4E5F6 (d0, q0, r0, m0, "
                       f"'NOVUS/Linha2/events', ... (131 bytes))")
+    for k in range(3):  # caso real: confirmação de comando num tópico que o NXperience gravou com "Ï"
+        linhas.append(f"{t - 400 + k * 120}: Received PUBLISH from NOVUS_A1B2C3 (d0, q1, r0, m{k + 20}, "
+                      f"'NOÏUS/Teste_Alumbra/ack/command', ... (212 bytes))")
     for k in range(9):  # parou há 3 min
         linhas.append(f"{t - 830 + k * 70}: Received PUBLISH from fieldlogger-07 (d0, q1, r0, m{k + 1}, "
                       f"'NOVUS/Teste_Alumbra/fieldlogger', ... (96 bytes))")
@@ -145,6 +148,7 @@ def capturar_clientes(destino: Path, tema: str) -> Path:
     settings = QSettings(str(Path(pasta) / "gui.ini"), QSettings.Format.IniFormat)
     config = Config()
     config.mosquitto.iniciar_automaticamente = False
+    config.mqtt.topico = "NOVUS/#"  # assinatura do usuário: o NOÏUS/… fica de fora
     bridge = FakePipelineBridge(config)
     janela = JanelaPrincipal(bridge, config, settings=settings, tema=tema, cofre=CofreFalso(),
                              executor_arp=lambda: ARP_SIMULADO, enderecos_locais={"192.168.100.162"})
@@ -170,6 +174,8 @@ def capturar_clientes(destino: Path, tema: str) -> Path:
                                     "sn": sn, "curr_rssi": rssi, "min_rssi": "-46", "max_rssi": "-87",
                                     "avg_rssi": "-58", "ipv4": ip})
     bridge.emitir_resposta("Teste_Alumbra", "reset_counters", True, "Contadores zerados (chd2).")
+    bridge.emitir_resposta("Teste_Alumbra", "diag", False,
+                           "Sem resposta do dispositivo em 15 s (esperada em NOVUS/Teste_Alumbra/ack/command).")
     bridge.contadores.emit(1284, 21, 3)
     janela.abas.setCurrentIndex(2)
     _rodar(1.5)  # consulta ARP (thread) e tique
@@ -179,8 +185,31 @@ def capturar_clientes(destino: Path, tema: str) -> Path:
     janela.grab().save(str(caminho))
     if tema == "claro":
         _capturar_dialogo_zerar(janela, destino)
+    _capturar_dialogo_topicos(janela, destino, tema)
     janela.close()
     return caminho
+
+
+def _capturar_dialogo_topicos(janela, destino: Path, tema: str) -> None:
+    """Diálogo "Tópicos" do Teste_Alumbra: o NOÏUS listado em "não ouvidos" e já usado na confirmação de comando
+    (indicador vermelho "não ouvido" até salvar)."""
+    painel = janela.painel_clientes
+
+    def executar(dlg):
+        _topico, botao = dlg.itens_nao_ouvidos[0]
+        acao = next(a for a in botao.menu().actions() if a.data() == "ack_command")
+        acao.trigger()
+        dlg.show()
+        dlg.adjustSize()
+        _rodar(0.3)
+        dlg.campos["ack_command"].deselect()  # a ativação da janela seleciona o texto do campo com foco
+        _rodar(0.1)
+        dlg.grab().save(str(destino / f"dialogo-topicos-{tema}.png"))
+        dlg.close()
+        return 0  # não salva
+
+    painel.executar_dialogo = executar
+    painel.abrir_topicos("Teste_Alumbra")
 
 
 def _capturar_dialogo_zerar(janela, destino: Path) -> None:

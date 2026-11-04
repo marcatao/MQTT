@@ -72,7 +72,13 @@ iniciar_automaticamente = true
 [dispositivos]
 # Comandos aos NOVUS DigiRail IoT ({id} = device_id). O integrador publica com QoS 1 e espera a resposta.
 # Se a assinatura da tela não cobrir o tópico de resposta, ele assina também (ex.: NOVUS/+/ack/command).
+# Padrões dos 5 tópicos de cada dispositivo. Para um aparelho com tópico diferente (ex.: o NXperience gravou
+# "NOÏUS/Teste_Alumbra/ack/command"), troque na aba Clientes > Tópicos…; fica salvo em arquivo_topicos.
+topico_dados = "NOVUS/{id}/events"
+topico_config = "NOVUS/{id}/config"
+topico_ack_config = "NOVUS/{id}/ack/config"
 topico_comando = "NOVUS/{id}/command"
-topico_resposta = "NOVUS/{id}/ack/command"
+topico_resposta = "NOVUS/{id}/ack/command"   # confirmação de comando
+arquivo_topicos = "dispositivos.json"        # na pasta do programa
 diagnostico_minutos = 30          # pede diagnóstico ao ver o dispositivo (a cada conexão) e a cada N min; 0 desliga
 timeout_comando_segundos = 15     # sem resposta nesse tempo: "sem resposta do dispositivo"

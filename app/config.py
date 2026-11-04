@@ -109,8 +109,14 @@ class MosquittoConfig:
 @dataclass
 class DispositivosConfig:
     """Comandos aos dispositivos NOVUS DigiRail (o integrador publica no broker). ``{id}`` = device_id."""
+    # padrões dos 5 tópicos de cada device; os de um device específico podem ser trocados na aba Clientes
+    # ("Tópicos…") e ficam em ``arquivo_topicos`` (ver app/core/topicos.py)
+    topico_dados: str = "NOVUS/{id}/events"
+    topico_config: str = "NOVUS/{id}/config"
+    topico_ack_config: str = "NOVUS/{id}/ack/config"
     topico_comando: str = "NOVUS/{id}/command"
-    topico_resposta: str = "NOVUS/{id}/ack/command"
+    topico_resposta: str = "NOVUS/{id}/ack/command"   # confirmação de comando (ack_command)
+    arquivo_topicos: str = "dispositivos.json"        # relativo à pasta do programa (pasta_base())
     diagnostico_minutos: float = 30         # pede "diag" ao ver o device em cada conexão e a cada N min; 0 desliga
     timeout_comando_segundos: float = 15    # sem resposta nesse tempo: "sem resposta do dispositivo"
 

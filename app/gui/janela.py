@@ -695,6 +695,8 @@ class JanelaPrincipal(QMainWindow):
             painel.zerar_pedido.connect(lambda device, canais: self.bridge.zerar_contadores(device, list(canais)))
             painel.diagnostico_pedido.connect(self.bridge.pedir_diagnostico)
         painel.registrar_log.connect(self._log_local)
+        # Tópicos por dispositivo (v0.1.11): o painel só usa os métodos do contrato; bridge antigo → sem botão.
+        painel.definir_api_topicos(self.bridge)
 
     def _log_local(self, nivel: str, mensagem: str) -> None:
         self.logs.adicionar(datetime.fromtimestamp(self._relogio()).strftime("%H:%M:%S"), nivel, mensagem)

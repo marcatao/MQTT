@@ -9,9 +9,13 @@ O MQTT não traz IP nem MAC, então a lista junta três fontes (CLAUDE.md, "Aba 
 * a tabela ARP do Windows (`arp -a`), consultada fora da thread da GUI a cada 60 s e quando surge um IP novo
   (`interpretar_arp`, `normalizar_mac`; o executor é injetável para testar em Linux);
 * os sinais do DigiRail (`diagnostico_dispositivo`, `canais_vistos`, `resposta_comando`): nº de série, firmware,
-  Wi-Fi, fila no aparelho, hora do diagnóstico, IP (quando o Mosquitto não deu) e o botão Zerar contadores
-  (diálogo e delegates em app/gui/comandos.py). O painel não fala com o bridge: emite `zerar_pedido` e
-  `diagnostico_pedido`, que a janela liga a `bridge.zerar_contadores` e `bridge.pedir_diagnostico`.
+  Wi-Fi, fila no aparelho, hora do diagnóstico ("sem resposta" quando o pedido falhou), IP (quando o Mosquitto não
+  deu) e o botão Zerar contadores (diálogo e delegates em app/gui/comandos.py). O painel não publica nada: emite
+  `zerar_pedido` e `diagnostico_pedido`, que a janela liga a `bridge.zerar_contadores` e `bridge.pedir_diagnostico`;
+* tópicos por dispositivo (diálogo "Tópicos…" em app/gui/topicos.py): a janela entrega o bridge em
+  `definir_api_topicos`. Cada tópico publicado (linha PUBLISH do mosquitto -v) é conferido com
+  `topico_coberto`; o que o integrador não ouve vira um AVISO na Atividade (1 vez por tópico por sessão), um ⚠ na
+  coluna Nome e um item no diálogo, com "Usar como…".
 
 Partes: lógica pura (`RegistroClientes`), modelo Qt (`ModeloClientes` + `FiltroClientes`), consulta ARP
 (`ConsultaArp`) e o conteúdo da aba (`PainelClientes`).
@@ -25,14 +29,16 @@ import re
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Iterable
 
 from PySide6.QtCore import (
     QAbstractTableModel,
+    QEvent,
     QPoint,
+    QPointF,
     QSettings,
     QModelIndex,
     QObject,
@@ -41,7 +47,7 @@ from PySide6.QtCore import (
     Qt,
     Signal,
 )
-from PySide6.QtGui import QColor, QFont, QFontMetrics
+from PySide6.QtGui import QColor, QFont, QFontMetrics, QIcon, QPainter, QPen, QPixmap, QPolygonF
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -54,6 +60,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QPushButton,
     QStackedWidget,
+    QStyleOptionViewItem,
     QTableView,
     QVBoxLayout,
     QWidget,
@@ -61,6 +68,7 @@ from PySide6.QtWidgets import (
 
 from .comandos import (
     PAPEL_ACAO,
+    PAPEL_TOPICOS,
     PAPEL_WIFI,
     DelegadoAcao,
     DelegadoWifi,
@@ -75,6 +83,7 @@ from .comandos import (
     texto_wifi,
 )
 from .estilo import CLARA, Paleta
+from .topicos import DialogoTopicos
 from .widgets import LOCALE_BR, PAPEL_PILULA, refiltrar, rodar_em_thread, ChipInfo, DelegadoPilula, avisar
 
 # ---------------------------------------------------------------------- constantes
@@ -108,6 +117,8 @@ DICAS_COLUNAS = {
     COL_ACAO: "Comandos ao aparelho (precisa estar conectado ao broker).",
 }
 COLUNAS_FIXAS = (COL_NOME, COL_ACAO)       # não podem ser escondidas
+# Cabeçalho na tela mais curto que o nome da coluna (CSV, menu Colunas e QSettings usam o nome completo).
+ROTULOS_CURTOS = {COL_FILA: "Fila"}
 # Em 1440 px a tabela tem ~940 px (a coluna lateral fica com o resto): por padrão escondem-se as colunas cuja
 # informação também aparece numa dica — Último envio (dica de "Há quanto tempo"), MAC (dica do IP), Tópico (dica do
 # nome), Firmware (dica do nº de série) — e Mensagens. O menu "Colunas" (ou clique direito no cabeçalho) as mostra.
@@ -119,6 +130,8 @@ PAPEL_ORDEM = Qt.ItemDataRole.UserRole
 CHAVE_COLUNAS_OCULTAS = "clientes/colunas_ocultas"
 TEMPO_SEM_RESPOSTA_S = 30  # o core responde em até 15 s; sem nada em 30 s a tela desiste
 TEXTO_ZERAR = "Zerar contadores"
+TEXTO_SEM_RESPOSTA = "sem resposta"
+MAX_TOPICOS_POR_CLIENTE = 50   # tópicos distintos lembrados por cliente (para reavaliar depois de salvar)
 
 
 # ---------------------------------------------------------------------- endereços (funções puras)
@@ -266,6 +279,13 @@ class Cliente:
     conectado: bool | None = None    # None: desconhecido (sem Mosquitto)
     assinante: bool = False
     atividade: float = 0.0           # último evento qualquer (para descartar os mais antigos)
+    publicados: list[str] = field(default_factory=list)   # tópicos distintos em que publicou (mosquitto -v)
+    nao_ouvidos: list[str] = field(default_factory=list)  # desses, os que o integrador não ouve
+
+    @property
+    def proprio(self) -> bool:
+        """O próprio integrador (publica os comandos; não precisa ouvir o que ele mesmo publica)."""
+        return (self.client_id or "").startswith(PREFIXOS_PROPRIOS)
 
     @property
     def nome_exibido(self) -> str:
@@ -306,6 +326,12 @@ class RegistroClientes:
         self._ips_vistos: set[str] = set()
         self.diagnosticos: dict[str, Diagnostico] = {}  # device_id → último diag
         self.canais: dict[str, list[int]] = {}           # device_id → canais vistos nas leituras (1–6)
+        # Tópicos não ouvidos. `coberto(tópico)` → True/False, ou None quando não dá para saber agora (integrador
+        # desconectado): nesse caso nada muda e o tópico é conferido de novo em `reavaliar`.
+        self.coberto: Callable[[str], bool | None] | None = None
+        self._cobertura: dict[str, bool] = {}           # cache até o próximo `reavaliar`
+        self._avisados: set[str] = set()                # tópicos já avisados nesta sessão
+        self._avisos: list[tuple[str, str]] = []        # (nome exibido do cliente, tópico) a avisar
 
     # ----- consulta -----
     def cliente(self, chave: str) -> Cliente | None:
@@ -317,6 +343,57 @@ class RegistroClientes:
     def retirar_ips_novos(self) -> list[str]:
         novos, self._ips_novos = self._ips_novos, []
         return novos
+
+    def retirar_avisos(self) -> list[tuple[str, str]]:
+        avisos, self._avisos = self._avisos, []
+        return avisos
+
+    def nao_ouvidos_do_dispositivo(self, device_id: str) -> list[str]:
+        saida: list[str] = []
+        for c in self.linhas:
+            if c.nome == device_id:
+                saida += [t for t in c.nao_ouvidos if t not in saida]
+        return saida
+
+    # ----- tópicos não ouvidos -----
+    def _e_coberto(self, topico: str) -> bool | None:
+        if self.coberto is None:
+            return None
+        if topico in self._cobertura:
+            return self._cobertura[topico]
+        resultado = self.coberto(topico)
+        if resultado is not None:
+            self._cobertura[topico] = bool(resultado)
+        return resultado
+
+    def _conferir(self, c: Cliente, topico: str) -> bool:
+        """Confere um tópico publicado por `c`. Devolve True se a lista de não ouvidos mudou."""
+        if c.proprio:
+            return False
+        coberto = self._e_coberto(topico)
+        if coberto is None:
+            return False
+        if coberto:
+            if topico in c.nao_ouvidos:
+                c.nao_ouvidos.remove(topico)
+                return True
+            return False
+        if topico in c.nao_ouvidos:
+            return False
+        c.nao_ouvidos.append(topico)
+        if topico not in self._avisados:
+            self._avisados.add(topico)
+            self._avisos.append((c.nome_exibido, topico))
+        return True
+
+    def reavaliar(self) -> int:
+        """Confere de novo todos os tópicos publicados (depois de salvar/restaurar tópicos ou ao conectar)."""
+        self._cobertura.clear()
+        mudou = False
+        for c in self.linhas:
+            for topico in list(c.publicados):
+                mudou = self._conferir(c, topico) or mudou
+        return DADOS if mudou else NADA
 
     # ----- entrada: texto do mosquitto -v -----
     def processar_texto(self, texto: str, agora: float) -> int:
@@ -348,6 +425,15 @@ class RegistroClientes:
             if ev.topico is not None:
                 self._publicador[ev.topico] = c.chave
                 mudanca = max(mudanca, self._absorver_por_topico(c, ev.topico))
+                if ev.topico not in c.publicados:
+                    if len(c.publicados) >= MAX_TOPICOS_POR_CLIENTE:
+                        antigo = c.publicados.pop(0)
+                        if antigo in c.nao_ouvidos:
+                            c.nao_ouvidos.remove(antigo)
+                    c.publicados.append(ev.topico)
+                    self._conferir(c, ev.topico)
+                elif ev.topico not in self._cobertura and ev.topico not in c.nao_ouvidos:
+                    self._conferir(c, ev.topico)  # visto antes de conectar: confere agora
         elif ev.tipo == "subscribe":
             c.conectado = True
             c.assinante = True
@@ -519,6 +605,9 @@ class ModeloClientes(QAbstractTableModel):
         self.conectado = False                        # integrador conectado ao broker (comandos possíveis)
         self.comandos: dict[str, EstadoComando] = {}  # device_id → último Zerar contadores
         self.diag_pedido: dict[str, float] = {}       # device_id → quando o diag foi pedido (sem resposta ainda)
+        self.diag_falha: dict[str, tuple[float, str]] = {}  # device_id → (quando, mensagem) do último diag sem resposta
+        self.topicos_editaveis = False                # há API de tópicos (botão "Tópicos" e menu)
+        self._icone_aviso: QIcon | None = None
 
     # ----- atualização -----
     def aplicar(self, mudanca: int) -> None:
@@ -540,7 +629,33 @@ class ModeloClientes(QAbstractTableModel):
 
     def definir_paleta(self, p: Paleta) -> None:
         self.paleta = p
+        self._icone_aviso = None
         self.atualizar_tudo()
+
+    def icone_aviso(self) -> QIcon:
+        """Triângulo de aviso (⚠) na cor de aviso do tema, desenhado à mão (não depende da fonte ter o glifo)."""
+        if self._icone_aviso is None:
+            icone = QIcon()
+            for escala in (1, 2):
+                lado = 16 * escala
+                pix = QPixmap(lado, lado)
+                pix.setDevicePixelRatio(escala)
+                pix.fill(Qt.GlobalColor.transparent)
+                pintor = QPainter(pix)
+                pintor.setRenderHint(QPainter.RenderHint.Antialiasing)
+                cor = QColor(self.paleta.aviso)
+                pintor.setPen(QPen(cor, 1.2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap,
+                                   Qt.PenJoinStyle.RoundJoin))
+                pintor.setBrush(cor)
+                pintor.drawPolygon(QPolygonF([QPointF(8, 1.6), QPointF(15, 14.4), QPointF(1, 14.4)]))
+                pintor.setPen(QPen(QColor(self.paleta.superficie), 1.8, Qt.PenStyle.SolidLine,
+                                   Qt.PenCapStyle.RoundCap))
+                pintor.drawLine(QPointF(8, 5.8), QPointF(8, 9.6))
+                pintor.drawPoint(QPointF(8, 12.2))
+                pintor.end()
+                icone.addPixmap(pix)
+            self._icone_aviso = icone
+        return self._icone_aviso
 
     def atualizar_dispositivo(self, device_id: str) -> None:
         for linha, c in enumerate(self.registro.linhas):
@@ -589,6 +704,8 @@ class ModeloClientes(QAbstractTableModel):
         if coluna == COL_DIAG:
             if c.nome and c.nome in self.diag_pedido:
                 return "pedido…"
+            if c.nome and c.nome in self.diag_falha:
+                return TEXTO_SEM_RESPOSTA
             return texto_hora_diag(diag.recebido_em if diag else None, self._relogio())
         if diag is None:
             return SEM_VALOR
@@ -637,7 +754,7 @@ class ModeloClientes(QAbstractTableModel):
     def headerData(self, secao: int, orientacao: Qt.Orientation, papel: int = Qt.ItemDataRole.DisplayRole):  # noqa: N802
         if orientacao == Qt.Orientation.Horizontal:
             if papel == Qt.ItemDataRole.DisplayRole:
-                return COLUNAS[secao]
+                return ROTULOS_CURTOS.get(secao, COLUNAS[secao])
             if papel == Qt.ItemDataRole.ToolTipRole:
                 return DICAS_COLUNAS.get(secao)
             if papel == Qt.ItemDataRole.TextAlignmentRole and secao == COL_MENSAGENS:
@@ -667,6 +784,12 @@ class ModeloClientes(QAbstractTableModel):
             return diag.rssi if diag else None
         if papel == PAPEL_ACAO and col == COL_ACAO:
             return self.acao(c)
+        if papel == PAPEL_TOPICOS and col == COL_ACAO:
+            if not (self.topicos_editaveis and c.nome):
+                return None
+            return "aviso" if c.nao_ouvidos else "normal"
+        if papel == Qt.ItemDataRole.DecorationRole and col == COL_NOME and c.nao_ouvidos:
+            return self.icone_aviso()
         if papel == Qt.ItemDataRole.TextAlignmentRole and col == COL_MENSAGENS:
             return int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         return None
@@ -696,6 +819,8 @@ class ModeloClientes(QAbstractTableModel):
         return self.texto(c, col).casefold()
 
     def _cor(self, c: Cliente, col: int) -> QColor | None:
+        if col == COL_DIAG and self.texto(c, col) == TEXTO_SEM_RESPOSTA:
+            return QColor(self.paleta.aviso)
         nivel = nivel_inatividade(self.idade(c))
         if nivel == "parado":
             return QColor(self.paleta.erro)
@@ -718,6 +843,12 @@ class ModeloClientes(QAbstractTableModel):
                 partes.append(f"Usuário MQTT: {c.usuario}")
             if c.topico:
                 partes.append(f"Tópico: {c.topico}")
+            if c.nao_ouvidos:
+                partes.append("")
+                partes.append("⚠ Publica em tópicos que o integrador não ouve:")
+                partes += [f"  • {t}" for t in c.nao_ouvidos]
+                if c.nome:
+                    partes.append("Clique com o botão direito → Tópicos… para usar esses tópicos.")
             if diag is not None:
                 if diag.titulo:
                     partes.append(f"Título no NXperience: {diag.titulo}")
@@ -745,6 +876,15 @@ class ModeloClientes(QAbstractTableModel):
         if col == COL_DIAG:
             if c.nome and c.nome in self.diag_pedido:
                 return "Diagnóstico pedido; aguardando a resposta do aparelho."
+            if c.nome and c.nome in self.diag_falha:
+                quando, mensagem = self.diag_falha[c.nome]
+                partes = [f"Diagnóstico sem resposta às {datetime.fromtimestamp(quando):%H:%M:%S}."]
+                if mensagem:
+                    partes.append(mensagem)
+                if diag is not None:
+                    partes.append(f"Último diagnóstico recebido em {formatar_epoch(diag.recebido_em)}.")
+                partes.append("Confira o tópico de confirmação de comando em Tópicos… (clique direito).")
+                return "\n".join(partes)
             if diag is not None:
                 return f"Último diagnóstico recebido em {formatar_epoch(diag.recebido_em)}."
             return "Nenhum diagnóstico recebido ainda (botão Atualizar diagnóstico)." if c.nome else None
@@ -894,6 +1034,9 @@ class PainelClientes(QWidget):
         self.executar_dialogo: Callable[[QDialog], int] = lambda dlg: dlg.exec()
         self.confirmar: Callable[[QWidget | None, str, list[int]], bool] | None = None
         self.ultimo_dialogo: DialogoZerarContadores | None = None
+        self.ultimo_dialogo_topicos: DialogoTopicos | None = None
+        self.confirmar_restaurar: Callable[[QWidget | None, str], bool] | None = None
+        self.api_topicos = None  # o bridge (topicos_do_dispositivo, salvar_…, restaurar_…, topico_coberto)
         self.registro = RegistroClientes()
         self.modelo = ModeloClientes(self.registro, self._relogio, lambda: self._locais, self)
         self.filtro = FiltroClientes(self)
@@ -971,8 +1114,10 @@ class PainelClientes(QWidget):
         # filtro (setIndexWidget ficaria preso à posição visual).
         self.delegado_acao = DelegadoAcao(self.tabela)
         self.delegado_acao.acionado.connect(self._ao_acionar)
+        self.delegado_acao.topicos_acionado.connect(self._ao_acionar_topicos)
         self.tabela.setItemDelegateForColumn(COL_ACAO, self.delegado_acao)
         self.tabela.setMouseTracking(True)  # hover do botão
+        self.tabela.viewport().installEventFilter(self)  # realce de cada botão da célula de ação
         self.tabela.entered.connect(self._ao_passar)
         self.tabela.activated.connect(self._ao_ativar)  # Enter/duplo clique na célula de ação
         self.tabela.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -1019,7 +1164,7 @@ class PainelClientes(QWidget):
 
     LARGURA_MAX = {COL_NOME: 170, COL_IP: 120, COL_MAC: 140, COL_ULTIMO: 150, COL_HA: 150, COL_TOPICO: 170,
                    COL_STATUS: 110, COL_SERIE: 100, COL_FIRMWARE: 90, COL_WIFI: 100, COL_FILA: 120, COL_DIAG: 100}
-    LARGURA_MIN = {COL_MAC: 124, COL_ACAO: 144}  # o MAC e o botão nunca aparecem cortados
+    LARGURA_MIN = {COL_MAC: 124, COL_ACAO: 144}  # o MAC e o botão nunca aparecem cortados (+ "Tópicos")
 
     def _ajustar_colunas(self, *_args) -> None:
         """Ajusta ao conteúdo (cabeçalho incluso), com teto por coluna para caber na janela."""
@@ -1031,9 +1176,12 @@ class PainelClientes(QWidget):
         for col in range(len(COLUNAS)):
             if self.tabela.isColumnHidden(col):
                 continue
-            texto_cab = metricas.horizontalAdvance(COLUNAS[col]) + 16
+            texto_cab = metricas.horizontalAdvance(ROTULOS_CURTOS.get(col, COLUNAS[col])) + 16
             conteudo = self.tabela.sizeHintForColumn(col) if self.filtro.rowCount() else 0
-            largura = max(texto_cab, conteudo, self.LARGURA_MIN.get(col, 0))
+            minimo = self.LARGURA_MIN.get(col, 0)
+            if col == COL_ACAO and self.modelo.topicos_editaveis:
+                minimo += DelegadoAcao.LARGURA_TOPICOS + DelegadoAcao.ESPACO
+            largura = max(texto_cab, conteudo, minimo)
             if col in self.LARGURA_MAX:
                 largura = max(texto_cab, min(largura, self.LARGURA_MAX[col]))
             cab.resizeSection(col, largura)
@@ -1044,6 +1192,7 @@ class PainelClientes(QWidget):
         if tipo != "saida":
             return
         self._aplicar(self.registro.processar_texto(texto, self._relogio()))
+        self._emitir_avisos_topicos()
 
     def ao_dispositivo_visto(self, device_id: str, topico: str, iso: str) -> None:
         agora = self._relogio()
@@ -1076,13 +1225,17 @@ class PainelClientes(QWidget):
     # ----- DigiRail: diagnóstico, canais e comandos -----
     def definir_conectado(self, conectado: bool) -> None:
         """Comandos só com o integrador conectado ao broker (a janela chama a cada mudança de estado)."""
+        antes = self.modelo.conectado
         self.modelo.conectado = bool(conectado)
+        if self.modelo.conectado and not antes:
+            self.reavaliar_topicos()  # o que chegou antes de conectar é conferido agora
         self.modelo.atualizar_tudo()
         self._atualizar_botao_diag()
 
     def ao_diagnostico(self, device_id: str, texto_json: str) -> None:
         diag = interpretar_diag(texto_json, self._relogio())
         self.modelo.diag_pedido.pop(device_id, None)
+        self.modelo.diag_falha.pop(device_id, None)  # respondeu: some o "sem resposta"
         self._aplicar(self.registro.registrar_diagnostico(device_id, diag))
         self._ajustar_colunas()
 
@@ -1099,6 +1252,7 @@ class PainelClientes(QWidget):
         elif comando == "diag":
             self.modelo.diag_pedido.pop(device_id, None)
             if not sucesso:
+                self.modelo.diag_falha[device_id] = (self._relogio(), str(mensagem or ""))
                 self.registrar_log.emit("AVISO", f"Diagnóstico de {device_id} falhou: {mensagem}")
             self.modelo.atualizar_dispositivo(device_id)
 
@@ -1159,6 +1313,82 @@ class PainelClientes(QWidget):
         # Só a linha da tabela muda: o log do resultado na Atividade vem do core (evita linha duplicada).
         self.modelo.atualizar_dispositivo(device_id)
 
+    # ----- tópicos por dispositivo -----
+    def definir_api_topicos(self, api) -> None:
+        """A janela entrega o bridge (ou None). Sem ele, não há botão "Tópicos" nem conferência de tópicos."""
+        necessarios = ("topicos_do_dispositivo", "salvar_topicos_dispositivo", "restaurar_topicos_padrao",
+                       "topico_coberto")
+        self.api_topicos = api if api is not None and all(hasattr(api, n) for n in necessarios) else None
+        self.modelo.topicos_editaveis = self.api_topicos is not None
+        self.registro.coberto = self._coberto if self.api_topicos is not None else None
+        self.reavaliar_topicos()
+        self._ajustar_colunas()
+
+    def _coberto(self, topico: str) -> bool | None:
+        """Pergunta ao bridge. Desconectado não há assinatura para comparar: None (confere ao conectar).
+        Se o bridge falhar, considera ouvido (melhor não avisar do que avisar errado)."""
+        if self.api_topicos is None or not self.modelo.conectado:
+            return None
+        try:
+            return bool(self.api_topicos.topico_coberto(topico))
+        except Exception:  # noqa: BLE001
+            return True
+
+    def reavaliar_topicos(self) -> None:
+        mudanca = self.registro.reavaliar()
+        if mudanca:
+            self.modelo.aplicar(mudanca)
+        self._emitir_avisos_topicos()
+
+    def _emitir_avisos_topicos(self) -> None:
+        for nome, topico in self.registro.retirar_avisos():
+            self.registrar_log.emit("AVISO", f"{nome} publica em '{topico}', que o integrador não está ouvindo. "
+                                             "Abra Clientes → Tópicos… para usar esse tópico.")
+
+    def abrir_topicos(self, device_id: str) -> bool:
+        """Abre o diálogo "Tópicos — <device_id>". Devolve True se salvou ou restaurou o padrão."""
+        if self.api_topicos is None or not device_id:
+            return False
+        try:
+            dlg = DialogoTopicos(device_id, self.api_topicos, self.registro.nao_ouvidos_do_dispositivo(device_id),
+                                 self, confirmar=self.confirmar_restaurar)
+        except Exception as exc:  # noqa: BLE001
+            self.registrar_log.emit("ERRO", f"Não foi possível abrir os tópicos de {device_id}: {exc}")
+            return False
+        self.ultimo_dialogo_topicos = dlg
+        try:
+            if self.executar_dialogo(dlg) != QDialog.DialogCode.Accepted:
+                return False
+        finally:
+            dlg.deleteLater()
+        # o log de "salvos"/"restaurados" vem do core, com as assinaturas aplicadas
+        self.reavaliar_topicos()  # o que passou a ser ouvido sai da lista e o ⚠ some
+        self.modelo.atualizar_dispositivo(device_id)
+        return True
+
+    def _ao_acionar_topicos(self, indice: QModelIndex) -> None:
+        c = self._cliente_do_proxy(indice)
+        if c is not None and c.nome:
+            self.abrir_topicos(c.nome)
+
+    def eventFilter(self, objeto, evento) -> bool:  # noqa: N802
+        """Movimento do mouse na tabela: realce só no botão sob o cursor e mãozinha sobre os botões."""
+        if objeto is self.tabela.viewport() and evento.type() in (QEvent.Type.MouseMove, QEvent.Type.Leave):
+            pos = evento.position() if evento.type() == QEvent.Type.MouseMove else None
+            self.delegado_acao.posicao_mouse = pos
+            indice = self.tabela.indexAt(pos.toPoint()) if pos is not None else QModelIndex()
+            if indice.isValid() and indice.column() == COL_ACAO:
+                opcao = QStyleOptionViewItem()
+                opcao.initFrom(self.tabela)
+                opcao.rect = self.tabela.visualRect(indice)
+                opcao.font = self.tabela.font()
+                if self.delegado_acao.botao_em(opcao, indice, pos):
+                    self.tabela.viewport().setCursor(Qt.CursorShape.PointingHandCursor)
+                else:
+                    self.tabela.viewport().unsetCursor()
+                self.tabela.viewport().update(self.tabela.visualRect(indice))
+        return super().eventFilter(objeto, evento)
+
     def _cliente_do_proxy(self, indice: QModelIndex) -> Cliente | None:
         if not indice.isValid():
             return None
@@ -1175,10 +1405,7 @@ class PainelClientes(QWidget):
             self._ao_acionar(indice)
 
     def _ao_passar(self, indice: QModelIndex) -> None:
-        acao = indice.data(PAPEL_ACAO) if indice.column() == COL_ACAO else None
-        if acao and acao[0] in DelegadoAcao.CLICAVEIS:
-            self.tabela.viewport().setCursor(Qt.CursorShape.PointingHandCursor)
-        else:
+        if indice.column() != COL_ACAO:  # na coluna de ação quem decide é o eventFilter (depende do botão)
             self.tabela.viewport().unsetCursor()
 
     def menu_da_linha(self, indice: QModelIndex) -> QMenu | None:
@@ -1195,6 +1422,13 @@ class PainelClientes(QWidget):
         diag = menu.addAction("Atualizar diagnóstico deste dispositivo")
         diag.setEnabled(bool(c.nome) and conectado)
         diag.triggered.connect(lambda: self.pedir_diagnostico(c.nome))
+        topicos = menu.addAction("Tópicos…")
+        topicos.setEnabled(bool(c.nome) and self.api_topicos is not None)
+        if c.nao_ouvidos:
+            topicos.setIcon(self.modelo.icone_aviso())
+        topicos.setToolTip("Ver e corrigir os tópicos deste aparelho (como no NXperience)." if c.nome
+                           else "Este cliente ainda não tem nome (device_id).")
+        topicos.triggered.connect(lambda: self.abrir_topicos(c.nome))
         if not conectado:
             for a in (zerar, diag):
                 a.setToolTip("Conecte ao broker para enviar comandos.")

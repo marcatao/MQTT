@@ -416,6 +416,21 @@ QPushButton#botaoPerigo:hover { border: 2px solid $texto; padding: 0 17px; }
 QPushButton#botaoPerigo:focus { border: 2px solid $texto; padding: 0 17px; }
 QPushButton#botaoPerigo:disabled { background: $neutro_suave; color: $texto_fraco; border-color: $neutro_suave; }
 
+/* ---------- Diálogo Tópicos (aba Clientes) ---------- */
+QDialog#dialogoTopicos { background: $fundo; }
+QFrame#grupoNaoOuvidos { background: $superficie; border: 1px solid $aviso; border-radius: 8px; }
+QLabel#topicoNaoOuvido { color: $texto; background: transparent; }
+QLabel#rotuloTopico { color: $texto_sec; font-weight: 600; }
+QPushButton#botaoUsarComo { min-height: 28px; padding: 0 12px; }
+QPushButton#botaoUsarComo:focus { padding: 0 11px; }
+QLabel#indicadorTopico {
+    border-radius: 11px; padding: 2px 10px; font-weight: 600; font-size: 9pt;
+    background: $neutro_suave; color: $texto_sec;
+}
+QLabel#indicadorTopico[estado="ouvido"] { background: $sucesso_suave; color: $sucesso; }
+QLabel#indicadorTopico[estado="nao_ouvido"] { background: $erro_suave; color: $erro; }
+QLabel#indicadorTopico[estado="invalido"] { background: $aviso_suave; color: $aviso; }
+
 QMenu { background: $superficie; border: 1px solid $borda_forte; border-radius: 8px; padding: 4px; }
 QMenu::item { padding: 6px 20px; border-radius: 4px; }
 QMenu::item:selected { background: $destaque_suave; color: $texto; }
