@@ -193,6 +193,12 @@ class PipelineBridge(QObject):
     def encerrar(self, timeout: float = 5.0) -> None: ...  # ao fechar a janela: para, grava o último lote, desconecta
     def zerar_contadores(self, device_id: str, canais: list[int]) -> None: ...  # publica reset_counters; não bloqueia
     def pedir_diagnostico(self, device_id: str) -> None: ...                   # publica diag; não bloqueia
+    # Tópicos por dispositivo (v0.1.11): chaves "events", "config", "ack_config", "command", "ack_command"
+    def topicos_do_dispositivo(self, device_id: str) -> dict[str, str]: ...    # efetivos: salvos ou padrão do modelo
+    def salvar_topicos_dispositivo(self, device_id: str, topicos: dict[str, str]) -> None: ...  # grava e aplica já
+    def restaurar_topicos_padrao(self, device_id: str) -> None: ...            # apaga os salvos desse device
+    def topicos_ouvidos(self) -> list[str]: ...    # filtros assinados agora (assinatura do usuário + extras)
+    def topico_coberto(self, topico: str) -> bool: ...  # o integrador recebe mensagens desse tópico?
 ```
 
 Os sinais são emitidos de outras threads; o Qt entrega na thread da GUI (conexão enfileirada). A GUI só usa isso.
@@ -296,6 +302,26 @@ lacunas L1/L2 serem corrigidas: QoS 1, "Reter Dados" desligado, diagnóstico per
     firmware, sinal Wi-Fi (RSSI), leituras guardadas no aparelho (`mqtt_queue`) e IP.
 - **Aba Clientes**: colunas novas Nº série, Firmware, Wi-Fi e Fila; em cada linha, botão **Zerar contadores** que abre
   a escolha dos canais (chd1–chd6, individual ou todos), pede confirmação e mostra o resultado.
+
+### Tópicos por dispositivo e tópicos não ouvidos (decidido com o usuário em 04/11/2026)
+
+Motivo: o NXperience do `Teste_Alumbra` grava o "Tópico de confirmação de comando" como `NOÏUS/Teste_Alumbra/ack/command`
+(o aparelho troca o V sozinho e não deixa corrigir); o diagnóstico e as respostas de Zerar contadores iam para um tópico
+que o integrador não ouvia.
+
+- **Tópicos por dispositivo**: cada device tem 5 tópicos (`events`, `config`, `ack_config`, `command`, `ack_command`),
+  pré-preenchidos com o padrão de `[dispositivos]` (`NOVUS/{id}/...`), editáveis na aba Clientes (diálogo "Tópicos…")
+  e salvos em `dispositivos.json` na pasta do programa (`pasta_base()`, sobrevive a atualizações do `.zip`). O core usa
+  esses tópicos para publicar comandos, assina os que a assinatura do usuário não cobre (refaz ao reconectar e ao
+  salvar) e reconhece as respostas e o dispositivo por eles. Texto do tópico é guardado exatamente como digitado/colado
+  (UTF-8), inclusive caracteres como `Ï`.
+- **Tópicos não ouvidos**: a GUI lê as linhas `Received PUBLISH from ID (... 'tópico' ...)` do `mosquitto -v` e, quando
+  um cliente publica num tópico que `topico_coberto()` diz que não é ouvido, registra um AVISO na Atividade (1 vez por
+  tópico por sessão), marca a linha do cliente na aba Clientes e lista o tópico no diálogo "Tópicos…" com botão para
+  usá-lo num dos 5 campos (ex.: "Usar como confirmação de comando").
+- **Sem resposta**: a coluna Diagnóstico mostra "sem resposta" (com a hora e o tópico usado na dica) quando o pedido de
+  diagnóstico — manual ou automático — não é respondido no tempo; o core emite `resposta_comando(device, "diag", False,
+  msg)` também para o automático, só em caso de falha.
 
 ## Pendências conhecidas
 
