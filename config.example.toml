@@ -27,22 +27,25 @@ lote_max = 500           # grava quando juntar esta quantidade...
 lote_segundos = 1.0      # ...ou quando passar este tempo, o que vier primeiro
 pasta_contingencia = "contingencia"
 pasta_logs = "logs"      # erros detalhados do dia em erros_AAAAMMDD.jsonl (a janela de erros lê daqui)
-# Amostragem: a cada ciclo alinhado ao relógio (60 = hh:mm:00) grava só a leitura completa mais recente de cada
-# device_id; as outras do período são descartadas. 0 = grava todas (por lote_max/lote_segundos, como acima).
+# Amostragem pelo minuto da leitura (ts_unix): 1 linha por device_id por minuto (a leitura mais recente daquele
+# minuto). A cada ciclo alinhado ao relógio (60 = hh:mm:00) grava todos os minutos já encerrados, inclusive os
+# antigos reenviados pela memória do dispositivo depois de uma queda; o minuto corrente espera o próximo ciclo.
+# 0 = grava todas (por lote_max/lote_segundos, como acima). Nos dois casos, a mesma leitura (device_id, ts_unix)
+# não é gravada duas vezes (memória das últimas 24 h).
 intervalo_gravacao_segundos = 60
 
 [mapeamento]
 # Como achar cada coluna da dbo.IOT001 no payload (JSON ou tabular com cabeçalho). A primeira chave encontrada
 # vence; maiúsculas não importam; "a.b" é caminho aninhado no JSON ({"a": {"b": ...}}).
 # pid, device_id e ts_unix são obrigatórios: sem eles a leitura vai para contingencia/ com o motivo no log.
-pid = ["pid", "packet_id", "id_pacote", "seq", "sequencia"]
+pid = ["pid", "pid_id", "product_id", "id_produto"]  # no DigiRail é o código do modelo (constante), não nº de pacote
 device_id = ["device_id", "deviceid", "device", "dispositivo", "id_dispositivo", "serial", "serial_number", "sn"]
 ts_unix = ["ts_unix", "ts", "timestamp", "time", "epoch", "unix", "datahora", "data_hora", "datetime"]  # s, ms, µs, ns ou ISO 8601
 chd1 = ["chd1_value", "chd1.value", "chd1"]
 chd2 = ["chd2_value", "chd2.value", "chd2"]
 chd3 = ["chd3_value", "chd3.value", "chd3"]
 leituras = ["leituras", "readings", "dados", "data", "registros"]  # lista de leituras dentro de um objeto
-device_do_topico = true      # sem device_id no payload, usa o nível do tópico após o prefixo assinado
+device_do_topico = true      # sem device_id no payload: {id} de NOVUS/{id}/..., ou o nível do curinga da assinatura
 fuso_sem_offset = "local"    # data/hora ISO sem fuso: "local" (do PC) ou "utc"
 colunas_sem_cabecalho = []   # tabular sem cabeçalho: ex. ["pid", "device_id", "ts", "chd1", "chd2", "chd3"]
 
@@ -65,3 +68,11 @@ conectar_automaticamente = true
 pasta = "C:\\Program Files\\mosquitto168"
 comando = "mosquitto -v"     # 1º token = programa (.exe é acrescentado se faltar); o resto são argumentos
 iniciar_automaticamente = true
+
+[dispositivos]
+# Comandos aos NOVUS DigiRail IoT ({id} = device_id). O integrador publica com QoS 1 e espera a resposta.
+# Se a assinatura da tela não cobrir o tópico de resposta, ele assina também (ex.: NOVUS/+/ack/command).
+topico_comando = "NOVUS/{id}/command"
+topico_resposta = "NOVUS/{id}/ack/command"
+diagnostico_minutos = 30          # pede diagnóstico ao ver o dispositivo (a cada conexão) e a cada N min; 0 desliga
+timeout_comando_segundos = 15     # sem resposta nesse tempo: "sem resposta do dispositivo"

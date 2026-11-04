@@ -7,7 +7,11 @@ O MQTT não traz IP nem MAC, então a lista junta três fontes (CLAUDE.md, "Aba 
 * o sinal `dispositivo_visto(device_id, tópico, iso)` do bridge: o nome (device_id) é ligado ao client id que
   publicou por último no MESMO tópico; sem Mosquitto na aba, a linha fica só com nome, tópico e último envio;
 * a tabela ARP do Windows (`arp -a`), consultada fora da thread da GUI a cada 60 s e quando surge um IP novo
-  (`interpretar_arp`, `normalizar_mac`; o executor é injetável para testar em Linux).
+  (`interpretar_arp`, `normalizar_mac`; o executor é injetável para testar em Linux);
+* os sinais do DigiRail (`diagnostico_dispositivo`, `canais_vistos`, `resposta_comando`): nº de série, firmware,
+  Wi-Fi, fila no aparelho, hora do diagnóstico, IP (quando o Mosquitto não deu) e o botão Zerar contadores
+  (diálogo e delegates em app/gui/comandos.py). O painel não fala com o bridge: emite `zerar_pedido` e
+  `diagnostico_pedido`, que a janela liga a `bridge.zerar_contadores` e `bridge.pedir_diagnostico`.
 
 Partes: lógica pura (`RegistroClientes`), modelo Qt (`ModeloClientes` + `FiltroClientes`), consulta ARP
 (`ConsultaArp`) e o conteúdo da aba (`PainelClientes`).
@@ -16,6 +20,7 @@ from __future__ import annotations
 
 import csv
 import ipaddress
+import json
 import re
 import subprocess
 import sys
@@ -27,6 +32,8 @@ from typing import Callable, Iterable
 
 from PySide6.QtCore import (
     QAbstractTableModel,
+    QPoint,
+    QSettings,
     QModelIndex,
     QObject,
     QSortFilterProxyModel,
@@ -37,11 +44,14 @@ from PySide6.QtCore import (
 from PySide6.QtGui import QColor, QFont, QFontMetrics
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QCheckBox,
+    QDialog,
     QFileDialog,
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QMenu,
     QPushButton,
     QStackedWidget,
     QTableView,
@@ -49,6 +59,21 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .comandos import (
+    PAPEL_ACAO,
+    PAPEL_WIFI,
+    DelegadoAcao,
+    DelegadoWifi,
+    Diagnostico,
+    DialogoZerarContadores,
+    dica_wifi,
+    interpretar_diag,
+    lista_canais,
+    numeros_canais,
+    texto_hora_diag,
+    texto_relogio,
+    texto_wifi,
+)
 from .estilo import CLARA, Paleta
 from .widgets import LOCALE_BR, PAPEL_PILULA, refiltrar, rodar_em_thread, ChipInfo, DelegadoPilula, avisar
 
@@ -63,9 +88,37 @@ PREFIXOS_SUB = ("mosqsub", "mosquitto_sub")       # mosquitto_sub antigo; o 2.x 
 SEM_VALOR = "—"
 ESTE_COMPUTADOR = "este computador"
 
-COLUNAS = ("Nome", "IP", "MAC", "Último envio", "Há quanto tempo", "Tópico", "Status", "Mensagens")
-(COL_NOME, COL_IP, COL_MAC, COL_ULTIMO, COL_HA, COL_TOPICO, COL_STATUS, COL_MENSAGENS) = range(len(COLUNAS))
+# Ordem lógica (modelo, CSV, `linhas_visiveis`): as 8 colunas de sempre e depois as do DigiRail.
+COLUNAS = ("Nome", "IP", "MAC", "Último envio", "Há quanto tempo", "Tópico", "Status", "Mensagens",
+           "Nº série", "Firmware", "Wi-Fi", "Fila no aparelho", "Diagnóstico", "Ação")
+(COL_NOME, COL_IP, COL_MAC, COL_ULTIMO, COL_HA, COL_TOPICO, COL_STATUS, COL_MENSAGENS,
+ COL_SERIE, COL_FIRMWARE, COL_WIFI, COL_FILA, COL_DIAG, COL_ACAO) = range(len(COLUNAS))
+# Ordem na tela: o que se olha sempre (nome, status, envio, sinal, fila) à esquerda; endereços e identificação no
+# meio; tópico, contagem e a ação no fim. Colunas menos usadas podem ser escondidas (clique direito no cabeçalho).
+ORDEM_VISUAL = (COL_NOME, COL_STATUS, COL_HA, COL_ULTIMO, COL_WIFI, COL_FILA, COL_IP, COL_MAC, COL_SERIE,
+                COL_FIRMWARE, COL_DIAG, COL_TOPICO, COL_MENSAGENS, COL_ACAO)
+DICAS_COLUNAS = {
+    COL_HA: "Tempo desde o último envio do dispositivo.",
+    COL_WIFI: "Sinal Wi-Fi (RSSI) informado pelo diagnóstico do aparelho.",
+    COL_FILA: "Leituras guardadas no aparelho esperando envio por MQTT (mqtt_queue do diagnóstico).",
+    COL_SERIE: "Número de série, pelo diagnóstico do aparelho.",
+    COL_FIRMWARE: "Versão do firmware, pelo diagnóstico do aparelho.",
+    COL_DIAG: "Hora do último diagnóstico recebido do aparelho.",
+    COL_MENSAGENS: "Mensagens publicadas, contadas pela saída do mosquitto -v.",
+    COL_ACAO: "Comandos ao aparelho (precisa estar conectado ao broker).",
+}
+COLUNAS_FIXAS = (COL_NOME, COL_ACAO)       # não podem ser escondidas
+# Em 1440 px a tabela tem ~940 px (a coluna lateral fica com o resto): por padrão escondem-se as colunas cuja
+# informação também aparece numa dica — Último envio (dica de "Há quanto tempo"), MAC (dica do IP), Tópico (dica do
+# nome), Firmware (dica do nº de série) — e Mensagens. O menu "Colunas" (ou clique direito no cabeçalho) as mostra.
+OCULTAS_PADRAO = (COL_ULTIMO, COL_MAC, COL_TOPICO, COL_MENSAGENS, COL_FIRMWARE)
+# Exportação CSV: as 8 colunas originais na ordem de sempre, o client id e depois as do diagnóstico.
+COLUNAS_CSV = tuple(range(COL_MENSAGENS + 1))
+COLUNAS_CSV_DIAG = (COL_SERIE, COL_FIRMWARE, COL_WIFI, COL_FILA, COL_DIAG)
 PAPEL_ORDEM = Qt.ItemDataRole.UserRole
+CHAVE_COLUNAS_OCULTAS = "clientes/colunas_ocultas"
+TEMPO_SEM_RESPOSTA_S = 30  # o core responde em até 15 s; sem nada em 30 s a tela desiste
+TEXTO_ZERAR = "Zerar contadores"
 
 
 # ---------------------------------------------------------------------- endereços (funções puras)
@@ -251,6 +304,8 @@ class RegistroClientes:
         self._publicador: dict[str, str] = {}  # tópico → client id que publicou nele por último
         self._ips_novos: list[str] = []
         self._ips_vistos: set[str] = set()
+        self.diagnosticos: dict[str, Diagnostico] = {}  # device_id → último diag
+        self.canais: dict[str, list[int]] = {}           # device_id → canais vistos nas leituras (1–6)
 
     # ----- consulta -----
     def cliente(self, chave: str) -> Cliente | None:
@@ -324,6 +379,31 @@ class RegistroClientes:
         c.ultimo_envio = max(c.ultimo_envio or 0.0, quando)
         c.atividade = max(c.atividade, quando)
         return max(mudanca, DADOS)
+
+    # ----- entrada: sinais do DigiRail -----
+    def registrar_diagnostico(self, device_id: str, diag: Diagnostico) -> int:
+        """Guarda o diag do device_id. Se o dispositivo ainda não tem linha, cria uma (só-pipeline)."""
+        device_id = str(device_id or "").strip()
+        if not device_id:
+            return NADA
+        self.diagnosticos[device_id] = diag
+        if diag.ip:
+            self._ver_ip(diag.ip)
+        if self.por_nome(device_id) is not None:
+            return DADOS
+        c, mudanca = self._obter(_chave_dispositivo(device_id))
+        c.nome = device_id
+        c.mensagens = None
+        c.atividade = max(c.atividade, diag.recebido_em)
+        return max(mudanca, DADOS)
+
+    def registrar_canais(self, device_id: str, canais: list[int]) -> None:
+        device_id = str(device_id or "").strip()
+        if device_id:
+            self.canais[device_id] = list(canais)
+
+    def diagnostico(self, c: Cliente) -> Diagnostico | None:
+        return self.diagnosticos.get(c.nome) if c.nome else None
 
     # ----- interno -----
     def _obter(self, chave: str) -> tuple[Cliente, int]:
@@ -417,6 +497,15 @@ def epoch_de_iso(iso: str, padrao: float) -> float:
         return padrao
 
 
+@dataclass
+class EstadoComando:
+    """Último "Zerar contadores" de um dispositivo: "enviando" | "ok" | "falha"."""
+    estado: str
+    quando: float
+    canais: list[int]
+    mensagem: str = ""
+
+
 # ---------------------------------------------------------------------- modelo Qt
 class ModeloClientes(QAbstractTableModel):
     def __init__(self, registro: RegistroClientes, relogio: Callable[[], float],
@@ -427,6 +516,9 @@ class ModeloClientes(QAbstractTableModel):
         self._locais = locais or (lambda: set())
         self.macs: dict[str, str] = {}
         self.paleta: Paleta = CLARA
+        self.conectado = False                        # integrador conectado ao broker (comandos possíveis)
+        self.comandos: dict[str, EstadoComando] = {}  # device_id → último Zerar contadores
+        self.diag_pedido: dict[str, float] = {}       # device_id → quando o diag foi pedido (sem resposta ainda)
 
     # ----- atualização -----
     def aplicar(self, mudanca: int) -> None:
@@ -450,6 +542,11 @@ class ModeloClientes(QAbstractTableModel):
         self.paleta = p
         self.atualizar_tudo()
 
+    def atualizar_dispositivo(self, device_id: str) -> None:
+        for linha, c in enumerate(self.registro.linhas):
+            if c.nome == device_id:
+                self.dataChanged.emit(self.index(linha, 0), self.index(linha, len(COLUNAS) - 1))
+
     def cliente(self, linha: int) -> Cliente:
         return self.registro.linhas[linha]
 
@@ -457,18 +554,59 @@ class ModeloClientes(QAbstractTableModel):
     def idade(self, c: Cliente) -> float | None:
         return None if not c.ultimo_envio else max(0.0, self._relogio() - c.ultimo_envio)
 
+    def ip(self, c: Cliente) -> str | None:
+        """IP do Mosquitto; sem ele, o `ipv4` do diagnóstico do aparelho."""
+        if c.ip:
+            return c.ip
+        diag = self.registro.diagnostico(c)
+        return diag.ip if diag else None
+
     def texto_mac(self, c: Cliente) -> str:
-        if not c.ip:
+        ip = self.ip(c)
+        if not ip:
             return SEM_VALOR
-        if ip_local(c.ip, self._locais()):
+        if ip_local(ip, self._locais()):
             return ESTE_COMPUTADOR
-        return self.macs.get(c.ip, SEM_VALOR)
+        return self.macs.get(ip, SEM_VALOR)
+
+    def acao(self, c: Cliente) -> tuple[str, str] | None:
+        """(estado, texto) do botão da linha; None sem device_id (não há a quem mandar o comando)."""
+        if not c.nome:
+            return None
+        cmd = self.comandos.get(c.nome)
+        if cmd is not None and cmd.estado == "enviando":
+            return ("enviando", "Zerando…")
+        if not self.conectado:
+            return ("desabilitado", TEXTO_ZERAR)
+        if cmd is not None and cmd.estado == "ok":
+            return ("ok", f"Zerado às {datetime.fromtimestamp(cmd.quando):%H:%M}")
+        if cmd is not None and cmd.estado == "falha":
+            return ("falha", "Falhou")
+        return ("pronto", TEXTO_ZERAR)
+
+    def _texto_diag(self, c: Cliente, coluna: int) -> str:
+        diag = self.registro.diagnostico(c)
+        if coluna == COL_DIAG:
+            if c.nome and c.nome in self.diag_pedido:
+                return "pedido…"
+            return texto_hora_diag(diag.recebido_em if diag else None, self._relogio())
+        if diag is None:
+            return SEM_VALOR
+        if coluna == COL_SERIE:
+            return diag.sn or SEM_VALOR
+        if coluna == COL_FIRMWARE:
+            return diag.firmware or SEM_VALOR
+        if coluna == COL_WIFI:
+            return texto_wifi(diag)
+        if coluna == COL_FILA:
+            return SEM_VALOR if diag.fila is None else LOCALE_BR.toString(int(diag.fila))
+        return ""
 
     def texto(self, c: Cliente, coluna: int) -> str:
         if coluna == COL_NOME:
             return c.nome_exibido
         if coluna == COL_IP:
-            return c.ip or SEM_VALOR
+            return self.ip(c) or SEM_VALOR
         if coluna == COL_MAC:
             return self.texto_mac(c)
         if coluna == COL_ULTIMO:
@@ -482,6 +620,11 @@ class ModeloClientes(QAbstractTableModel):
             return c.status
         if coluna == COL_MENSAGENS:
             return SEM_VALOR if c.mensagens is None else LOCALE_BR.toString(int(c.mensagens))
+        if coluna in (COL_SERIE, COL_FIRMWARE, COL_WIFI, COL_FILA, COL_DIAG):
+            return self._texto_diag(c, coluna)
+        if coluna == COL_ACAO:
+            acao = self.acao(c)
+            return acao[1] if acao else ""
         return ""
 
     # ----- API do Qt -----
@@ -495,6 +638,8 @@ class ModeloClientes(QAbstractTableModel):
         if orientacao == Qt.Orientation.Horizontal:
             if papel == Qt.ItemDataRole.DisplayRole:
                 return COLUNAS[secao]
+            if papel == Qt.ItemDataRole.ToolTipRole:
+                return DICAS_COLUNAS.get(secao)
             if papel == Qt.ItemDataRole.TextAlignmentRole and secao == COL_MENSAGENS:
                 return int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         return None
@@ -514,6 +659,14 @@ class ModeloClientes(QAbstractTableModel):
             return self._dica(c, col)
         if papel == PAPEL_PILULA and col == COL_STATUS:
             return {"Conectado": "sucesso", "Assinante": "destaque", "Desconectado": "neutro"}.get(c.status)
+        if papel == PAPEL_PILULA and col == COL_FILA:
+            diag = self.registro.diagnostico(c)
+            return "aviso" if diag and diag.fila else None  # fila > 0: leituras atrasadas no aparelho
+        if papel == PAPEL_WIFI and col == COL_WIFI:
+            diag = self.registro.diagnostico(c)
+            return diag.rssi if diag else None
+        if papel == PAPEL_ACAO and col == COL_ACAO:
+            return self.acao(c)
         if papel == Qt.ItemDataRole.TextAlignmentRole and col == COL_MENSAGENS:
             return int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         return None
@@ -521,7 +674,7 @@ class ModeloClientes(QAbstractTableModel):
     def _ordem(self, c: Cliente, col: int):
         if col == COL_IP:
             try:
-                ip = ipaddress.ip_address(c.ip or "")
+                ip = ipaddress.ip_address(self.ip(c) or "")
                 return float(int(ip)) + (0 if ip.version == 4 else 2.0 ** 33)
             except ValueError:
                 return float("inf")
@@ -531,6 +684,15 @@ class ModeloClientes(QAbstractTableModel):
             return envio if col == COL_ULTIMO else -envio
         if col == COL_MENSAGENS:
             return -1 if c.mensagens is None else c.mensagens
+        diag = self.registro.diagnostico(c)
+        if col == COL_WIFI:  # melhor sinal primeiro em ordem decrescente; "cabo" acima de "—"
+            return -1000.0 if diag is None else (-999.0 if diag.rssi is None else float(diag.rssi))
+        if col == COL_FILA:
+            return -1 if diag is None or diag.fila is None else diag.fila
+        if col == COL_DIAG:
+            return diag.recebido_em if diag else 0.0
+        if col == COL_ACAO:
+            return f"{self.texto(c, col)}|{c.nome_exibido}".casefold()
         return self.texto(c, col).casefold()
 
     def _cor(self, c: Cliente, col: int) -> QColor | None:
@@ -539,34 +701,88 @@ class ModeloClientes(QAbstractTableModel):
             return QColor(self.paleta.erro)
         if nivel == "atrasado":
             return QColor(self.paleta.aviso)
-        if col in (COL_MAC, COL_ULTIMO, COL_HA, COL_TOPICO) and self.texto(c, col) in (SEM_VALOR, ESTE_COMPUTADOR):
+        if col in (COL_MAC, COL_ULTIMO, COL_HA, COL_TOPICO, COL_IP, COL_SERIE, COL_FIRMWARE, COL_WIFI, COL_FILA,
+                   COL_DIAG) and self.texto(c, col) in (SEM_VALOR, ESTE_COMPUTADOR, "cabo", "pedido…"):
             return QColor(self.paleta.texto_fraco)
         if c.conectado is False and col != COL_STATUS:
             return QColor(self.paleta.texto_sec)
         return None
 
     def _dica(self, c: Cliente, col: int) -> str | None:
+        diag = self.registro.diagnostico(c)
         if col == COL_NOME:
             partes = [f"Client id: {c.client_id}" if c.client_id else "Sem client id (Mosquitto não está na aba)"]
             if c.nome:
                 partes.insert(0, f"Dispositivo: {c.nome}")
             if c.usuario:
                 partes.append(f"Usuário MQTT: {c.usuario}")
+            if c.topico:
+                partes.append(f"Tópico: {c.topico}")
+            if diag is not None:
+                if diag.titulo:
+                    partes.append(f"Título no NXperience: {diag.titulo}")
+                if diag.local:
+                    partes.append(f"Localização: {diag.local}")
+                relogio = texto_relogio(diag)
+                if relogio:
+                    partes.append(relogio)
             return "\n".join(partes)
-        if col == COL_IP and c.ip:
-            return f"{c.ip}:{c.porta}" if c.porta else c.ip
+        if col == COL_IP and self.ip(c):
+            ip = f"{c.ip}:{c.porta}" if c.ip and c.porta else self.ip(c)
+            if not c.ip:
+                ip += " (informado pelo diagnóstico do aparelho)"
+            mac = self.texto_mac(c)
+            return f"{ip}\nMAC: {mac}" if mac != SEM_VALOR else ip
+        if col in (COL_SERIE, COL_FIRMWARE) and diag is not None:
+            return f"Nº de série: {diag.sn or SEM_VALOR}\nFirmware: {diag.firmware or SEM_VALOR}"
+        if col == COL_WIFI:
+            return dica_wifi(diag)
+        if col == COL_FILA and diag is not None and diag.fila is not None:
+            if diag.fila:
+                return (f"{LOCALE_BR.toString(int(diag.fila))} leitura(s) guardada(s) no aparelho esperando envio. "
+                        "Elas chegam atrasadas quando a rede voltar.")
+            return "Nenhuma leitura pendente no aparelho."
+        if col == COL_DIAG:
+            if c.nome and c.nome in self.diag_pedido:
+                return "Diagnóstico pedido; aguardando a resposta do aparelho."
+            if diag is not None:
+                return f"Último diagnóstico recebido em {formatar_epoch(diag.recebido_em)}."
+            return "Nenhum diagnóstico recebido ainda (botão Atualizar diagnóstico)." if c.nome else None
+        if col == COL_ACAO:
+            return self._dica_acao(c)
         if col == COL_MAC:
             texto = self.texto_mac(c)
             if texto == SEM_VALOR and c.ip:
                 return "Fora da tabela ARP: outra rede ou ainda não consultado (botão Atualizar MAC)."
             return None
         if col == COL_HA:
-            return DICA_INATIVIDADE.get(nivel_inatividade(self.idade(c)))
+            dica = DICA_INATIVIDADE.get(nivel_inatividade(self.idade(c)))
+            envio = f"Último envio: {formatar_epoch(c.ultimo_envio)}" if c.ultimo_envio else None
+            return "\n".join(t for t in (envio, dica) if t) or None
         if col == COL_STATUS and c.client_id and c.assinante and c.mensagens:
             return "Publica e também assina tópicos."
         if col == COL_TOPICO and c.topico:
             return c.topico
         return None
+
+
+    def _dica_acao(self, c: Cliente) -> str | None:
+        acao = self.acao(c)
+        if acao is None:
+            return None
+        cmd = self.comandos.get(c.nome)
+        estado = acao[0]
+        if estado == "enviando":
+            return f"Enviando o comando para zerar {lista_canais(cmd.canais)}; aguardando a resposta do aparelho."
+        if estado == "desabilitado":
+            return "Conecte ao broker para enviar comandos ao aparelho."
+        if estado == "ok":
+            return (f"Contadores {lista_canais(cmd.canais)} zerados às {datetime.fromtimestamp(cmd.quando):%H:%M:%S}."
+                    f"{' ' + cmd.mensagem if cmd.mensagem else ''}\nClique para zerar de novo.")
+        if estado == "falha":
+            return (f"Falhou ao zerar {lista_canais(cmd.canais)}: {cmd.mensagem or 'sem detalhe.'}\n"
+                    "Clique para tentar de novo.")
+        return "Escolher os canais (chd1 a chd6) e zerar os contadores no aparelho."
 
 
 class FiltroClientes(QSortFilterProxyModel):
@@ -655,14 +871,29 @@ def enderecos_locais() -> set[str]:
 
 # ---------------------------------------------------------------------- tela
 class PainelClientes(QWidget):
-    """Conteúdo da aba Clientes: barra (chip, Mostrar assinantes, Atualizar MAC, Exportar CSV) e a tabela."""
+    """Conteúdo da aba Clientes: barra (chip, Mostrar assinantes, Atualizar diagnóstico, Atualizar MAC, Colunas,
+    Exportar CSV) e a tabela.
+
+    Comandos: `zerar_pedido(device_id, [canais])` e `diagnostico_pedido(device_id)` (a janela liga ao bridge);
+    `registrar_log(nivel, mensagem)` vai para a caixa da aba Atividade. `executar_dialogo(dlg) -> int` e
+    `confirmar(parent, device_id, canais) -> bool` são injetáveis para testar sem diálogos modais.
+    """
+
+    zerar_pedido = Signal(str, list)
+    diagnostico_pedido = Signal(str)
+    registrar_log = Signal(str, str)
 
     def __init__(self, parent: QWidget | None = None, relogio: Callable[[], float] | None = None,
-                 executor_arp: Callable[[], str] | None = None, locais: set[str] | None = None):
+                 executor_arp: Callable[[], str] | None = None, locais: set[str] | None = None,
+                 settings: QSettings | None = None):
         super().__init__(parent)
         self.setObjectName("paginaAba")
         self._relogio = relogio or time.time
         self._locais = set(locais) if locais is not None else enderecos_locais()
+        self._settings = settings
+        self.executar_dialogo: Callable[[QDialog], int] = lambda dlg: dlg.exec()
+        self.confirmar: Callable[[QWidget | None, str, list[int]], bool] | None = None
+        self.ultimo_dialogo: DialogoZerarContadores | None = None
         self.registro = RegistroClientes()
         self.modelo = ModeloClientes(self.registro, self._relogio, lambda: self._locais, self)
         self.filtro = FiltroClientes(self)
@@ -682,22 +913,31 @@ class PainelClientes(QWidget):
         self.opcao_assinantes = QCheckBox("Mostrar assinantes", self)
         self.opcao_assinantes.setToolTip("Mostra também quem só assina tópicos: este programa e o mosquitto_sub.")
         self.opcao_assinantes.toggled.connect(self._ao_mostrar_assinantes)
+        self.botao_diag = self._botao("Atualizar diagnóstico", "")
         self.botao_mac = self._botao("Atualizar MAC", "Consultar agora a tabela ARP do Windows (arp -a).")
+        self.botao_colunas = self._botao("Colunas", "Escolher as colunas visíveis (também no clique direito no "
+                                                    "cabeçalho da tabela).")
         self.botao_exportar = self._botao("Exportar CSV…", "Salvar a lista em um arquivo .csv (abre no Excel).")
+        self.botao_diag.clicked.connect(self.atualizar_diagnosticos)
         self.botao_mac.clicked.connect(self.atualizar_mac)
         self.botao_exportar.clicked.connect(self.exportar_dialogo)
+        self.menu_colunas = QMenu(self)
+        self.menu_colunas.aboutToShow.connect(self._montar_menu_colunas)
+        self.botao_colunas.setMenu(self.menu_colunas)
         barra.addWidget(self.chip_enviando)
         barra.addSpacing(8)
         barra.addWidget(self.opcao_assinantes)
         barra.addStretch(1)
+        barra.addWidget(self.botao_diag)
         barra.addWidget(self.botao_mac)
+        barra.addWidget(self.botao_colunas)
         barra.addWidget(self.botao_exportar)
 
         self.tabela = QTableView(self)
         self.tabela.setObjectName("tabelaDados")
         self.tabela.setAccessibleName("Lista de clientes")
         fonte = self.tabela.font()
-        fonte.setPointSizeF(9.0)  # tabela densa: 8 colunas
+        fonte.setPointSizeF(9.0)  # tabela densa: até 14 colunas
         self.tabela.setFont(fonte)
         self.tabela.setModel(self.filtro)
         self.tabela.setSortingEnabled(True)
@@ -720,8 +960,26 @@ class PainelClientes(QWidget):
         # ocupa a sobra. Em janela estreita aparece a barra de rolagem horizontal (nada é espremido).
         cab.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         cab.setStretchLastSection(True)
+        for posicao, col in enumerate(ORDEM_VISUAL):
+            cab.moveSection(cab.visualIndex(col), posicao)
         self.delegado = DelegadoPilula(self.tabela)
         self.tabela.setItemDelegateForColumn(COL_STATUS, self.delegado)
+        self.tabela.setItemDelegateForColumn(COL_FILA, self.delegado)
+        self.delegado_wifi = DelegadoWifi(self.tabela)
+        self.tabela.setItemDelegateForColumn(COL_WIFI, self.delegado_wifi)
+        # Botão da linha desenhado pelo delegate: lê o estado do índice, então segue a linha certa com ordenação e
+        # filtro (setIndexWidget ficaria preso à posição visual).
+        self.delegado_acao = DelegadoAcao(self.tabela)
+        self.delegado_acao.acionado.connect(self._ao_acionar)
+        self.tabela.setItemDelegateForColumn(COL_ACAO, self.delegado_acao)
+        self.tabela.setMouseTracking(True)  # hover do botão
+        self.tabela.entered.connect(self._ao_passar)
+        self.tabela.activated.connect(self._ao_ativar)  # Enter/duplo clique na célula de ação
+        self.tabela.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.tabela.customContextMenuRequested.connect(self._menu_linha)
+        cab.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        cab.customContextMenuRequested.connect(self._menu_cabecalho)
+        self._restaurar_colunas()
 
         self.vazio = QLabel(self)
         self.vazio.setObjectName("estadoVazio")
@@ -750,6 +1008,7 @@ class PainelClientes(QWidget):
         self._ajustar_colunas()
         self._atualizar_vazio()
         self._atualizar_chip()
+        self._atualizar_botao_diag()
 
     def _botao(self, texto: str, dica: str) -> QPushButton:
         b = QPushButton(texto, self)
@@ -758,9 +1017,9 @@ class PainelClientes(QWidget):
         b.setCursor(Qt.CursorShape.PointingHandCursor)
         return b
 
-    LARGURA_MAX = {COL_NOME: 180, COL_IP: 140, COL_MAC: 160, COL_ULTIMO: 160, COL_HA: 160, COL_TOPICO: 150,
-                   COL_STATUS: 100}
-    LARGURA_MIN = {COL_MAC: 124}  # o MAC nunca aparece cortado
+    LARGURA_MAX = {COL_NOME: 170, COL_IP: 120, COL_MAC: 140, COL_ULTIMO: 150, COL_HA: 150, COL_TOPICO: 170,
+                   COL_STATUS: 110, COL_SERIE: 100, COL_FIRMWARE: 90, COL_WIFI: 100, COL_FILA: 120, COL_DIAG: 100}
+    LARGURA_MIN = {COL_MAC: 124, COL_ACAO: 144}  # o MAC e o botão nunca aparecem cortados
 
     def _ajustar_colunas(self, *_args) -> None:
         """Ajusta ao conteúdo (cabeçalho incluso), com teto por coluna para caber na janela."""
@@ -770,6 +1029,8 @@ class PainelClientes(QWidget):
         fonte.setWeight(QFont.Weight.DemiBold)
         metricas = QFontMetrics(fonte)
         for col in range(len(COLUNAS)):
+            if self.tabela.isColumnHidden(col):
+                continue
             texto_cab = metricas.horizontalAdvance(COLUNAS[col]) + 16
             conteudo = self.tabela.sizeHintForColumn(col) if self.filtro.rowCount() else 0
             largura = max(texto_cab, conteudo, self.LARGURA_MIN.get(col, 0))
@@ -789,13 +1050,217 @@ class PainelClientes(QWidget):
         self._aplicar(self.registro.dispositivo_visto(device_id, topico, epoch_de_iso(iso, agora)))
 
     def tique(self) -> None:
-        """A cada 1 s (timer da janela): "Há quanto tempo", cores de inatividade e o chip."""
+        """A cada 1 s (timer da janela): "Há quanto tempo", cores de inatividade, o chip e os comandos sem
+        resposta há mais de `TEMPO_SEM_RESPOSTA_S` (o core responde em até 15 s; isto é só uma rede de proteção)."""
+        agora = self._relogio()
+        for device, cmd in list(self.modelo.comandos.items()):
+            if cmd.estado == "enviando" and agora - cmd.quando > TEMPO_SEM_RESPOSTA_S:
+                # Nenhum resposta_comando chegou: o core não registrou nada, então a tela avisa na Atividade.
+                self._resultado_zerar(device, False, f"Sem resposta do integrador em {TEMPO_SEM_RESPOSTA_S} s.")
+                alvo = f"{lista_canais(cmd.canais)} em {device}" if cmd.canais else device
+                self.registrar_log.emit("AVISO", f"Zerar contadores {alvo}: sem resposta do integrador em "
+                                                 f"{TEMPO_SEM_RESPOSTA_S} s; o resultado é desconhecido.")
+        for device, quando in list(self.modelo.diag_pedido.items()):
+            if agora - quando > TEMPO_SEM_RESPOSTA_S:
+                del self.modelo.diag_pedido[device]
         self.modelo.atualizar_tudo()
         self._atualizar_chip()
 
     def definir_paleta(self, p: Paleta) -> None:
         self.modelo.definir_paleta(p)
         self.delegado.definir_paleta(p)
+        self.delegado_wifi.definir_paleta(p)
+        self.delegado_acao.definir_paleta(p)
+        self.tabela.viewport().update()
+
+    # ----- DigiRail: diagnóstico, canais e comandos -----
+    def definir_conectado(self, conectado: bool) -> None:
+        """Comandos só com o integrador conectado ao broker (a janela chama a cada mudança de estado)."""
+        self.modelo.conectado = bool(conectado)
+        self.modelo.atualizar_tudo()
+        self._atualizar_botao_diag()
+
+    def ao_diagnostico(self, device_id: str, texto_json: str) -> None:
+        diag = interpretar_diag(texto_json, self._relogio())
+        self.modelo.diag_pedido.pop(device_id, None)
+        self._aplicar(self.registro.registrar_diagnostico(device_id, diag))
+        self._ajustar_colunas()
+
+    def ao_canais_vistos(self, device_id: str, texto_json: str) -> None:
+        try:
+            nomes = json.loads(texto_json)
+        except (TypeError, ValueError):
+            nomes = []
+        self.registro.registrar_canais(device_id, numeros_canais(nomes if isinstance(nomes, list) else []))
+
+    def ao_resposta_comando(self, device_id: str, comando: str, sucesso: bool, mensagem: str) -> None:
+        if comando == "reset_counters":
+            self._resultado_zerar(device_id, sucesso, mensagem)
+        elif comando == "diag":
+            self.modelo.diag_pedido.pop(device_id, None)
+            if not sucesso:
+                self.registrar_log.emit("AVISO", f"Diagnóstico de {device_id} falhou: {mensagem}")
+            self.modelo.atualizar_dispositivo(device_id)
+
+    def dispositivos_listados(self) -> list[str]:
+        """device_ids das linhas visíveis (na ordem da tabela)."""
+        nomes = []
+        for r in range(self.filtro.rowCount()):
+            c = self.modelo.cliente(self.filtro.mapToSource(self.filtro.index(r, 0)).row())
+            if c.nome and c.nome not in nomes:
+                nomes.append(c.nome)
+        return nomes
+
+    def atualizar_diagnosticos(self) -> None:
+        dispositivos = self.dispositivos_listados()
+        if not self.modelo.conectado or not dispositivos:
+            return
+        for device in dispositivos:
+            self._pedir_diagnostico(device)
+        n = len(dispositivos)
+        self.registrar_log.emit("INFO", f"Pedindo diagnóstico a {n} dispositivo{'s' if n != 1 else ''}.")
+
+    def pedir_diagnostico(self, device_id: str) -> None:
+        if self.modelo.conectado and device_id:
+            self._pedir_diagnostico(device_id)
+            self.registrar_log.emit("INFO", f"Pedindo diagnóstico a {device_id}.")
+
+    def _pedir_diagnostico(self, device_id: str) -> None:
+        self.modelo.diag_pedido[device_id] = self._relogio()
+        self.modelo.atualizar_dispositivo(device_id)
+        self.diagnostico_pedido.emit(device_id)
+
+    def zerar(self, device_id: str) -> bool:
+        """Abre o diálogo de canais; confirmado, envia e põe a linha em "Zerando…". Devolve True se enviou."""
+        acao = next((self.modelo.acao(c) for c in self.registro.linhas if c.nome == device_id), None)
+        if not acao or acao[0] not in DelegadoAcao.CLICAVEIS:
+            return False
+        dlg = DialogoZerarContadores(device_id, self.registro.canais.get(device_id, []), self,
+                                     confirmar=self.confirmar)
+        self.ultimo_dialogo = dlg
+        try:
+            if self.executar_dialogo(dlg) != QDialog.DialogCode.Accepted:
+                return False
+            canais = dlg.canais_escolhidos()
+        finally:
+            dlg.deleteLater()
+        if not canais or not self.modelo.conectado:
+            return False
+        self.modelo.comandos[device_id] = EstadoComando("enviando", self._relogio(), canais)
+        self.modelo.atualizar_dispositivo(device_id)
+        self.zerar_pedido.emit(device_id, list(canais))  # o log do envio e do resultado vem do core
+        return True
+
+    def _resultado_zerar(self, device_id: str, sucesso: bool, mensagem: str) -> None:
+        anterior = self.modelo.comandos.get(device_id)
+        canais = anterior.canais if anterior else []
+        self.modelo.comandos[device_id] = EstadoComando("ok" if sucesso else "falha", self._relogio(), canais,
+                                                        str(mensagem or ""))
+        # Só a linha da tabela muda: o log do resultado na Atividade vem do core (evita linha duplicada).
+        self.modelo.atualizar_dispositivo(device_id)
+
+    def _cliente_do_proxy(self, indice: QModelIndex) -> Cliente | None:
+        if not indice.isValid():
+            return None
+        fonte = self.filtro.mapToSource(indice)
+        return self.modelo.cliente(fonte.row()) if fonte.isValid() else None
+
+    def _ao_acionar(self, indice: QModelIndex) -> None:
+        c = self._cliente_do_proxy(indice)
+        if c is not None and c.nome:
+            self.zerar(c.nome)
+
+    def _ao_ativar(self, indice: QModelIndex) -> None:
+        if indice.column() == COL_ACAO:
+            self._ao_acionar(indice)
+
+    def _ao_passar(self, indice: QModelIndex) -> None:
+        acao = indice.data(PAPEL_ACAO) if indice.column() == COL_ACAO else None
+        if acao and acao[0] in DelegadoAcao.CLICAVEIS:
+            self.tabela.viewport().setCursor(Qt.CursorShape.PointingHandCursor)
+        else:
+            self.tabela.viewport().unsetCursor()
+
+    def menu_da_linha(self, indice: QModelIndex) -> QMenu | None:
+        """Menu de contexto de uma linha (índice do proxy). Exposto para testes."""
+        c = self._cliente_do_proxy(indice)
+        if c is None:
+            return None
+        menu = QMenu(self)
+        conectado = self.modelo.conectado
+        acao = self.modelo.acao(c)
+        zerar = menu.addAction("Zerar contadores…")
+        zerar.setEnabled(bool(acao) and acao[0] in DelegadoAcao.CLICAVEIS)
+        zerar.triggered.connect(lambda: self.zerar(c.nome))
+        diag = menu.addAction("Atualizar diagnóstico deste dispositivo")
+        diag.setEnabled(bool(c.nome) and conectado)
+        diag.triggered.connect(lambda: self.pedir_diagnostico(c.nome))
+        if not conectado:
+            for a in (zerar, diag):
+                a.setToolTip("Conecte ao broker para enviar comandos.")
+        menu.setToolTipsVisible(True)
+        menu.addSeparator()
+        ip = self.modelo.ip(c)
+        copiar_ip = menu.addAction("Copiar IP")
+        copiar_ip.setEnabled(bool(ip))
+        copiar_ip.triggered.connect(lambda: QApplication.clipboard().setText(ip or ""))
+        return menu
+
+    def _menu_linha(self, pos: QPoint) -> None:
+        menu = self.menu_da_linha(self.tabela.indexAt(pos))
+        if menu is not None:
+            menu.exec(self.tabela.viewport().mapToGlobal(pos))
+            menu.deleteLater()
+
+    def _atualizar_botao_diag(self) -> None:
+        if not self.modelo.conectado:
+            self.botao_diag.setEnabled(False)
+            self.botao_diag.setToolTip("Conecte ao broker para pedir o diagnóstico aos aparelhos.")
+        elif not self.dispositivos_listados():
+            self.botao_diag.setEnabled(False)
+            self.botao_diag.setToolTip("Nenhum dispositivo com nome (device_id) na lista ainda.")
+        else:
+            self.botao_diag.setEnabled(True)
+            self.botao_diag.setToolTip("Pedir agora o diagnóstico (série, firmware, Wi-Fi, fila e IP) a todos os "
+                                       "dispositivos listados.")
+
+    # ----- colunas visíveis -----
+    def colunas_ocultas(self) -> list[int]:
+        return [c for c in range(len(COLUNAS)) if self.tabela.isColumnHidden(c)]
+
+    def definir_coluna_visivel(self, coluna: int, visivel: bool) -> None:
+        if coluna in COLUNAS_FIXAS:
+            return
+        self.tabela.setColumnHidden(coluna, not visivel)
+        if visivel:
+            self._ajustar_colunas()
+        if self._settings is not None:
+            self._settings.setValue(CHAVE_COLUNAS_OCULTAS, [COLUNAS[c] for c in self.colunas_ocultas()])
+
+    def _restaurar_colunas(self) -> None:
+        ocultas = set(OCULTAS_PADRAO)
+        if self._settings is not None and self._settings.contains(CHAVE_COLUNAS_OCULTAS):
+            valor = self._settings.value(CHAVE_COLUNAS_OCULTAS) or []
+            nomes = [valor] if isinstance(valor, str) else list(valor)
+            ocultas = {COLUNAS.index(n) for n in nomes if n in COLUNAS} - set(COLUNAS_FIXAS)
+        for col in range(len(COLUNAS)):
+            self.tabela.setColumnHidden(col, col in ocultas)
+
+    def _menu_cabecalho(self, pos: QPoint) -> None:
+        menu = self._montar_menu_colunas(QMenu(self))
+        menu.exec(self.tabela.horizontalHeader().mapToGlobal(pos))
+        menu.deleteLater()
+
+    def _montar_menu_colunas(self, menu: QMenu | None = None) -> QMenu:
+        menu = self.menu_colunas if menu is None else menu
+        menu.clear()
+        for col in ORDEM_VISUAL:
+            acao = menu.addAction(COLUNAS[col])
+            acao.setCheckable(True)
+            acao.setChecked(not self.tabela.isColumnHidden(col))
+            acao.setEnabled(col not in COLUNAS_FIXAS)
+            acao.toggled.connect(lambda marcado, c=col: self.definir_coluna_visivel(c, marcado))
+        return menu
 
     def atualizar_mac(self) -> None:
         self.arp.consultar()
@@ -813,6 +1278,7 @@ class PainelClientes(QWidget):
         if novos:
             self._timer_ip_novo.start()
         self._atualizar_chip()
+        self._atualizar_botao_diag()
 
     def _ao_arp(self, macs: dict) -> None:
         self.modelo.definir_macs(macs)
@@ -825,6 +1291,7 @@ class PainelClientes(QWidget):
     def _ao_mostrar_assinantes(self, mostrar: bool) -> None:
         self.filtro.definir_mostrar_assinantes(mostrar)
         self._atualizar_vazio()
+        self._atualizar_botao_diag()
 
     def enviando(self) -> int:
         agora = self._relogio()
@@ -860,11 +1327,13 @@ class PainelClientes(QWidget):
         return linhas
 
     def exportar_csv(self, caminho: Path) -> Path:
+        """Colunas originais na ordem de sempre, client id e depois as do diagnóstico (todas, mesmo ocultas)."""
         caminho = Path(caminho)
         with caminho.open("w", encoding="utf-8-sig", newline="") as f:
             w = csv.writer(f, delimiter=";")
-            w.writerow([*COLUNAS, "Client id"])
-            w.writerows(self.linhas_visiveis())
+            w.writerow([*(COLUNAS[c] for c in COLUNAS_CSV), "Client id", *(COLUNAS[c] for c in COLUNAS_CSV_DIAG)])
+            for valores in self.linhas_visiveis():
+                w.writerow([*(valores[c] for c in COLUNAS_CSV), valores[-1], *(valores[c] for c in COLUNAS_CSV_DIAG)])
         return caminho
 
     def exportar_dialogo(self) -> None:

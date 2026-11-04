@@ -323,8 +323,10 @@ def test_exportar_csv(novo_painel, tmp_path):
     caminho = painel.exportar_csv(tmp_path / "clientes.csv")
     with caminho.open(encoding="utf-8-sig", newline="") as f:
         linhas = list(csv.reader(f, delimiter=";"))
-    assert linhas[0] == ["Nome", "IP", "MAC", "Último envio", "Há quanto tempo", "Tópico", "Status", "Mensagens",
-                         "Client id"]
+    # as 9 colunas de sempre nas mesmas posições; as do diagnóstico do DigiRail vêm depois
+    assert linhas[0][:9] == ["Nome", "IP", "MAC", "Último envio", "Há quanto tempo", "Tópico", "Status", "Mensagens",
+                             "Client id"]
+    assert linhas[0][9:] == ["Nº série", "Firmware", "Wi-Fi", "Fila no aparelho", "Diagnóstico"]
     por_nome = {l[0]: l for l in linhas[1:]}
     assert set(por_nome) == {"Teste_Alumbra", "NOVUS_B"}
     assert por_nome["Teste_Alumbra"][1] == "192.168.100.50"

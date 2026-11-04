@@ -5,7 +5,7 @@ Regra: cada +1 no contador de erros do pipeline gera exatamente um registro, e n
 Formato de cada registro (um objeto JSON por linha, UTF-8)::
 
     {"quando": "AAAA-MM-DDTHH:MM:SS" (hora local),
-     "categoria": "payload" | "sql" | "contingencia" | "mqtt" | "fila",
+     "categoria": "payload" | "sql" | "contingencia" | "mqtt" | "fila" | "comando",
      "mensagem": str, "topico": str | null, "detalhe": str | null,
      "payload": str | null (no máximo 2000 caracteres)}
 
@@ -24,7 +24,7 @@ from typing import Callable
 from app.config import pasta_base
 from app.core.sql_conexao import mascarar
 
-CATEGORIAS = ("payload", "sql", "contingencia", "mqtt", "fila")
+CATEGORIAS = ("payload", "sql", "contingencia", "mqtt", "fila", "comando")
 CHAVES = ("quando", "categoria", "mensagem", "topico", "detalhe", "payload")
 MAX_PAYLOAD = 2000
 

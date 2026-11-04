@@ -56,8 +56,9 @@ Formatos aceitos
 Regras de cada coluna
 ---------------------
 - ``pid``: inteiro (aceita ``"17"`` e ``17.0``), dentro da faixa do ``bigint``.
-- ``device_id``: texto de até 100 caracteres. Se faltar no payload, usa o nível do tópico após o prefixo assinado
-  (``NOVUS/Teste_Alumbra/#`` + ``NOVUS/Teste_Alumbra/N1/dados`` → ``N1``), se ``device_do_topico`` for verdadeiro.
+- ``device_id``: texto de até 100 caracteres. Se faltar no payload (e ``device_do_topico`` for verdadeiro), usa o
+  ``{id}`` do padrão NOVUS (``NOVUS/{id}/events``, ``.../ack/command``...); fora desse padrão, o nível do tópico após
+  o prefixo assinado (``NOVUS/Teste_Alumbra/#`` + ``NOVUS/Teste_Alumbra/N1/dados`` → ``N1``).
 - ``ts_unix``: epoch em **segundos** (UTC). Aceita s, ms, µs e ns (pela magnitude), texto de dígitos, ISO 8601
   (com fuso, ou sem fuso interpretado conforme ``fuso_sem_offset``) e ``dd/mm/aaaa hh:mm[:ss]``. Só aceita
   valores entre 2000-01-01 e o ano 3000.
@@ -67,6 +68,20 @@ Regras de cada coluna
 - ``payload_json``: o texto original da mensagem, igual para todas as linhas da mesma mensagem. Payload binário
   vira ``"base64:..."``.
 - ``recebido_em``: hora em que o app recebeu a mensagem, em **UTC** sem fuso, com milissegundos.
+
+Classificação das mensagens (NOVUS DigiRail; ``classificar``)
+------------------------------------------------------------
+Antes de mapear, cada objeto JSON é classificado (ver docs/digirail_iot_mqtt.md, seção 3.8):
+
+- ``"leitura"``: tem ``channels``, ou é um formato genérico (nenhuma das regras abaixo). Segue o mapeamento.
+- ``"evento"``: tem ``events`` (borda de um canal digital no modo Evento). Não é leitura, não grava, não é erro.
+- ``"resposta"``: tem ``reported`` ou ``desired``, ou chegou num tópico ``.../ack/command`` ou ``.../ack/config``
+  (mesmo com JSON ilegível). Não é leitura nem erro; ``diag`` e ``reset_counters`` são tratados no pipeline.
+
+Para eventos e respostas, ``ResultadoMapa`` traz ``tipo``, ``objeto`` (o JSON) e ``device_id`` (do payload ou do
+``{id}`` do tópico), sem linhas.
+
+``pid`` no DigiRail é o código do modelo do produto (constante), não número de pacote: não serve como chave.
 
 Nenhum valor é inventado. Se faltar ``pid``, ``device_id`` ou ``ts_unix`` (ou se forem inválidos), a linha sai com
 ``motivo`` preenchido e vai para a contingência, não para o banco. O mesmo vale para JSON quebrado, binário e
@@ -91,9 +106,12 @@ from app.core.parser import (
     _json_loads,
     _parece_binario,
     dispositivo_do_topico,
+    dispositivo_novus,
     hex_abreviado,
     trecho,
 )
+
+LEITURA, EVENTO, RESPOSTA = "leitura", "evento", "resposta"
 
 MAX_DEVICE_ID = 100
 BIGINT_MIN, BIGINT_MAX = -(2**63), 2**63 - 1
@@ -158,6 +176,9 @@ class ResultadoMapa:
     linhas: list[LinhaIot] = field(default_factory=list)   # completas e incompletas, na ordem
     avisos: list[str] = field(default_factory=list)
     erro: str | None = None           # só para mensagem ignorada (payload vazio)
+    tipo: str = LEITURA               # "leitura" | "evento" | "resposta" (ver classificar)
+    objeto: Any = None                # JSON decodificado (dict/list) quando o payload é JSON válido
+    device_id: str | None = None      # eventos e respostas: device_id do payload ou {id} do tópico
 
     @property
     def ok(self) -> bool:
@@ -532,6 +553,40 @@ def _tabular(m: _Montador, texto: str) -> str:
     return "tabular"
 
 
+def topico_de_resposta(topico: str) -> bool:
+    """``.../ack/command`` ou ``.../ack/config`` (Command Ack / Config Ack do DigiRail)."""
+    niveis = (topico or "").split("/")
+    return len(niveis) >= 2 and niveis[-2] == "ack" and niveis[-1] in ("command", "config")
+
+
+def classificar(topico: str, obj: Any) -> str:
+    """Tipo da mensagem: ``"leitura"``, ``"evento"`` ou ``"resposta"`` (ponto único da regra; ver docstring).
+
+    ``obj`` é o JSON decodificado (ou None se não for JSON válido). Formatos desconhecidos são ``"leitura"``
+    (seguem o mapeamento, e o que hoje é erro de payload continua erro).
+    """
+    if topico_de_resposta(topico):
+        return RESPOSTA
+    if not isinstance(obj, dict):
+        return LEITURA
+    chaves = {_norm(k) for k in obj}
+    if "channels" in chaves:
+        return LEITURA
+    if "events" in chaves:
+        return EVENTO
+    if "reported" in chaves or "desired" in chaves:
+        return RESPOSTA
+    return LEITURA
+
+
+def _device_da_mensagem(obj: Any, topico: str, assinatura: str | None) -> str | None:
+    if isinstance(obj, dict):
+        achou, valor = _resolver(obj, "device_id")
+        if achou and isinstance(valor, (str, int)) and not isinstance(valor, bool) and str(valor).strip():
+            return str(valor).strip()[:MAX_DEVICE_ID]
+    return dispositivo_novus(topico) or dispositivo_do_topico(topico, assinatura)
+
+
 def mapear(topico: str, payload: bytes | bytearray | str, recebido_em: datetime | None = None,
            assinatura: str | None = None, cfg: MapeamentoConfig | None = None) -> ResultadoMapa:
     """Mensagem → linhas da IOT001. Nunca levanta exceção."""
@@ -541,6 +596,8 @@ def mapear(topico: str, payload: bytes | bytearray | str, recebido_em: datetime 
     device_topico = dispositivo_do_topico(topico, assinatura)
 
     if not dados.strip():
+        if topico_de_resposta(topico):  # ex.: limpeza de mensagem retida no tópico de resposta
+            return ResultadoMapa("vazio", tipo=RESPOSTA, device_id=_device_da_mensagem(None, topico, assinatura))
         return ResultadoMapa("vazio", erro="payload vazio")
 
     try:
@@ -549,6 +606,8 @@ def mapear(topico: str, payload: bytes | bytearray | str, recebido_em: datetime 
     except UnicodeDecodeError:
         texto, binario = "", True
 
+    if binario and topico_de_resposta(topico):
+        return ResultadoMapa("binário", tipo=RESPOSTA, device_id=_device_da_mensagem(None, topico, assinatura))
     if binario:
         m = _Montador(cfg, topico, "base64:" + base64.b64encode(dados).decode("ascii"), recebido, device_topico)
         m.rejeitar(f"payload binário (não é texto UTF-8): {hex_abreviado(dados)}")
@@ -561,11 +620,18 @@ def mapear(topico: str, payload: bytes | bytearray | str, recebido_em: datetime 
             try:
                 obj = _json_loads(t)
             except _JSONDecodeError as exc:
+                if topico_de_resposta(topico):  # resposta ilegível (o manual tem exemplos com vírgula sobrando)
+                    return ResultadoMapa("JSON", tipo=RESPOSTA, avisos=[f"resposta com JSON inválido ({exc})"],
+                                         device_id=_device_da_mensagem(None, topico, assinatura))
                 m.rejeitar(f"JSON inválido ({exc})")
                 return ResultadoMapa("JSON", m.linhas, m.avisos)
+            tipo = classificar(topico, obj)
+            if tipo != LEITURA:
+                return ResultadoMapa("JSON", tipo=tipo, objeto=obj,
+                                     device_id=_device_da_mensagem(obj, topico, assinatura))
             if isinstance(obj, dict):
                 m.objeto(obj)
-                return ResultadoMapa("JSON", m.linhas, m.avisos)
+                return ResultadoMapa("JSON", m.linhas, m.avisos, objeto=obj)
             if not obj:
                 m.rejeitar("lista JSON vazia")
             for i, item in enumerate(obj):
@@ -573,7 +639,9 @@ def mapear(topico: str, payload: bytes | bytearray | str, recebido_em: datetime 
                     m.objeto(item)
                 else:
                     m.rejeitar(f"item {i} da lista JSON não é um objeto: {trecho(str(item), 30)!r}")
-            return ResultadoMapa("JSON lista", m.linhas, m.avisos)
+            return ResultadoMapa("JSON lista", m.linhas, m.avisos, objeto=obj)
+        if topico_de_resposta(topico):
+            return ResultadoMapa("texto", tipo=RESPOSTA, device_id=_device_da_mensagem(None, topico, assinatura))
         formato = _tabular(m, t)
         return ResultadoMapa(formato, m.linhas, m.avisos)
     except Exception as exc:  # noqa: BLE001 - payload estranho nunca derruba a thread

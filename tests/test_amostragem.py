@@ -1,4 +1,5 @@
-"""Amostragem de gravação (1 leitura por device_id a cada ciclo alinhado ao relógio) e os avisos de atividade.
+"""Amostragem de gravação (1 leitura por device_id por minuto de ts_unix, gravada no ciclo alinhado ao relógio)
+e os avisos de atividade.
 
 Sem broker e sem esperar 60 s: o cliente MQTT é falso (as mensagens são entregues direto em ``ao_mensagem``) e o
 relógio do pipeline é injetado; o teste avança o relógio e espera a thread de processamento reagir.
@@ -45,23 +46,39 @@ class ClienteFalso:
     def __init__(self, broker, porta, topico, qos, ao_mensagem, ao_status, logar, **_kw) -> None:
         self.ao_mensagem = ao_mensagem
         self.ao_status = ao_status
+        self.topico = topico
+        self.publicados: list[tuple[str, str, int]] = []
+        self.assinaturas_extras: list[str] = []
+        self.falhar_publicacao: str | None = None
         ClienteFalso.ultimo = self
 
     def iniciar(self) -> None:
         self.ao_status("conectado", "Conectado (falso)")
 
+    def publicar(self, topico: str, payload: str, qos: int = 1) -> tuple[bool, str]:
+        if self.falhar_publicacao:
+            return False, self.falhar_publicacao
+        self.publicados.append((topico, payload, qos))
+        return True, ""
+
+    def assinar_extra(self, filtro: str, qos: int = 1) -> None:
+        if filtro not in self.assinaturas_extras:
+            self.assinaturas_extras.append(filtro)
+
     def parar(self) -> None:
         pass
 
-    def entregar(self, topico: str, payload: dict | bytes) -> None:
+    def entregar(self, topico: str, payload: dict | bytes, retida: bool = False) -> None:
         if isinstance(payload, dict):
             payload = json.dumps(payload).encode()
-        self.ao_mensagem(topico, payload, 1, False)
+        self.ao_mensagem(topico, payload, 1, retida)
 
 
-def novus(pid: int, device: str = "Teste_Alumbra", chd1: float = 1.0) -> dict:
+def novus(pid: int, device: str = "Teste_Alumbra", chd1: float = 1.0, ts: int | None = None) -> dict:
+    """Leitura NOVUS; sem ``ts``, ``timestamp`` = 1793386748 + pid (2026-10-30, distinto por pid)."""
     return {"pid": pid, "device_id": device,
-            "channels": {"timestamp": 1793386748 + pid, "chd1_value": chd1, "chd2_value": 2, "chd3_value": 0}}
+            "channels": {"timestamp": 1793386748 + pid if ts is None else int(ts), "chd1_value": chd1,
+                         "chd2_value": 2, "chd3_value": 0}}
 
 
 def esperar(cond, timeout: float = 5.0) -> bool:
@@ -106,6 +123,7 @@ def _config(tmp_path, sql: SqlServerConfig | None = None, intervalo: int = 60) -
     cfg.gravacao.pasta_contingencia = str(tmp_path / "contingencia")
     cfg.gravacao.pasta_logs = str(tmp_path / "logs")
     cfg.gravacao.intervalo_gravacao_segundos = intervalo
+    cfg.dispositivos.diagnostico_minutos = 0   # diagnóstico automático testado em test_digirail.py
     return cfg
 
 
@@ -167,15 +185,22 @@ def test_iso_local():
     assert iso_local(t) == "2026-11-03T14:31:05"
 
 
-def test_amostragem_empate_fica_com_a_ultima_que_chegou():
-    a = _Amostragem()
-    r = datetime(2026, 11, 3, 17, 31, 0)
-    linhas = [LinhaIot(i, "D", 1, None, None, None, "{}", r, "t") for i in (1, 2, 3)]
-    a.adicionar(linhas)
-    a.adicionar([LinhaIot(9, "D", 1, None, None, None, "{}", datetime(2026, 11, 3, 17, 30, 59), "t")])  # mais velha
-    pendentes, recebidas = a.retirar()
-    assert [l.pid for l in pendentes] == [3] and recebidas == 4
-    assert a.retirar() == ([], 0)
+def _l(pid: int, ts: int, dev: str = "D") -> LinhaIot:
+    return LinhaIot(pid, dev, ts, None, None, None, "{}", datetime(2026, 11, 3, 17, 31, 0), "t")
+
+
+def test_amostragem_maior_ts_do_minuto_vence_e_mesmo_ts_e_duplicata():
+    a = _Amostragem(60)
+    m = 1793386740                                    # início de um minuto (múltiplo de 60)
+    assert a.adicionar([_l(1, m + 10), _l(2, m + 50), _l(3, m + 30)], m + 100) == 0
+    assert a.adicionar([_l(9, m + 50)], m + 100) == 1  # mesmo (device, ts): duplicata, não substitui
+    normais, recuperados, dup = a.retirar(m + 60, m + 61)
+    assert [b.linha.pid for b in normais] == [2] and recuperados == []
+    assert normais[0].recebidas == 3 and dup == 1
+    assert a.retirar(m + 120, m + 121) == ([], [], 0)
+    # minuto já gravado: qualquer leitura dele (ou o mesmo ts) é duplicata
+    assert a.adicionar([_l(4, m + 59), _l(5, m + 50)], m + 130) == 2
+    assert a.pendentes == 0
 
 
 # ------------------------------------------------------------------------------------------ pipeline
@@ -185,7 +210,7 @@ def test_seis_leituras_do_mesmo_device_gravam_so_a_mais_recente(montar, inicio):
     p, cli, relogio, ev, conexao = montar()
     for i in range(6):                                   # uma a cada 10 s, como o NOVUS
         relogio.ir(inicio + 5 + 10 * i)
-        cli.entregar("NOVUS/Teste_Alumbra/events", novus(100 + i, chd1=i))
+        cli.entregar("NOVUS/Teste_Alumbra/events", novus(100 + i, chd1=i, ts=inicio + 4 + 10 * i))
     assert esperar(lambda: len(ev.com("Mensagem de NOVUS/Teste_Alumbra/events")) == 6)
     assert _linhas(conexao) == []                        # nada antes da virada (nem por lote_segundos)
 
@@ -206,7 +231,7 @@ def test_dois_devices_gravam_uma_linha_cada(montar, inicio):
     p, cli, relogio, ev, conexao = montar()
     for i, dev in enumerate(["A", "B", "A", "B", "A"]):
         relogio.ir(inicio + 1 + i)
-        cli.entregar(f"NOVUS/Teste_Alumbra/{dev}", novus(i, device=dev))
+        cli.entregar(f"NOVUS/Teste_Alumbra/{dev}", novus(i, device=dev, ts=inicio + i))
     assert esperar(lambda: len(ev.com("Mensagem de")) == 5)
     relogio.ir(inicio + 60)
     assert esperar(lambda: ev.com("Gravação "))
@@ -223,18 +248,31 @@ def test_janela_sem_leitura_nao_grava_nada(montar, inicio):
     assert p.contadores == (0, 0, 0)
 
 
-def test_mensagem_depois_da_virada_vai_para_a_janela_seguinte(montar, inicio):
-    """A thread pode ver a mensagem nova antes de notar a virada: a janela anterior fecha primeiro."""
+def test_minuto_corrente_espera_o_proximo_ciclo(montar, inicio):
+    """Leitura do minuto que acabou de começar (ts depois da virada) não vai no ciclo da virada."""
     p, cli, relogio, ev, conexao = montar()
     relogio.ir(inicio + 10)
-    cli.entregar("NOVUS/Teste_Alumbra/events", novus(1))
+    cli.entregar("NOVUS/Teste_Alumbra/events", novus(1, ts=inicio + 9))
     relogio.ir(inicio + 59.5 + 1)                         # já passou da virada
-    cli.entregar("NOVUS/Teste_Alumbra/events", novus(2))
+    cli.entregar("NOVUS/Teste_Alumbra/events", novus(2, ts=inicio + 59.5 + 0.6))   # minuto novo
     assert esperar(lambda: ev.com("Gravação "))
     assert [l[0] for l in _linhas(conexao)] == [1]
     relogio.ir(inicio + 119.5)
     assert esperar(lambda: len(ev.com("Gravação ")) == 2)
     assert [l[0] for l in _linhas(conexao)] == [1, 2]
+
+
+def test_leitura_atrasada_do_minuto_anterior_entra_se_o_ciclo_ainda_nao_rodou(montar, inicio):
+    """Recebida logo depois da virada, mas com ts do minuto que fechou: ainda conta para ele (é a mais recente)."""
+    p, cli, relogio, ev, conexao = montar()
+    relogio.ir(inicio + 10)
+    cli.entregar("NOVUS/Teste_Alumbra/events", novus(1, ts=inicio + 9))
+    assert esperar(lambda: ev.com("Mensagem de"))
+    p._fila.put(("NOVUS/Teste_Alumbra/events", json.dumps(novus(2, ts=inicio + 58)).encode(),
+                 datetime.now(timezone.utc), False, inicio + 59.5 + 0.2))
+    relogio.ir(inicio + 59.5 + 0.2)
+    assert esperar(lambda: ev.com("Gravação "))
+    assert [l[0] for l in _linhas(conexao)] == [2]
 
 
 def test_incompleta_vai_na_hora_para_a_contingencia(montar, inicio, tmp_path):
@@ -250,7 +288,7 @@ def test_encerrar_grava_a_pendente(montar, inicio):
     p, cli, relogio, ev, conexao = montar()
     for i in range(3):
         relogio.ir(inicio + 1 + i)
-        cli.entregar("NOVUS/Teste_Alumbra/events", novus(i))
+        cli.entregar("NOVUS/Teste_Alumbra/events", novus(i, ts=inicio + i))
     assert p.encerrar(5)
     assert [l[0] for l in _linhas(conexao)] == [2]
     (log,) = ev.com("Gravação ")
@@ -263,8 +301,8 @@ def test_encerrar_grava_a_pendente(montar, inicio):
 def test_desconectar_grava_a_pendente_na_contingencia_sem_sql(montar, inicio, tmp_path):
     p, cli, relogio, ev, _ = montar(sql=False)
     relogio.ir(inicio + 2)
-    cli.entregar("NOVUS/Teste_Alumbra/events", novus(7))
-    cli.entregar("NOVUS/Teste_Alumbra/events", novus(8))
+    cli.entregar("NOVUS/Teste_Alumbra/events", novus(7, ts=inicio + 1))
+    cli.entregar("NOVUS/Teste_Alumbra/events", novus(8, ts=inicio + 2))
     p.desconectar().result(5)
     (arq,) = (tmp_path / "contingencia").glob("*.jsonl")
     assert [json.loads(l)["pid"] for l in arq.read_text().splitlines()] == [8]

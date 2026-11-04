@@ -8,12 +8,18 @@ Eventos de conexão (``ao_evento(tipo, motivo)``), para o pipeline contar erros 
 - ``"falha_conexao"``: tentativa de conexão falhou (broker inacessível ou CONNACK recusado);
 - ``"assinatura_recusada"``: SUBACK com falha (motivo = código devolvido pelo broker).
 Nada é avisado quando a desconexão foi pedida (``parar``). O cliente avisa todas as tentativas; quem decide
-"um erro por queda" é o pipeline.
+"um erro por queda" é o pipeline. Para assinaturas extras recusadas, ``ao_evento`` recebe também o tópico
+(``ao_evento("assinatura_recusada", motivo, topico)``).
+
+Publicação (``publicar``): usada para os comandos aos dispositivos; não bloqueia (o paho envia na thread de rede).
+Assinaturas extras (``assinar_extra``): ex. o tópico de resposta dos comandos; refeitas a cada conexão, como a
+principal.
 """
 from __future__ import annotations
 
 import socket
 import ssl
+import threading
 import uuid
 from typing import Callable
 
@@ -145,6 +151,9 @@ class ClienteMqtt:
         self._parando = False
         self._conectado = False
         self.endereco = f"{self.broker}:{self.porta}"
+        self._extras: dict[str, int] = {}          # filtro → QoS (assinaturas além da principal)
+        self._mids: dict[int, str] = {}            # mid do SUBSCRIBE → filtro (para o log do SUBACK)
+        self._trava_mids = threading.RLock()       # o SUBACK pode chegar antes de guardarmos o mid
 
         cid = client_id or client_id_padrao()
         if not sessao_persistente:
@@ -193,6 +202,44 @@ class ClienteMqtt:
         self._cliente.loop_stop()
         self._conectado = False
 
+    def publicar(self, topico: str, payload: bytes | str, qos: int = 1) -> tuple[bool, str]:
+        """Publica sem bloquear. Devolve (aceito, motivo da falha). Só publica com a conexão ativa."""
+        if not self._conectado:
+            return False, "não conectado ao broker"
+        try:
+            info = self._cliente.publish(topico, payload, qos=qos)
+        except Exception as exc:  # noqa: BLE001 - tópico inválido, payload grande demais...
+            return False, f"{type(exc).__name__}: {exc}"
+        if info.rc != MQTTErrorCode.MQTT_ERR_SUCCESS:
+            return False, mqtt.error_string(info.rc)
+        return True, ""
+
+    @property
+    def assinaturas_extras(self) -> list[str]:
+        return list(self._extras)
+
+    def assinar_extra(self, filtro: str, qos: int = 1) -> None:
+        """Assina mais um filtro (agora, se conectado, e de novo a cada reconexão). Repetir não faz nada."""
+        filtro = validar_topico_assinatura(filtro)
+        if filtro == self.topico or filtro in self._extras:
+            return
+        self._extras[filtro] = qos
+        if self._conectado:
+            self._assinar(self._cliente, filtro, qos)
+
+    def _assinar(self, client, filtro: str, qos: int) -> None:
+        with self._trava_mids:
+            resultado, mid = client.subscribe(filtro, qos=qos)
+            if resultado == MQTTErrorCode.MQTT_ERR_SUCCESS and mid is not None:
+                self._mids[mid] = filtro
+        if resultado != MQTTErrorCode.MQTT_ERR_SUCCESS:
+            self._logar("ERRO", f"Falha ao pedir assinatura de {filtro}: {mqtt.error_string(resultado)}")
+
+    def _casa(self, topico: str) -> bool:
+        if mqtt.topic_matches_sub(self.topico, topico):
+            return True
+        return any(mqtt.topic_matches_sub(f, topico) for f in self._extras)
+
     # -- callbacks do paho (thread de rede) ----------------------------------------------------------
 
     def _evento(self, tipo: str, motivo: str = "") -> None:
@@ -216,9 +263,9 @@ class ClienteMqtt:
         self._logar("INFO", f"Conectado a {self.endereco}{sessao}")
         self._ao_status("conectado", f"Conectado a {self.endereco}")
         self._evento("conectado")
-        resultado, _mid = client.subscribe(self.topico, qos=self.qos)
-        if resultado != MQTTErrorCode.MQTT_ERR_SUCCESS:
-            self._logar("ERRO", f"Falha ao pedir assinatura de {self.topico}: {mqtt.error_string(resultado)}")
+        self._assinar(client, self.topico, self.qos)
+        for filtro, qos in list(self._extras.items()):   # sessão limpa perde as assinaturas: refaz todas
+            self._assinar(client, filtro, qos)
 
     def _on_connect_fail(self, client, userdata) -> None:
         if self._parando:
@@ -241,19 +288,29 @@ class ClienteMqtt:
             self._evento("perdida", motivo)
 
     def _on_subscribe(self, client, userdata, mid, reason_codes, properties) -> None:
+        with self._trava_mids:
+            filtro = self._mids.pop(mid, self.topico)
+        principal = filtro == self.topico
+        pedido = self.qos if principal else self._extras.get(filtro, 1)
         for rc in reason_codes:
             if rc.is_failure:
-                self._logar("ERRO", f"Broker recusou a assinatura de {self.topico} ({rc}). "
+                self._logar("ERRO", f"Broker recusou a assinatura de {filtro} ({rc}). "
                                     "Verifique as permissões (ACL) do usuário.")
-                self._ao_status("erro", f"Assinatura recusada: {self.topico}")
-                self._evento("assinatura_recusada", str(rc))
+                if principal:
+                    self._ao_status("erro", f"Assinatura recusada: {filtro}")
+                    self._evento("assinatura_recusada", str(rc))
+                elif self._ao_evento is not None and not self._parando:
+                    try:
+                        self._ao_evento("assinatura_recusada", str(rc), filtro)
+                    except Exception:  # noqa: BLE001
+                        pass
             else:
                 concedido = int(getattr(rc, "value", rc))
-                extra = f"; broker concedeu QoS {concedido}" if concedido != self.qos else ""
-                self._logar("INFO", f"Assinado {self.topico} (QoS {self.qos}{extra})")
+                extra = f"; broker concedeu QoS {concedido}" if concedido != pedido else ""
+                self._logar("INFO", f"Assinado {filtro} (QoS {pedido}{extra})")
 
     def _on_message(self, client, userdata, msg: mqtt.MQTTMessage) -> None:
         # Sessão persistente pode trazer mensagens de uma assinatura antiga: ignora o que não casa.
-        if not mqtt.topic_matches_sub(self.topico, msg.topic):
+        if not self._casa(msg.topic):
             return
         self._ao_mensagem(msg.topic, msg.payload, msg.qos, bool(msg.retain))

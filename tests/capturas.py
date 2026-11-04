@@ -158,6 +158,18 @@ def capturar_clientes(destino: Path, tema: str) -> Path:
     iso = lambda t: datetime.fromtimestamp(t).strftime("%Y-%m-%dT%H:%M:%S")  # noqa: E731
     bridge.emitir_dispositivo("Teste_Alumbra", "NOVUS/Teste_Alumbra/events", iso(agora - 10))
     bridge.emitir_dispositivo("Linha2_Forno", "NOVUS/Linha2/events", iso(agora - 7))
+    bridge.emitir_dispositivo("Caldeira_03", "NOVUS/Teste_Alumbra/fieldlogger", iso(agora - 180))
+    bridge.status_alterado.emit("conectado", "192.168.100.162:1883 · NOVUS/#")
+    for device, sn, fw, rssi, fila, ip, deriva in (
+            ("Teste_Alumbra", "21004417", "1.23", "55", 0, [192, 168, 100, 50], 2),     # rssi do manual: "55"
+            ("Linha2_Forno", "21004502", "1.23", "-71", 37, [192, 168, 100, 57], 194),  # fila no aparelho
+            ("Caldeira_03", "20117730", "1.18", "-82", 0, [192, 168, 100, 71], -41)):
+        bridge.emitir_canais(device, ["chd1", "chd2", "chd3"])
+        bridge.emitir_diag(device, {"error": 0, "title": f"DigiRail {device}", "location": "Fábrica — galpão 2",
+                                    "curr_timestamp": int(agora) + deriva, "fw_v": fw, "mqtt_queue": fila,
+                                    "sn": sn, "curr_rssi": rssi, "min_rssi": "-46", "max_rssi": "-87",
+                                    "avg_rssi": "-58", "ipv4": ip})
+    bridge.emitir_resposta("Teste_Alumbra", "reset_counters", True, "Contadores zerados (chd2).")
     bridge.contadores.emit(1284, 21, 3)
     janela.abas.setCurrentIndex(2)
     _rodar(1.5)  # consulta ARP (thread) e tique
@@ -165,8 +177,29 @@ def capturar_clientes(destino: Path, tema: str) -> Path:
     _rodar(0.2)
     caminho = destino / f"janela-{tema}-clientes.png"
     janela.grab().save(str(caminho))
+    if tema == "claro":
+        _capturar_dialogo_zerar(janela, destino)
     janela.close()
     return caminho
+
+
+def _capturar_dialogo_zerar(janela, destino: Path) -> None:
+    """Diálogo "Zerar contadores" com chd2 marcado (os canais vistos vêm primeiro e destacados)."""
+    painel = janela.painel_clientes
+    capturas: list[Path] = []
+
+    def executar(dlg):
+        dlg.caixas[2].setChecked(True)
+        dlg.show()
+        _rodar(0.3)
+        caminho = destino / "dialogo-zerar-contadores.png"
+        dlg.grab().save(str(caminho))
+        capturas.append(caminho)
+        dlg.close()
+        return 0  # não envia
+
+    painel.executar_dialogo = executar
+    painel.zerar("Linha2_Forno")
 
 
 ERROS_SIMULADOS = [
@@ -183,6 +216,9 @@ ERROS_SIMULADOS = [
     ("fila", "Fila de processamento cheia: 1 mensagem descartada.", "NOVUS/Teste_Alumbra/events", None, None),
     ("mqtt", "Assinatura recusada pelo broker para NOVUS/Restrito/#.", "NOVUS/Restrito/#",
      "SUBACK com código 0x87 (não autorizado)", None),
+    ("comando", "Falha ao zerar contadores chd2 em Linha2_Forno: sem resposta do dispositivo.",
+     "NOVUS/Linha2_Forno/command", "Nenhuma resposta em NOVUS/Linha2_Forno/ack/command em 15 s.",
+     '{"timestamp":1793386748,"desired":{"reset_counters":{"reset_chd2":1}}}'),
 ]
 
 

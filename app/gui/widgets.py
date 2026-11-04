@@ -30,7 +30,8 @@ from PySide6.QtWidgets import (
 from .estilo import CLARA, Paleta, fonte_mono
 
 LOCALE_BR = QLocale(QLocale.Language.Portuguese, QLocale.Country.Brazil)
-# Papel do modelo com o "tom" de uma pílula (DelegadoPilula): "sucesso" | "aviso" | "erro" | "destaque" | "roxo" | "neutro"
+# Papel do modelo com o "tom" de uma pílula (DelegadoPilula):
+# "sucesso" | "aviso" | "erro" | "destaque" | "roxo" | "ciano" | "neutro"
 PAPEL_PILULA = Qt.ItemDataRole.UserRole + 1
 
 
@@ -733,6 +734,7 @@ class DelegadoPilula(QStyledItemDelegate):
             "erro": (p.erro, p.erro_suave),
             "destaque": (p.destaque_texto or p.destaque, p.destaque_suave),
             "roxo": (p.roxo, p.roxo_suave),
+            "ciano": (p.ciano, p.ciano_suave),
         }.get(tom, (p.texto_sec, p.neutro_suave))
 
     def paint(self, pintor: QPainter, opcao: QStyleOptionViewItem, indice: QModelIndex) -> None:

@@ -56,6 +56,9 @@ class Paleta:
     # Categoria "mqtt" na janela de erros (4ª cor de categoria, distinta de aviso/erro/destaque).
     roxo: str = "#6D28D9"
     roxo_suave: str = "#F0E9FD"
+    # Categoria "comando" (comandos enviados ao dispositivo): 5ª cor de categoria. #0A6B7C sobre #E0F2F7: 5,6:1.
+    ciano: str = "#0A6B7C"
+    ciano_suave: str = "#E0F2F7"
 
 
 # Contraste conferido para WCAG AA (texto normal >= 4,5:1 sobre a superfície correspondente).
@@ -111,6 +114,8 @@ ESCURA = Paleta(
     destaque_texto="#9DBBFF",
     roxo="#C4B5FD",
     roxo_suave="#261E3E",
+    ciano="#67E8F9",
+    ciano_suave="#0E2A31",
 )
 
 _QSS = Template(
@@ -388,9 +393,34 @@ QComboBox QAbstractItemView {
     selection-background-color: $destaque_suave; selection-color: $texto;
 }
 
+/* ---------- Diálogo Zerar contadores (aba Clientes) ---------- */
+QDialog#dialogoZerar { background: $fundo; }
+QLabel#tituloDialogo { font-size: 12pt; font-weight: 600; color: $texto; }
+QLabel#descricaoDialogo { color: $texto_sec; }
+QLabel#secaoCanais { color: $texto_sec; font-size: 8pt; font-weight: 600; }
+QFrame#grupoCanais { background: $superficie; border: 1px solid $borda; border-radius: 8px; }
+QCheckBox[visto="true"] { font-weight: 600; }
+QFrame#avisoZerar { background: $aviso_suave; border: 1px solid $aviso_suave; border-radius: 8px; }
+QLabel#avisoZerarTexto { color: $texto; background: transparent; }
+QLabel#avisoZerarIcone { color: $aviso; background: transparent; font-weight: 700; font-size: 12pt; }
+QPushButton#botaoLink {
+    background: transparent; border: 1px solid transparent; color: $destaque_texto; padding: 0 6px; min-height: 24px;
+}
+QPushButton#botaoLink:hover { text-decoration: underline; }
+QPushButton#botaoLink:focus { border: 1px solid $destaque; }
+QPushButton#botaoPerigo {
+    background: $erro; color: $superficie; border: 1px solid $erro; font-weight: 600; min-height: 34px;
+    padding: 0 18px;
+}
+QPushButton#botaoPerigo:hover { border: 2px solid $texto; padding: 0 17px; }
+QPushButton#botaoPerigo:focus { border: 2px solid $texto; padding: 0 17px; }
+QPushButton#botaoPerigo:disabled { background: $neutro_suave; color: $texto_fraco; border-color: $neutro_suave; }
+
 QMenu { background: $superficie; border: 1px solid $borda_forte; border-radius: 8px; padding: 4px; }
 QMenu::item { padding: 6px 20px; border-radius: 4px; }
 QMenu::item:selected { background: $destaque_suave; color: $texto; }
+QMenu::item:disabled { color: $texto_fraco; }
+QMenu::separator { height: 1px; background: $borda; margin: 4px 8px; }
 """
 )
 

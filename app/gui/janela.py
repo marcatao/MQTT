@@ -195,6 +195,7 @@ class JanelaPrincipal(QMainWindow):
         self._tema_forcado = tema
         self._paleta = estilo.CLARA
         self._estado = "desconectado"
+        self._comandos_disponiveis = False
         self._encerrado = False
         self._testando = False
         self._senha_no_cofre: tuple[str, str] | None = None  # (usuario, senha) já gravados no cofre
@@ -342,7 +343,7 @@ class JanelaPrincipal(QMainWindow):
         self._icone_aba_mosquitto(self.mosquitto.estado)
 
         self.painel_clientes = PainelClientes(self.abas, relogio=self._relogio, executor_arp=self._executor_arp,
-                                              locais=self._enderecos_locais)
+                                              locais=self._enderecos_locais, settings=self.settings)
         self.abas.addTab(self.painel_clientes, "Clientes")
         self.abas.setTabToolTip(2, "Dispositivos que enviam dados ao broker: nome, IP, MAC e último envio.")
         self.mosquitto.saida.connect(self.painel_clientes.ao_saida_mosquitto)
@@ -567,7 +568,8 @@ class JanelaPrincipal(QMainWindow):
                  self.painel_mosquitto.botao_iniciar, self.painel_mosquitto.botao_parar,
                  self.painel_mosquitto.botao_limpar, self.painel_mosquitto.caixa,
                  self.painel_mosquitto.campo_comando, self.painel_mosquitto.botao_executar,
-                 self.painel_clientes.opcao_assinantes, self.painel_clientes.botao_mac,
+                 self.painel_clientes.opcao_assinantes, self.painel_clientes.botao_diag,
+                 self.painel_clientes.botao_mac, self.painel_clientes.botao_colunas,
                  self.painel_clientes.botao_exportar, self.painel_clientes.tabela]
         for a, b in zip(ordem, ordem[1:]):
             QWidget.setTabOrder(a, b)
@@ -679,6 +681,20 @@ class JanelaPrincipal(QMainWindow):
             self.bridge.dispositivo_visto.connect(self.painel_clientes.ao_dispositivo_visto)
         if hasattr(self.bridge, "erro_registrado"):
             self.bridge.erro_registrado.connect(self.janela_erros.adicionar_json)
+        # DigiRail: diagnóstico, canais e comandos (opcionais: um bridge sem eles deixa os botões desabilitados).
+        painel = self.painel_clientes
+        if hasattr(self.bridge, "diagnostico_dispositivo"):
+            self.bridge.diagnostico_dispositivo.connect(painel.ao_diagnostico)
+        if hasattr(self.bridge, "canais_vistos"):
+            self.bridge.canais_vistos.connect(painel.ao_canais_vistos)
+        if hasattr(self.bridge, "resposta_comando"):
+            self.bridge.resposta_comando.connect(painel.ao_resposta_comando)
+        self._comandos_disponiveis = all(hasattr(self.bridge, n) for n in (
+            "zerar_contadores", "pedir_diagnostico", "resposta_comando"))
+        if self._comandos_disponiveis:
+            painel.zerar_pedido.connect(lambda device, canais: self.bridge.zerar_contadores(device, list(canais)))
+            painel.diagnostico_pedido.connect(self.bridge.pedir_diagnostico)
+        painel.registrar_log.connect(self._log_local)
 
     def _log_local(self, nivel: str, mensagem: str) -> None:
         self.logs.adicionar(datetime.fromtimestamp(self._relogio()).strftime("%H:%M:%S"), nivel, mensagem)
@@ -961,6 +977,7 @@ class JanelaPrincipal(QMainWindow):
             detalhe, Qt.TextElideMode.ElideMiddle, 360))
         self.detalhe_status.setToolTip(detalhe)
 
+        self.painel_clientes.definir_conectado(estado == "conectado" and self._comandos_disponiveis)
         livre = estado in ("desconectado", "erro")
         for w in (self.campo_broker, self.campo_porta, self.campo_topico, self.seletor_qos):
             w.setEnabled(livre)

@@ -33,10 +33,14 @@ class FakePipelineBridge(QObject):
     ultima_leitura = Signal(str)       # ISO local da última mensagem recebida
     dispositivo_visto = Signal(str, str, str)  # (device_id, tópico, ISO local); máx. 1 a cada 5 s por device
     erro_registrado = Signal(str)      # JSON de UM erro; 1 sinal para cada +1 no contador de erros
+    canais_vistos = Signal(str, str)   # (device_id, JSON lista ["chd1","chd2"]) quando o conjunto de canais muda
+    diagnostico_dispositivo = Signal(str, str)  # (device_id, JSON do objeto "diag" do DigiRail)
+    resposta_comando = Signal(str, str, bool, str)  # (device_id, "reset_counters"|"diag", sucesso, mensagem)
 
     def __init__(self, config: Config, parent=None, *, atraso_conexao: float = 0.2,
                  intervalo: float = 0.05, falhar_conexao: bool = False, sql_ok: bool = True,
-                 semente: int | None = 7, ciclo: float = 60.0):
+                 semente: int | None = 7, ciclo: float = 60.0, responder_comandos: bool = True,
+                 atraso_resposta: float = 0.3, comandos_ok: bool = True):
         super().__init__(parent)
         self.config = config
         self.atraso_conexao = atraso_conexao
@@ -51,6 +55,11 @@ class FakePipelineBridge(QObject):
         self.sql: SqlServerConfig | None = None
         self.recebidas = self.gravadas = self.erros = 0
         self._visto_em: dict[str, float] = {}
+        # Comandos ao dispositivo: com responder_comandos=False os testes emitem a resposta à mão.
+        self.responder_comandos = responder_comandos
+        self.atraso_resposta = atraso_resposta
+        self.comandos_ok = comandos_ok
+        self._diag_enviado: set[str] = set()
 
     # ----- ajudas para testes e capturas (emitem como o bridge real) -----
     def emitir_dispositivo(self, device_id: str, topico: str, iso: str | None = None) -> None:
@@ -61,6 +70,15 @@ class FakePipelineBridge(QObject):
         self.erro_registrado.emit(json.dumps({
             "quando": quando or _iso_agora(), "categoria": categoria, "mensagem": mensagem, "topico": topico,
             "detalhe": detalhe, "payload": payload[:2000] if payload else None}, ensure_ascii=False))
+
+    def emitir_canais(self, device_id: str, canais: list[str]) -> None:
+        self.canais_vistos.emit(device_id, json.dumps(list(canais)))
+
+    def emitir_diag(self, device_id: str, diag: dict) -> None:
+        self.diagnostico_dispositivo.emit(device_id, json.dumps(diag, ensure_ascii=False))
+
+    def emitir_resposta(self, device_id: str, comando: str, sucesso: bool, mensagem: str) -> None:
+        self.resposta_comando.emit(device_id, comando, sucesso, mensagem)
 
     # ----- contrato -----
     def definir_sql(self, sql: SqlServerConfig) -> None:
@@ -101,6 +119,35 @@ class FakePipelineBridge(QObject):
     def encerrar(self, timeout: float = 5.0) -> None:
         self.chamadas.append(("encerrar", timeout))
         self._parar_thread(timeout)
+
+    def zerar_contadores(self, device_id: str, canais: list[int]) -> None:
+        self.chamadas.append(("zerar_contadores", device_id, list(canais)))
+        if not self.responder_comandos:
+            return
+
+        def trabalho():
+            time.sleep(self.atraso_resposta)
+            nomes = ", ".join(f"chd{n}" for n in canais)
+            if self.comandos_ok:
+                self.resposta_comando.emit(device_id, "reset_counters", True, f"Contadores zerados ({nomes}).")
+            else:
+                msg = "Sem resposta do dispositivo em 15 s."
+                self.resposta_comando.emit(device_id, "reset_counters", False, msg)
+                self.emitir_erro("comando", f"Falha ao zerar contadores em {device_id}: {msg}",
+                                 f"NOVUS/{device_id}/command", f"Canais: {nomes}")
+
+        threading.Thread(target=trabalho, daemon=True).start()
+
+    def pedir_diagnostico(self, device_id: str) -> None:
+        self.chamadas.append(("pedir_diagnostico", device_id))
+        if not self.responder_comandos:
+            return
+
+        def trabalho():
+            time.sleep(self.atraso_resposta)
+            self.diagnostico_dispositivo.emit(device_id, json.dumps(diag_exemplo(device_id)))
+
+        threading.Thread(target=trabalho, daemon=True).start()
 
     # ----- simulação -----
     def _parar_thread(self, timeout: float = 2.0) -> None:
@@ -152,6 +199,10 @@ class FakePipelineBridge(QObject):
             if agora_m - self._visto_em.get(device, -1e9) >= 5.0:  # como o bridge real: 1 a cada 5 s por device
                 self._visto_em[device] = agora_m
                 self.emitir_dispositivo(device, sub)
+                if device not in self._diag_enviado:  # como o core: canais e diag na primeira vez que vê o device
+                    self._diag_enviado.add(device)
+                    self.emitir_canais(device, ["chd1", "chd2", "chd3"])
+                    self.diagnostico_dispositivo.emit(device, json.dumps(diag_exemplo(device)))
             if n % 9 == 0:
                 self.erros += 1
                 self._log("AVISO", f"Campo “temp_3” sem valor numérico em {sub}; gravado como texto.")
@@ -174,6 +225,15 @@ class FakePipelineBridge(QObject):
                 ultimo = agora
                 self.contadores.emit(self.recebidas, self.gravadas, self.erros)
         self.contadores.emit(self.recebidas, self.gravadas, self.erros)
+
+
+def diag_exemplo(device_id: str) -> dict:
+    """Objeto "diag" no formato do manual do DigiRail (p. 20–21): RSSI em texto, ipv4 em lista."""
+    n = sum(map(ord, device_id)) % 40
+    return {"error": 0, "title": f"DigiRail {device_id}", "location": "Fábrica", "curr_timestamp": int(time.time()),
+            "cfg_timestamp": int(time.time()) - 86400, "fw_v": "1.23", "mqtt_queue": 0, "sn": f"{21000000 + n:08d}",
+            "curr_rssi": str(50 + n % 20), "min_rssi": "-46", "max_rssi": "-87", "avg_rssi": "-58",
+            "ipv4": [192, 168, 100, 50 + n], "gateway": [192, 168, 100, 1], "mask": [255, 255, 255, 0]}
 
 
 def _iso_agora() -> str:

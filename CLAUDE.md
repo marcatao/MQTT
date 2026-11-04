@@ -217,8 +217,9 @@ mensagem inteira, não só o booleano.
 ## Operação contínua (decidido com o usuário em 03/11/2026)
 
 - **Amostragem de 1 em 1 minuto** (`[gravacao] intervalo_gravacao_segundos = 60`; 0 = grava tudo): os ciclos são
-  alinhados ao relógio (hh:mm:00). Em cada ciclo grava-se, **por `device_id`, a leitura completa mais recente** recebida
-  naquele minuto; as demais são descartadas (não são erro). Leitura incompleta continua indo na hora para a
+  alinhados ao relógio (hh:mm:00). Desde a v0.1.9 a amostragem é **pelo minuto da leitura (`ts_unix`)**: em cada
+  ciclo grava-se, por `device_id`, a leitura completa mais recente de cada minuto de `ts_unix` já encerrado
+  (inclusive os reenviados da memória do dispositivo); as demais são descartadas (não são erro). Leitura incompleta continua indo na hora para a
   contingência. Um log por ciclo resume: gravadas, recebidas e descartadas pela amostragem.
 - **Caixa ATIVIDADE**: mostra contagem regressiva até a próxima gravação e dia/hora da última gravação com sucesso no
   SQL Server (contingência não conta como sucesso). É **limpa todo dia à meia-noite** (hora local); o arquivo
@@ -256,7 +257,7 @@ mensagem inteira, não só o booleano.
   registrados (data/hora, categoria, mensagem, tópico, detalhe e trecho do payload), com filtro, cópia e exportação
   CSV. Cada erro que soma 1 no contador gera exatamente um registro. O core grava os registros também em
   `logs/erros_AAAAMMDD.jsonl`, e a janela lê o arquivo do dia ao abrir, para não perder a lista num reinício. Formato
-  do JSON: `{"quando": ISO local, "categoria": "payload"|"sql"|"contingencia"|"mqtt"|"fila", "mensagem": str,
+  do JSON: `{"quando": ISO local, "categoria": "payload"|"sql"|"contingencia"|"mqtt"|"fila"|"comando", "mensagem": str,
   "topico": str|null, "detalhe": str|null, "payload": str|null (máx. 2000 caracteres)}`.
   Broker MQTT (categoria `"mqtt"`): **um erro por queda (incidente)**, não um por tentativa de reconexão. Conexão
   perdida sem o usuário pedir ("Conexão com o broker IP:porta perdida", detalhe com o motivo e a hora da última
@@ -299,11 +300,9 @@ lacunas L1/L2 serem corrigidas: QoS 1, "Reter Dados" desligado, diagnóstico per
 ## Pendências conhecidas
 
 - Índice único `(device_id, ts_unix)` na IOT001 (opcional, decidir com o usuário).
-- Lacunas do integrador com o DigiRail (seção 7 de `docs/digirail_iot_mqtt.md`), a decidir com o usuário:
-  L1 eventos viram leitura com canais NULL e podem substituir a leitura do minuto; L2 respostas `ack/*` viram
-  leitura falsa ou erro; L3 reenvio da memória circular é descartado pela amostragem (agrupa por `recebido_em`, não
-  por `ts_unix`); L4 mensagens retidas regravadas; L5 duplicatas sem chave única `(device_id, ts_unix)`; L6 vigia de
-  10 min × intervalo de envio ≥ 10 min.
+- Lacunas do DigiRail ainda abertas (seção 7 de `docs/digirail_iot_mqtt.md`): L6 vigia de 10 min × intervalo de envio
+  ≥ 10 min; L7 JSON inválido do firmware (parcial, confirmar com captura real); L11 canais além de chd1–chd3 só no
+  `payload_json`. L1–L5, L8–L10 resolvidas na v0.1.9 (L5 só em memória: some ao reiniciar o programa).
 
 - Reprocessar os arquivos de `contingencia/` (`.jsonl`) no SQL Server quando o banco voltar.
 - Possível duplicação de um lote se o `commit` chegar ao servidor e a resposta se perder (exigiria id de lote ou
@@ -311,7 +310,7 @@ lacunas L1/L2 serem corrigidas: QoS 1, "Reter Dados" desligado, diagnóstico per
 
 ## Estado atual
 
-- v0.1.3 validada pelo usuário em produção (NOVUS → dbo.IOT001). v0.1.4: amostragem de 1 min, contagem regressiva, limpeza diária e vigia. v0.1.5: conexão automática ao abrir. v0.1.6: abas Atividade/Mosquitto e título Integrador Alumbra. v0.1.7: aba Clientes e janela de erros (card ERROS). v0.1.8: queda do broker conta como erro (1 por queda).
+- v0.1.3 validada pelo usuário em produção (NOVUS → dbo.IOT001). v0.1.4: amostragem de 1 min, contagem regressiva, limpeza diária e vigia. v0.1.5: conexão automática ao abrir. v0.1.6: abas Atividade/Mosquitto e título Integrador Alumbra. v0.1.7: aba Clientes e janela de erros (card ERROS). v0.1.8: queda do broker conta como erro (1 por queda). v0.1.9: DigiRail (classificação, amostragem por ts_unix, sem duplicatas), diagnóstico e Zerar contadores na aba Clientes.
 
 ## Idioma
 

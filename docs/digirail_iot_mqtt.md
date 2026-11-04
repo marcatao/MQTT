@@ -495,7 +495,7 @@ Com efeito no processo (exigem decisão do usuário e cuidado):
 - `device.pub_interval`: muda a cadência de publicação.
 
 Publicar exige que o cliente do integrador tenha permissão de escrita nesses tópicos no Mosquitto (ACL, se houver).
-Hoje o integrador não publica nada.
+Desde 04/11/2026 o integrador publica `diag` e `reset_counters` (seção 7, "O que pode ser aproveitado").
 
 ---
 
@@ -549,6 +549,8 @@ versão v0.1.8. Os comportamentos marcados com **[simulado]** foram verificados 
 
 ### L1 (crítica): eventos (`events`) viram leitura com canais NULL e podem apagar a leitura do minuto
 
+- **Estado (04/11/2026): resolvida.** `classificar()` em `app/core/mapeamento.py`: `events` não vira linha, não entra na amostragem e não é erro; vira o log INFO "Evento chd1 (borda de subida) em Teste_Alumbra às 14:31:05" (limitado a 20 logs por segundo). Testes em `tests/test_digirail.py`.
+
 - **Problema:** um evento tem `pid`, `device_id` e `timestamp` (aninhado em `events.chdX`), então o mapeador o trata
   como leitura **completa** com `chd1..3 = NULL` [simulado]. A chave `chd1` da configuração casa com `events.chd1`
   (um objeto sem `value`), o que gera ainda um aviso a cada evento. Com amostragem (padrão), `_Amostragem` guarda
@@ -568,6 +570,8 @@ versão v0.1.8. Os comportamentos marcados com **[simulado]** foram verificados 
   `tests/test_amostragem.py`.
 
 ### L2 (crítica): respostas de comando/configuração e diagnóstico periódico viram linha NULL ou erro falso
+
+- **Estado (04/11/2026): resolvida.** `reported`/`desired` e tudo em `.../ack/command` e `.../ack/config` (inclusive JSON ilegível, vazio ou binário) é resposta: não é leitura nem erro e não dispara `dispositivo_visto`. `reported.diag` sai no sinal `diagnostico_dispositivo`; `reported.reset_counters` fecha o comando pendente (sinal `resposta_comando`). Pedidos `desired` de terceiros são ignorados em silêncio.
 
 - **Problema:** com a assinatura `NOVUS/Teste_Alumbra/#`, chegam também `.../ack/command` e `.../ack/config`.
   - `reported.diag`, `reported.logs`, `set_counters`, `reset_counters`, `output` → linha **completa** com canais
@@ -593,6 +597,8 @@ versão v0.1.8. Os comportamentos marcados com **[simulado]** foram verificados 
 
 ### L3 (crítica): reenvio da memória circular é descartado pela amostragem
 
+- **Estado (04/11/2026): resolvida.** A amostragem agrupa por `(device_id, minuto de ts_unix)` e fica com a leitura de maior `ts_unix` de cada minuto. A cada ciclo (hh:mm:00) grava todos os minutos encerrados, em ordem cronológica, inclusive os reenviados da memória; o minuto corrente espera. O log do ciclo informa "+ N recuperadas da memória do dispositivo" (minutos anteriores ao ciclo anterior). Ao desconectar/encerrar, grava todos os pendentes.
+
 - **Problema:** depois de uma queda (broker fora, rede fora, **reinício do vigia, que reinicia junto o Mosquitto
   filho do app**), o dispositivo publica os registros pendentes com o **timestamp original** (seção 4.6). A
   `_Amostragem` agrupa pela janela de **recebimento** (`recebido_em`) e guarda só a última por `device_id`: uma
@@ -616,6 +622,8 @@ versão v0.1.8. Os comportamentos marcados com **[simulado]** foram verificados 
 
 ### L4 (alta): mensagens retidas (`retain`) duplicam linhas a cada reconexão
 
+- **Estado (04/11/2026): resolvida pela deduplicação (L5).** A mensagem retida reentregue a cada reconexão tem o mesmo `(device_id, ts_unix)` e conta como "duplicada ignorada" (não é erro). Não foi criada a opção `ignorar_retidas`. Limite: a memória não sobrevive a um reinício do programa, então a última retida pode ser regravada uma vez depois de reiniciar (o índice único no banco resolveria).
+
 - **Problema:** se "Reter Dados" estiver ligado no dispositivo (p. 36), o broker guarda a última mensagem de cada
   tópico e a reenvia **a cada SUBSCRIBE**. O `ClienteMqtt` reassina em todo `on_connect` (correto), então a cada
   reconexão a última leitura (e a última resposta de diag) volta. O pipeline só acrescenta "(retida)" ao log
@@ -628,6 +636,8 @@ versão v0.1.8. Os comportamentos marcados com **[simulado]** foram verificados 
 - **Arquivos:** `app/core/pipeline.py` (`_processar`), `app/config.py`, testes.
 
 ### L5 (alta): duplicatas com QoS 1 e sem chave única no banco
+
+- **Estado (04/11/2026): resolvida em memória; índice único no banco pendente (decisão do usuário).** `_MemoriaGravadas` (`app/core/pipeline.py`): 24 h, até 200 mil chaves, vale entre conexões enquanto o programa está aberto. Não grava de novo o mesmo `(device_id, ts_unix)` e, com amostragem, o mesmo `(device_id, minuto)`. Com `intervalo_gravacao_segundos = 0`, só a regra `(device_id, ts_unix)` vale (grava todas as leituras distintas).
 
 - **Problema:** o dispositivo publica com QoS 0 ou 1 (p. 36). Com QoS 1, o MQTT entrega "pelo menos uma vez", então
   uma leitura pode chegar duas vezes, sobretudo em reconexões e no reenvio da memória. Sem amostragem (intervalo 0),
@@ -645,6 +655,8 @@ versão v0.1.8. Os comportamentos marcados com **[simulado]** foram verificados 
 
 ### L6 (média): vigia de 10 min contra intervalos longos do dispositivo, e reinício que causa nova queda
 
+- **Estado (04/11/2026): pendente.** Ajuda indireta: o diagnóstico automático mostra `mqtt_queue` na aba Clientes.
+
 - **Problema:** o vigia reinicia o app depois de 10 min sem leitura. O dispositivo aceita `pub_interval` até
   65535 s e `alter_pub_interval` de 60 a 65535 s (p. 106); o exemplo do manual usa 600 s (p. 96), exatamente 10 min.
   Se o intervalo normal ou o alternativo for maior ou igual a 10 min, o vigia reinicia o app sem necessidade. O
@@ -661,6 +673,8 @@ versão v0.1.8. Os comportamentos marcados com **[simulado]** foram verificados 
 
 ### L7 (média): JSON levemente inválido nos exemplos do manual
 
+- **Estado (04/11/2026): parcial.** Nos tópicos `ack/*`, JSON inválido vira resposta ilegível (AVISO, não é erro). No tópico de dados, evento com vírgula sobrando continua "JSON inválido" (erro); falta captura real para decidir o fallback tolerante.
+
 - **Problema:** os exemplos de evento e de `log_counters` têm vírgula sobrando (p. 16, 21, 93), e o do Gateway tem
   `;` (p. 22). Se o firmware realmente publicar assim, o `orjson`/`json` rejeita: "JSON inválido" → erro +
   contingência [simulado]. Pode ser só erro de digitação do manual.
@@ -672,6 +686,8 @@ versão v0.1.8. Os comportamentos marcados com **[simulado]** foram verificados 
 
 ### L8 (média): relógio do dispositivo não é verificado
 
+- **Estado (04/11/2026): resolvida (parte do futuro).** Leitura com `ts_unix` mais de 5 min à frente do relógio do PC é gravada, com um AVISO uma vez por dispositivo (enquanto o programa está aberto). Ela vai no próximo ciclo, sem esperar o minuto dela chegar. Atraso não gera aviso, porque o reenvio da memória é normal.
+
 - **Problema:** `ts_unix` vem do RTC do dispositivo (p. 16). Sem NTP, ou com a pilha fraca, as leituras são gravadas
   com horário errado, e `data_hora_utc` e a amostragem por `ts_unix` (L3) ficam errados também. Hoje o mapeador só
   rejeita fora de 2000–3000.
@@ -681,6 +697,8 @@ versão v0.1.8. Os comportamentos marcados com **[simulado]** foram verificados 
 - **Arquivos:** `app/core/pipeline.py` ou `app/core/mapeamento.py` (aviso), `CLAUDE.md`.
 
 ### L9 (baixa): `device_id` deduzido do tópico pega o nível errado no padrão NOVUS
+
+- **Estado (04/11/2026): resolvida.** `dispositivo_novus()` em `app/core/parser.py`: o `{id}` é o nível antes de `events`/`config`/`command`/`ack/config`/`ack/command` no fim do tópico. Os outros tópicos seguem a regra do curinga.
 
 - **Problema:** `dispositivo_do_topico` devolve o nível que casa com o primeiro curinga. Com
   `NOVUS/Teste_Alumbra/#`, para `NOVUS/Teste_Alumbra/events` ele devolve **"events"** (e "ack" ou "command" nos
@@ -693,6 +711,8 @@ versão v0.1.8. Os comportamentos marcados com **[simulado]** foram verificados 
 
 ### L10 (baixa): semântica de `pid` documentada errado na configuração
 
+- **Estado (04/11/2026): resolvida.** As chaves alternativas de `pid` passaram a ser `pid`, `pid_id` (exemplo do manual, p. 20), `product_id` e `id_produto`. Saíram `packet_id`, `id_pacote`, `seq` e `sequencia`. Comentários em `app/config.py`, `config.example.toml` e `mapeamento.py`.
+
 - **Problema:** `MapeamentoConfig.pid` aceita `packet_id`, `id_pacote`, `seq`, `sequencia`, o que sugere "número de
   pacote". No DigiRail, `pid` é o **código do modelo** (p. 15). O valor de produção (51387408) nem está na tabela
   de modelos. Risco: alguém usar `pid` como chave ou contador de sequência.
@@ -702,6 +722,8 @@ versão v0.1.8. Os comportamentos marcados com **[simulado]** foram verificados 
 
 ### L11 (baixa): canais além de `chd1`–`chd3` só ficam no `payload_json`
 
+- **Estado (04/11/2026): pendente.** O sinal `canais_vistos` informa à GUI os canais presentes em `channels` (chdN, chN, chrN), mas não há aviso nem coluna nova.
+
 - **Problema:** `chd4`–`chd6`, `ch1_user_range`/`ch2_user_range` e `chr1`–`chr8` (p. 15–16) não têm coluna. Se o
   usuário habilitar a analógica e desabilitar `chd1`–`chd3`, a linha sai **completa com os três canais NULL** sem
   aviso [simulado]. O dado fica só em `payload_json`, que pode ser lido com `OPENJSON`.
@@ -710,6 +732,12 @@ versão v0.1.8. Os comportamentos marcados com **[simulado]** foram verificados 
 - **Arquivos:** `app/core/mapeamento.py`, `CLAUDE.md`.
 
 ### O que pode ser aproveitado
+
+Estado em 04/11/2026: **A1** feito (sinal `diagnostico_dispositivo`, inclusive o diagnóstico periódico publicado pelo
+próprio aparelho); **A3** feito (`diag` pedido ao ver o dispositivo pela 1ª vez em cada conexão e a cada
+`[dispositivos] diagnostico_minutos`); **A6** feito (log do ciclo com as recuperadas). Também feito: comando
+`reset_counters` (zerar contadores por canal, sinal `resposta_comando`, falha = erro categoria `"comando"`). A2, A4 e
+A5 continuam pendentes.
 
 | # | Ideia | Fonte no manual | Esforço / dependência |
 | --- | --- | --- | --- |
@@ -721,6 +749,8 @@ versão v0.1.8. Os comportamentos marcados com **[simulado]** foram verificados 
 | A6 | **Detectar reenvio**: com L3, contar no log do ciclo quantas leituras chegaram atrasadas e de quando, e mostrar na ATIVIDADE "recuperadas da memória do dispositivo". | p. 21, 40–41, 43 | Baixo, junto com L3. |
 
 ### Ordem sugerida de implementação
+
+(Itens 1 e 2 e parte do 3 e do 4 feitos em 04/11/2026; ver o estado em cada lacuna.)
 
 1. L1 + L2 (classificação de mensagens; uma mudança única no mapeador e no pipeline).
 2. L3 (amostragem por minuto da leitura) + L4 (retidas) + dedup em memória de L5.

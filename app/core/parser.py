@@ -137,10 +137,39 @@ def hex_abreviado(dados: bytes, limite: int = 24) -> str:
     return h + (f" … ({len(dados)} bytes)" if len(dados) > limite else f" ({len(dados)} bytes)")
 
 
+TIPOS_TOPICO_NOVUS = ("events", "config", "command", "ack")
+
+
+def dispositivo_novus(topico: str) -> str | None:
+    """``{id}`` no padrão NOVUS ``.../{id}/events|config|command|ack/config|ack/command``; senão None.
+
+    O ``{id}`` é o nível imediatamente antes do primeiro nível de tipo (``events``, ``config``, ``command`` ou
+    ``ack`` seguido de ``config``/``command``). Ex.: ``NOVUS/Teste_Alumbra/ack/command`` → ``Teste_Alumbra``.
+    """
+    niveis = (topico or "").split("/")
+    for i in range(1, len(niveis)):
+        nivel = niveis[i]
+        if nivel not in TIPOS_TOPICO_NOVUS:
+            continue
+        if nivel == "ack" and (i + 1 >= len(niveis) or niveis[i + 1] not in ("config", "command")):
+            continue
+        if i + (2 if nivel == "ack" else 1) != len(niveis):
+            continue  # o tipo precisa ser o fim do tópico
+        return niveis[i - 1] or None
+    return None
+
+
 def dispositivo_do_topico(topico: str, assinatura: str | None) -> str | None:
-    """Nível do tópico que casa com o primeiro curinga (``+`` ou ``#``) da assinatura."""
+    """Dispositivo deduzido do tópico.
+
+    1. Padrão NOVUS (``NOVUS/{id}/events``, ``.../ack/command``...): o ``{id}`` (ver ``dispositivo_novus``).
+    2. Senão, o nível do tópico que casa com o primeiro curinga (``+`` ou ``#``) da assinatura.
+    """
     if not assinatura:
         return None
+    novus = dispositivo_novus(topico)
+    if novus is not None:
+        return novus
     niveis_ass = assinatura.split("/")
     niveis_top = topico.split("/")
     for i, nivel in enumerate(niveis_ass):

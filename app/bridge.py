@@ -26,6 +26,9 @@ class PipelineBridge(QObject):
     ultima_leitura = Signal(str)             # "AAAA-MM-DDTHH:MM:SS" local da última mensagem MQTT (máx. 1 a cada 5 s)
     dispositivo_visto = Signal(str, str, str)  # (device_id, tópico, ISO local) de leitura recebida; máx. 1/5 s por device
     erro_registrado = Signal(str)            # JSON de UM erro (app.core.erros); 1 sinal para cada +1 no contador de erros
+    canais_vistos = Signal(str, str)         # (device_id, JSON lista ["chd1","chd2","chd3"]) quando o conjunto muda
+    diagnostico_dispositivo = Signal(str, str)  # (device_id, JSON do objeto "diag" do DigiRail: sn, fw_v, rssi...)
+    resposta_comando = Signal(str, str, bool, str)  # (device_id, "reset_counters"|"diag", sucesso, mensagem)
 
     def __init__(self, config: Config, parent=None) -> None:
         super().__init__(parent)
@@ -40,6 +43,9 @@ class PipelineBridge(QObject):
             ao_leitura=self.ultima_leitura.emit,
             ao_dispositivo=self.dispositivo_visto.emit,
             ao_erro=self.erro_registrado.emit,
+            ao_canais=self.canais_vistos.emit,
+            ao_diagnostico=self.diagnostico_dispositivo.emit,
+            ao_resposta_comando=self.resposta_comando.emit,
         )
 
     def _emitir_log(self, nivel: str, mensagem: str) -> None:
@@ -70,3 +76,11 @@ class PipelineBridge(QObject):
 
     def encerrar(self, timeout: float = 5.0) -> None:
         self._pipeline.encerrar(timeout)
+
+    def zerar_contadores(self, device_id: str, canais: list[int]) -> None:
+        """Não bloqueia: publica ``reset_counters`` (canais 1–6) e responde em ``resposta_comando``."""
+        self._pipeline.zerar_contadores(device_id, list(canais))
+
+    def pedir_diagnostico(self, device_id: str) -> None:
+        """Não bloqueia: publica ``diag``; responde em ``diagnostico_dispositivo`` e ``resposta_comando``."""
+        self._pipeline.pedir_diagnostico(device_id)

@@ -61,7 +61,10 @@ class MapeamentoConfig:
     Um ``.`` indica caminho aninhado no JSON (``chd1.value`` = ``{"chd1": {"value": ...}}``). A primeira chave
     encontrada vence. Ver app/core/mapeamento.py.
     """
-    pid: list[str] = field(default_factory=lambda: ["pid", "packet_id", "id_pacote", "seq", "sequencia"])
+    # No NOVUS DigiRail, ``pid`` é o código do modelo do produto (constante: ETH 51584019, WRL 51518482), não um
+    # número de pacote nem de sequência: não serve para deduplicar (a chave da leitura é device_id + ts_unix).
+    # "pid_id" aparece num exemplo do manual (p. 20).
+    pid: list[str] = field(default_factory=lambda: ["pid", "pid_id", "product_id", "id_produto"])
     device_id: list[str] = field(default_factory=lambda: [
         "device_id", "deviceid", "device", "dispositivo", "id_dispositivo", "serial", "serial_number", "sn"])
     ts_unix: list[str] = field(default_factory=lambda: [
@@ -71,7 +74,9 @@ class MapeamentoConfig:
     chd3: list[str] = field(default_factory=lambda: ["chd3_value", "chd3.value", "chd3"])
     # chave que traz uma lista de leituras dentro de um objeto (campos de fora valem para todos os itens)
     leituras: list[str] = field(default_factory=lambda: ["leituras", "readings", "dados", "data", "registros"])
-    device_do_topico: bool = True    # sem device_id no payload: usa o nível do tópico após o prefixo assinado
+    # sem device_id no payload: usa o {id} de NOVUS/{id}/events|config|command|ack/...; nos outros tópicos, o nível
+    # que casa com o primeiro curinga da assinatura
+    device_do_topico: bool = True
     fuso_sem_offset: str = "local"   # data/hora ISO sem fuso: "local" (do PC) ou "utc"
     colunas_sem_cabecalho: list[str] = field(default_factory=list)  # tabular sem cabeçalho: nomes das colunas
 
@@ -102,6 +107,15 @@ class MosquittoConfig:
 
 
 @dataclass
+class DispositivosConfig:
+    """Comandos aos dispositivos NOVUS DigiRail (o integrador publica no broker). ``{id}`` = device_id."""
+    topico_comando: str = "NOVUS/{id}/command"
+    topico_resposta: str = "NOVUS/{id}/ack/command"
+    diagnostico_minutos: float = 30         # pede "diag" ao ver o device em cada conexão e a cada N min; 0 desliga
+    timeout_comando_segundos: float = 15    # sem resposta nesse tempo: "sem resposta do dispositivo"
+
+
+@dataclass
 class Config:
     mqtt: MqttConfig = field(default_factory=MqttConfig)
     sqlserver: SqlServerConfig = field(default_factory=SqlServerConfig)
@@ -110,6 +124,7 @@ class Config:
     vigia: VigiaConfig = field(default_factory=VigiaConfig)
     inicio: InicioConfig = field(default_factory=InicioConfig)
     mosquitto: MosquittoConfig = field(default_factory=MosquittoConfig)
+    dispositivos: DispositivosConfig = field(default_factory=DispositivosConfig)
 
 
 def _preencher(destino, dados: dict) -> None:
@@ -125,6 +140,7 @@ def carregar(caminho: Path | None = None) -> Config:
     if caminho.exists():
         with caminho.open("rb") as f:
             dados = tomllib.load(f)
-        for secao in ("mqtt", "sqlserver", "gravacao", "mapeamento", "vigia", "inicio", "mosquitto"):
+        for secao in ("mqtt", "sqlserver", "gravacao", "mapeamento", "vigia", "inicio", "mosquitto",
+                      "dispositivos"):
             _preencher(getattr(cfg, secao), dados.get(secao, {}))
     return cfg
