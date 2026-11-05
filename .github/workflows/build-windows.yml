@@ -2,7 +2,7 @@ name: Gerar .exe para Windows
 
 on:
   push:
-    branches: [main, "claude/**"]
+    branches: [main]
     paths-ignore:  # mudanças só de documentação/agentes não geram versão nova
       - "**.md"
       - ".claude/**"
