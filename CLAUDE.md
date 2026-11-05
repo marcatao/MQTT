@@ -166,6 +166,11 @@ release (`https://github.com/marcatao/MQTT/releases/download/v0.1.<n>/MQTT-SQLSe
 confira que contém `MQTT-SQLServer.exe` e **envie o arquivo na conversa** (SendUserFile, `display: attach`), junto
 com o link da release. O usuário não deve precisar procurar o `.exe` no GitHub.
 
+**Histórico de versões (sempre, pedido do usuário em 05/11/2026):** a cada release publicada, acrescente uma linha
+no topo da tabela "Histórico de versões" do `README.md` (versão, data dd/mm/aaaa, principais melhorias em linguagem do
+usuário). Se o build falhar e pular um número, diga isso na linha seguinte. Mudança só no README não gera release
+(`paths-ignore`).
+
 Sem `[sqlserver]` configurado, o app roda do mesmo jeito: mostra os registros no log e guarda em `contingencia/`
 (JSON Lines) para gravar depois.
 

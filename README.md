@@ -107,6 +107,26 @@ Todas as opções estão comentadas em `config.example.toml`. As principais seç
 
 Os campos digitados na tela valem mais que o `config.toml`, que vale mais que os padrões do programa.
 
+## Histórico de versões
+
+Cada versão fica em **Releases** (https://github.com/marcatao/MQTT/releases), com o `MQTT-SQLServer-windows.zip`
+pronto para baixar. O número vem da contagem de builds do GitHub, por isso alguns números são pulados.
+
+| Versão | Data | Principais melhorias |
+| --- | --- | --- |
+| **v0.1.14** | 05/11/2026 | Primeira versão publicada a partir da `main`, com o README novo. O programa é igual ao da v0.1.13. |
+| **v0.1.13** | 04/11/2026 | **Gravação imediata:** cada leitura vai para o banco assim que chega, sem a amostragem de 1 min. **Reinício automático** depois de 1 h sem gravar, com contador regressivo na aba Atividade. Campo **Endereço Mosquitto**, com seletor de pasta, salvo entre aberturas. (A v0.1.12 falhou no build e não foi publicada.) |
+| **v0.1.11** | 04/11/2026 | **Tópicos por dispositivo**, editáveis e salvos em `dispositivos.json`, para aparelhos que usam tópicos fora do padrão (caso `NOÏUS`). Aviso de **tópicos não ouvidos**, com ⚠ na aba Clientes. Coluna Diagnóstico mostra **"sem resposta"**. |
+| **v0.1.10** | 04/11/2026 | Suporte ao **NOVUS DigiRail IoT**: leituras, eventos e respostas separados; leituras reenviadas pela memória do aparelho sem buracos; sem gravar duas vezes a mesma leitura. **Diagnóstico** (Wi-Fi, firmware, nº de série, fila) e botão **Zerar contadores** por canal na aba Clientes. |
+| **v0.1.9** | 04/11/2026 | Manual do DigiRail IoT incluído no repositório. O programa é igual ao da v0.1.8. |
+| **v0.1.8** | 03/11/2026 | Cada **queda do broker** conta como erro (um por queda), com o motivo e a mensagem "Broker voltou após…". |
+| **v0.1.7** | 03/11/2026 | Aba **Clientes**, com nome, IP, MAC, último envio e status. Card **ERROS** clicável, com a lista detalhada, filtro e exportação CSV. |
+| **v0.1.6** | 03/11/2026 | Aba **Mosquitto**, com o `mosquitto -v` rodando dentro do programa e linha de comando. Novo nome: **Integrador Alumbra MQTT + SQL + Mosquitto**. |
+| **v0.1.5** | 03/11/2026 | **Conexão automática** ao broker e ao banco ao abrir o programa. |
+| **v0.1.4** | 03/11/2026 | Gravação de 1 em 1 minuto, contador da próxima gravação, limpeza diária da atividade e primeiro reinício automático (10 min). |
+| **v0.1.3** | 30/10/2026 | Leitura correta do payload real do NOVUS, com timestamp e canais dentro de `channels`. |
+| **v0.1.2** | 30/10/2026 | Primeira versão publicada em Releases: tela com broker, banco, teste de conexão e log; gravação na `dbo.IOT001`. |
+
 ## Desenvolvimento
 
 Requer Python 3.12 ou mais novo.
