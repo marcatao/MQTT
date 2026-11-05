@@ -357,13 +357,16 @@ que o integrador não ouvia.
 
 ## Estado atual
 
-- v0.1.3 validada pelo usuário em produção (NOVUS → dbo.IOT001). v0.1.4: amostragem de 1 min, contagem regressiva, limpeza diária e vigia. v0.1.5: conexão automática ao abrir. v0.1.6: abas Atividade/Mosquitto e título Integrador Alumbra. v0.1.7: aba Clientes e janela de erros (card ERROS). v0.1.8: queda do broker conta como erro (1 por queda). v0.1.10: DigiRail (classificação, amostragem por ts_unix, sem duplicatas), diagnóstico e Zerar contadores na aba Clientes. v0.1.11: tópicos por dispositivo (dispositivos.json), aviso de tópicos não ouvidos e diagnóstico "sem resposta". v0.1.13 (a v0.1.12 falhou no build): gravação imediata (sem amostragem), vigia de 1 h com contador, Endereço Mosquitto salvo.
+- v0.1.3 validada pelo usuário em produção (NOVUS → dbo.IOT001). v0.1.4: amostragem de 1 min, contagem regressiva, limpeza diária e vigia. v0.1.5: conexão automática ao abrir. v0.1.6: abas Atividade/Mosquitto e título Integrador Alumbra. v0.1.7: aba Clientes e janela de erros (card ERROS). v0.1.8: queda do broker conta como erro (1 por queda). v0.1.10: DigiRail (classificação, amostragem por ts_unix, sem duplicatas), diagnóstico e Zerar contadores na aba Clientes. v0.1.11: tópicos por dispositivo (dispositivos.json), aviso de tópicos não ouvidos e diagnóstico "sem resposta". v0.1.13 (a v0.1.12 falhou no build): gravação imediata (sem amostragem), vigia de 1 h com contador, Endereço Mosquitto salvo. v0.1.14: primeira release da `main` (README novo, programa igual à v0.1.13).
 
 ## Branches
 
-- Desde 05/11/2026 a **`main`** contém todo o projeto (o usuário pediu para transferir tudo para a `main`). O trabalho
-  continua no branch de desenvolvimento da sessão e é levado à `main` por fast-forward quando o usuário pedir.
-  Push na `main` também gera release (workflow `build-windows.yml`).
+- **Só a `main`** (decidido com o usuário em 05/11/2026). O antigo branch de trabalho foi apagado depois de a `main`
+  receber todo o conteúdo dele. Todo trabalho é commitado e enviado direto na `main`; não crie outros branches sem o
+  usuário pedir.
+- Push na `main` com mudança de código gera release (workflow `build-windows.yml`, que só roda para a `main`); só
+  `.md` e `.claude/` não geram. Por isso, envie código pronto e testado de uma vez, não em pedaços.
+- Commits com a identidade `Claude <noreply@anthropic.com>` (o GitHub mostra os outros como "Unverified").
 
 ## Idioma
 
