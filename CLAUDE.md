@@ -123,6 +123,9 @@ CREATE TABLE [dbo].[IOT001](
     [chd1_value]    decimal(18, 4) NULL,
     [chd2_value]    decimal(18, 4) NULL,
     [chd3_value]    decimal(18, 4) NULL,
+    [chd4_value]    decimal(18, 4) NULL,             -- chd4..chd6 acrescentadas por sql/canais_4_a_6_iot001.sql (11/11/2026)
+    [chd5_value]    decimal(18, 4) NULL,
+    [chd6_value]    decimal(18, 4) NULL,
     [payload_json]  nvarchar(max) NULL,              -- payload original, como chegou
     [recebido_em]   datetime2(3) NOT NULL            -- DEFAULT sysutcdatetime(): UTC
     -- [data_hora_local] (calculada, opcional): data_hora_utc em America/Sao_Paulo; ver sql/data_hora_local_iot001.sql
@@ -344,6 +347,28 @@ que o integrador não ouvia.
   pasta`, botão "…" ao lado para escolher a pasta (ou o `mosquitto.exe`), editável com o Mosquitto parado; ao Iniciar,
   usa o caminho do campo (prompt `<pasta>>mosquitto -v`). Salvo em `QSettings` (vale mais que o `config.toml`) e usado
   também no reinício automático.
+
+### Canais 4–6, diagnóstico de 3 min, último envio e cadastro no OEE (decidido com o usuário em 11/11/2026)
+
+- **Canais 4 a 6**: script `sql/canais_4_a_6_iot001.sql` (idempotente) acrescenta `chd4_value`, `chd5_value`,
+  `chd6_value` `decimal(18,4) NULL`. O integrador grava os canais que vierem e deixa NULL os que não vierem. Antes do
+  script ser rodado, o integrador detecta as colunas existentes (INFORMATION_SCHEMA) e insere só as que existem.
+- **Diagnóstico a cada 3 min**: `[dispositivos] diagnostico_minutos = 3`.
+- **Último envio** (aba Clientes) e `dispositivo_visto` só mudam com **leituras de contagem** (`channels`); diagnóstico,
+  respostas de comando e eventos não atualizam. As linhas PUBLISH do `mosquitto -v` não mexem mais no último envio
+  (continuam valendo para IP, client id, mensagens e tópicos não ouvidos).
+- **Cadastro no portal OEE** (repositório `marcatao/OEE`, Laravel): se no mesmo SQL Server existir o banco do OEE
+  (`[oee] banco = "OEE"`, configurável) com a tabela `dbo.dispositivos_iot` e o login tiver permissão, cada diagnóstico
+  recebido faz **upsert** por `codigo = device_id`:
+  - novo: `codigo`, `nome` (= device_id), `tipo = 'contador'`, `protocolo = 'mqtt'`, `endereco` (IP do diag),
+    `topico` (tópico de dados), `ultimo_sinal_em` (UTC), `observacao` (resumo do diag: nº série, firmware, Wi-Fi, fila,
+    hora), `ativo = 1`, `unidade` (`[oee] unidade = "manutencao"`), `criado_em`/`atualizado_em` UTC, `*_por_id` NULL.
+  - existente: atualiza `endereco`, `topico`, `ultimo_sinal_em`, `observacao`, `atualizado_em` — **nunca `maquina_id`**,
+    e também não mexe em `nome`, `tipo`, `ativo`, `unidade`, `porta` nem auditoria de criação (são do portal).
+  - `ultimo_sinal_em` também é renovado com as leituras, no máx. 1 vez por minuto por device.
+  - Sem o banco/tabela/permissão: ignora em silêncio (1 INFO no log), não é erro. Permissões: `sql/permissoes_oee.sql`.
+  - Estrutura da tabela vem de `database/migrations/2026_11_06_000002_criar_dispositivos_iot.php` do OEE (+ `unidade`).
+    O integrador **não cria nem altera** tabelas do OEE.
 
 ## Pendências conhecidas
 
