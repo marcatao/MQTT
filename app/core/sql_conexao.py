@@ -73,6 +73,36 @@ def tabela_citada(nome: str) -> str:
     return f"[{schema}].[{tabela}]"
 
 
+def validar_banco(nome: str) -> str:
+    """Nome de banco vindo da configuração: só ``[A-Za-z0-9_]`` (colchetes externos tolerados). ValueError se não."""
+    banco = str(nome or "").strip()
+    if banco.startswith("[") and banco.endswith("]"):
+        banco = banco[1:-1]
+    if not _NOME_SQL.match(banco):
+        raise ValueError(f"Nome de banco inválido: {nome!r}. Use só letras, números e _.")
+    return banco
+
+
+def tabela_em_banco(banco: str, nome: str) -> str:
+    """``("OEE", "dbo.dispositivos_iot")`` -> ``[OEE].[dbo].[dispositivos_iot]`` (nome em 3 partes, validado)."""
+    return f"[{validar_banco(banco)}].{tabela_citada(nome)}"
+
+
+SQL_COLUNAS = ("SELECT COLUMN_NAME FROM {banco}INFORMATION_SCHEMA.COLUMNS "
+               "WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?")
+
+
+def colunas_da_tabela(cursor, schema: str, tabela: str, banco: str | None = None) -> set[str]:
+    """Nomes (em minúsculas) das colunas de ``schema.tabela`` (no banco atual ou em ``banco``).
+
+    Conjunto vazio = tabela inexistente ou invisível para o login. Schema e tabela vão como parâmetros; o banco
+    (opcional) é validado e citado.
+    """
+    prefixo = f"[{validar_banco(banco)}]." if banco else ""
+    cursor.execute(SQL_COLUNAS.format(banco=prefixo), schema, tabela)
+    return {str(l[0]).lower() for l in (cursor.fetchall() or [])}
+
+
 # ------------------------------------------------------------------------------------ string de conexão
 
 
@@ -193,6 +223,7 @@ def testar_conexao(sql: SqlServerConfig) -> tuple[bool, str]:
             pode = cur.fetchone()[0]
             if pode == 1:
                 linhas.append(f"✓ Permissão de INSERT em {nome_tabela}.")
+                linhas.append(_linha_canais_novos(cur, schema, tabela, nome_tabela))
             else:
                 ok = False
                 linhas.append(f"✗ Sem permissão de INSERT em {nome_tabela}. Peça ao DBA: "
@@ -214,6 +245,23 @@ def testar_conexao(sql: SqlServerConfig) -> tuple[bool, str]:
         except Exception:  # noqa: BLE001
             pass
     return ok, "\n".join(linhas)
+
+
+CANAIS_NOVOS = ("chd4_value", "chd5_value", "chd6_value")
+
+
+def _linha_canais_novos(cur, schema: str, tabela: str, nome_tabela: str) -> str:
+    """Aviso (nunca falha) sobre as colunas chd4_value..chd6_value de sql/canais_4_a_6_iot001.sql."""
+    try:
+        colunas = colunas_da_tabela(cur, schema, tabela)
+    except Exception as exc:  # noqa: BLE001 - o teste não falha por isso
+        return f"⚠ Não foi possível conferir as colunas chd4_value..chd6_value ({type(exc).__name__})."
+    faltam = [c for c in CANAIS_NOVOS if c not in colunas]
+    if not faltam:
+        return f"✓ Colunas chd4_value..chd6_value existem em {nome_tabela}."
+    nomes = "chd4_value..chd6_value" if len(faltam) == len(CANAIS_NOVOS) else ", ".join(faltam)
+    return (f"⚠ Aviso: {nome_tabela} ainda não tem {nomes}; rode sql/canais_4_a_6_iot001.sql. Até lá os canais "
+            "4 a 6 ficam só no payload_json (a gravação continua normal).")
 
 
 # ----------------------------------------------------------------------------------------- tradução de erros

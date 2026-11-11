@@ -17,10 +17,25 @@ class ErroOdbc(Exception):
     """Imita pyodbc.Error: args == (sqlstate, mensagem)."""
 
 
+COLUNAS_TABELA = ("id", "pid", "device_id", "ts_unix", "data_hora_utc", "chd1_value", "chd2_value", "chd3_value",
+                  "chd4_value", "chd5_value", "chd6_value", "payload_json", "recebido_em")
+COLUNAS_ANTIGAS = tuple(c for c in COLUNAS_TABELA if c not in ("chd4_value", "chd5_value", "chd6_value"))
+
+
 class CursorFalso:
     def __init__(self, conexao):
         self.conexao = conexao
         self.fast_executemany = False
+        self._linhas = []
+
+    def execute(self, sql, *params):
+        self.conexao.consultas.append((sql, params))
+        assert "INFORMATION_SCHEMA.COLUMNS" in sql and params == ("dbo", self.conexao.tabela)
+        self._linhas = [(c,) for c in self.conexao.colunas]
+        return self
+
+    def fetchall(self):
+        return self._linhas
 
     def executemany(self, sql, linhas):
         linhas = list(linhas)
@@ -38,7 +53,10 @@ class CursorFalso:
 
 
 class ConexaoFalsa:
-    def __init__(self, falhas=0, sqlstate="08S01", campos_ruins=()):
+    def __init__(self, falhas=0, sqlstate="08S01", campos_ruins=(), colunas=COLUNAS_TABELA, tabela="IOT001"):
+        self.colunas = colunas
+        self.tabela = tabela
+        self.consultas = []
         self.falhas_restantes = falhas
         self.sqlstate = sqlstate
         self.campos_ruins = set(campos_ruins)
@@ -97,7 +115,13 @@ def novo_sink(sql, grav, conexoes, logs=None, **kw):
 def test_montar_insert_e_validacao_da_tabela():
     assert montar_insert("dbo.IOT001") == (
         "INSERT INTO [dbo].[IOT001] ([pid], [device_id], [ts_unix], [chd1_value], [chd2_value], [chd3_value], "
+        "[chd4_value], [chd5_value], [chd6_value], [payload_json], [recebido_em]) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+    assert montar_insert("dbo.IOT001", sink_sqlserver.colunas_insert(set(COLUNAS_ANTIGAS))) == (
+        "INSERT INTO [dbo].[IOT001] ([pid], [device_id], [ts_unix], [chd1_value], [chd2_value], [chd3_value], "
         "[payload_json], [recebido_em]) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+    with pytest.raises(ValueError):
+        montar_insert("dbo.IOT001", ("pid", "x]; DROP TABLE y; --"))
     assert "[id]" not in montar_insert("dbo.IOT001") and "data_hora_utc" not in montar_insert("dbo.IOT001")
     assert montar_insert("[dbo].[Leituras_2]").startswith("INSERT INTO [dbo].[Leituras_2]")
     for ruim in ["dbo.Leituras; DROP TABLE x", "dbo.[a]]b]", "a b", "x.y.z.w", ""]:
@@ -114,7 +138,8 @@ def test_lote_por_quantidade(sql, grav):
     assert sink.descarregar() == 3
     (sql_insert, linhas), = abertas[0].gravado
     assert sql_insert.startswith("INSERT INTO [dbo].[IOT001]")
-    assert linhas[0] == (0, "t0", 1730000000, Decimal("0.0000"), None, None, '{"pid": 0}', RECEBIDO)
+    assert linhas[0] == (0, "t0", 1730000000, Decimal("0.0000"), None, None, None, None, None, '{"pid": 0}',
+                         RECEBIDO)
     assert sink.pendentes() == 0
 
 
@@ -332,6 +357,13 @@ def test_setinputsizes_com_tipos_da_iot001(sql, grav, monkeypatch):
     assert sink_sqlserver._tipos_parametros() == [
         (p.SQL_BIGINT, 0, 0), (p.SQL_VARCHAR, 100, 0), (p.SQL_BIGINT, 0, 0),
         (p.SQL_DECIMAL, 18, 4), (p.SQL_DECIMAL, 18, 4), (p.SQL_DECIMAL, 18, 4),
+        (p.SQL_DECIMAL, 18, 4), (p.SQL_DECIMAL, 18, 4), (p.SQL_DECIMAL, 18, 4),
+        (p.SQL_WVARCHAR, 0, 0), (p.SQL_TYPE_TIMESTAMP, 23, 3),
+    ]
+    antigas = sink_sqlserver.colunas_insert(set(COLUNAS_ANTIGAS))
+    assert sink_sqlserver._tipos_parametros(antigas) == [
+        (p.SQL_BIGINT, 0, 0), (p.SQL_VARCHAR, 100, 0), (p.SQL_BIGINT, 0, 0),
+        (p.SQL_DECIMAL, 18, 4), (p.SQL_DECIMAL, 18, 4), (p.SQL_DECIMAL, 18, 4),
         (p.SQL_WVARCHAR, 0, 0), (p.SQL_TYPE_TIMESTAMP, 23, 3),
     ]
     tamanhos = []
@@ -346,3 +378,98 @@ def test_setinputsizes_com_tipos_da_iot001(sql, grav, monkeypatch):
     sink.adicionar(registros(1))
     sink.descarregar()
     assert len(tamanhos) == 1 and len(tamanhos[0]) == len(LinhaIot.COLUNAS)
+
+
+# ------------------------------------------------------------------- colunas detectadas (canais 4–6, 11/11/2026)
+
+
+def _com_canais_novos(n, campo="c"):
+    linhas = registros(n, campo)
+    for l in linhas:
+        l.chd4_value, l.chd6_value = Decimal("4.0000"), Decimal("6.0000")
+    return linhas
+
+
+def test_insert_com_chd4_a_chd6_quando_a_tabela_tem(sql, grav):
+    logs = []
+    conexao = ConexaoFalsa()
+    sink, _ = novo_sink(sql, grav, [conexao], logs)
+    sink.adicionar(_com_canais_novos(1))
+    assert sink.descarregar() == 1
+    (sql_insert, linhas), = conexao.gravado
+    assert "[chd4_value], [chd5_value], [chd6_value]" in sql_insert and sql_insert.count("?") == 11
+    assert linhas[0][6:9] == (Decimal("4.0000"), None, Decimal("6.0000"))
+    assert not any("canais_4_a_6" in m for _, m in logs)
+
+
+def test_insert_sem_chd4_a_chd6_antes_do_script_e_aviso_unico(sql, grav):
+    logs = []
+    conexao = ConexaoFalsa(colunas=COLUNAS_ANTIGAS)
+    sink, _ = novo_sink(sql, grav, [conexao], logs)
+    sink.adicionar(registros(1))            # sem valor nos canais 4–6: nada a avisar
+    sink.descarregar()
+    assert not any("canais_4_a_6" in m for _, m in logs)
+    for _ in range(3):
+        sink.adicionar(_com_canais_novos(2))
+        assert sink.descarregar() == 2
+    for sql_insert, linhas in conexao.gravado:
+        assert "chd4_value" not in sql_insert and sql_insert.count("?") == 8
+        assert all(len(l) == 8 for l in linhas)
+    avisos = [m for n, m in logs if n == "AVISO" and "canais_4_a_6" in m]
+    assert avisos == ["A tabela dbo.IOT001 ainda não tem chd4_value..chd6_value: rode "
+                      "sql/canais_4_a_6_iot001.sql. Os valores continuam no payload_json."]
+    # a detecção é feita uma vez por conexão (cache), não a cada lote
+    assert len(conexao.consultas) == 1
+
+
+def test_colunas_lidas_de_novo_ao_reconectar(sql, grav):
+    """Queda de conexão: a conexão nova lê as colunas de novo (ex.: o script foi rodado nesse meio tempo)."""
+    antiga = ConexaoFalsa(colunas=COLUNAS_ANTIGAS)
+    nova = ConexaoFalsa()
+    sink, abertas = novo_sink(sql, grav, [antiga, nova])
+    sink.adicionar(_com_canais_novos(1))
+    sink.descarregar()
+    assert "chd4_value" not in antiga.gravado[0][0]
+    antiga.falhas_restantes = 1             # 08S01: cai, reconecta na hora
+    sink.adicionar(_com_canais_novos(1, "d"))
+    assert sink.descarregar() == 1
+    assert antiga.fechada and len(abertas) == 2
+    assert "chd4_value" in nova.gravado[0][0] and len(nova.consultas) == 1
+
+
+def test_falha_ao_ler_colunas_usa_chd1_a_chd3(sql, grav):
+    logs = []
+    conexao = ConexaoFalsa()
+
+    class CursorSemMetadados(CursorFalso):
+        def execute(self, sql, *params):
+            raise ErroOdbc("42000", "[42000] permissão negada (simulada)")
+
+    conexao.cursor = lambda: CursorSemMetadados(conexao)
+    sink, _ = novo_sink(sql, grav, [conexao], logs)
+    sink.adicionar(registros(1))
+    assert sink.descarregar() == 1
+    assert "chd4_value" not in conexao.gravado[0][0]
+    assert any(n == "AVISO" and "Não foi possível ler as colunas" in m for n, m in logs)
+
+
+def test_tabela_invisivel_insere_colunas_base_e_erro_do_insert_decide(sql, grav):
+    assert sink_sqlserver.colunas_insert(set()) == (
+        "pid", "device_id", "ts_unix", "chd1_value", "chd2_value", "chd3_value", "payload_json", "recebido_em")
+
+
+def test_setinputsizes_acompanha_colunas_detectadas(sql, grav, monkeypatch):
+    monkeypatch.setitem(sink_sqlserver.sys.modules, "pyodbc", PyodbcFalso)
+    tamanhos = []
+
+    class CursorComTipos(CursorFalso):
+        def setinputsizes(self, tipos):
+            tamanhos.append(tipos)
+
+    conexao = ConexaoFalsa(colunas=COLUNAS_ANTIGAS)
+    conexao.cursor = lambda: CursorComTipos(conexao)
+    sink, _ = novo_sink(sql, grav, [conexao])
+    sink.adicionar(registros(1))
+    sink.descarregar()
+    assert len(tamanhos) == 1 and len(tamanhos[0]) == 8
+

@@ -416,4 +416,4 @@ def test_bridge_emite_os_tres_sinais(tmp_path, inicio, monkeypatch):
     finally:
         b.encerrar(5)
     # o recebido_em gravado vem do relógio do pipeline, em UTC sem fuso (como antes)
-    assert _linhas(conexao)[0][7] == datetime.fromtimestamp(inicio + 2, timezone.utc).replace(tzinfo=None)
+    assert _linhas(conexao)[0][LinhaIot.COLUNAS.index("recebido_em")] == datetime.fromtimestamp(inicio + 2, timezone.utc).replace(tzinfo=None)

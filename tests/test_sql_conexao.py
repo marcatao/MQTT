@@ -230,10 +230,12 @@ def test_conectar_sem_driver(monkeypatch):
 
 
 class CursorFalso:
-    def __init__(self, existe=True, insert=1):
+    def __init__(self, existe=True, insert=1, canais_novos=True):
         self.existe, self.insert = existe, insert
+        self.canais_novos = canais_novos
         self.consultas = []
         self._ultimo = None
+        self._todas = []
 
     def execute(self, sql, *params):
         self.consultas.append((sql, params))
@@ -244,7 +246,16 @@ class CursorFalso:
             self._ultimo = (123 if self.existe else None,)
         elif "HAS_PERMS_BY_NAME" in sql:
             self._ultimo = (self.insert,)
+        elif "INFORMATION_SCHEMA.COLUMNS" in sql:
+            assert params == ("dbo", "IOT001")
+            nomes = ["pid", "device_id", "ts_unix", "chd1_value", "chd2_value", "chd3_value"]
+            if self.canais_novos:
+                nomes += ["chd4_value", "chd5_value", "chd6_value"]
+            self._todas = [(n,) for n in nomes]
         return self
+
+    def fetchall(self):
+        return self._todas
 
     def fetchone(self):
         return self._ultimo
@@ -307,3 +318,34 @@ def test_testar_conexao_tabela_invalida_nem_conecta(monkeypatch):
     monkeypatch.setattr(sc, "conectar", lambda sql: pytest.fail("não deveria conectar"))
     ok, msg = sc.testar_conexao(_cfg(tabela="dbo.x;DROP"))
     assert ok is False and "inválido" in msg
+
+
+def test_testar_conexao_informa_colunas_chd4_a_chd6(monkeypatch):
+    monkeypatch.setattr(sc, "conectar", lambda sql: ConexaoFalsa(CursorFalso()))
+    ok, msg = sc.testar_conexao(_cfg())
+    assert ok is True and "✓ Colunas chd4_value..chd6_value existem" in msg
+
+
+def test_testar_conexao_sem_chd4_a_chd6_e_aviso_nao_falha(monkeypatch):
+    monkeypatch.setattr(sc, "conectar", lambda sql: ConexaoFalsa(CursorFalso(canais_novos=False)))
+    ok, msg = sc.testar_conexao(_cfg())
+    assert ok is True
+    linha = next(l for l in msg.splitlines() if "chd4_value" in l)
+    assert linha.startswith("⚠") and "sql/canais_4_a_6_iot001.sql" in linha and "payload_json" in linha
+
+
+def test_testar_conexao_falha_ao_ler_colunas_nao_reprova(monkeypatch):
+    cur = CursorFalso()
+    cur.fetchall = lambda: (_ for _ in ()).throw(RuntimeError("sem metadados"))
+    monkeypatch.setattr(sc, "conectar", lambda sql: ConexaoFalsa(cur))
+    ok, msg = sc.testar_conexao(_cfg())
+    assert ok is True and "Não foi possível conferir as colunas" in msg
+
+
+def test_validar_banco_e_nome_em_3_partes():
+    assert sc.validar_banco("OEE_Alumbra") == "OEE_Alumbra"
+    assert sc.tabela_em_banco("[OEE]", "dbo.dispositivos_iot") == "[OEE].[dbo].[dispositivos_iot]"
+    for ruim in ["", "OEE;DROP", "a b", "OEE]", "x.y"]:
+        with pytest.raises(ValueError):
+            sc.validar_banco(ruim)
+

@@ -1,7 +1,9 @@
 """Mapeia uma mensagem MQTT em linhas da tabela ``dbo.IOT001`` (formato largo: uma linha por leitura).
 
-Colunas inseridas (``LinhaIot.COLUNAS``): ``pid, device_id, ts_unix, chd1_value, chd2_value, chd3_value,
-payload_json, recebido_em``. Nunca ``id`` (identity) nem ``data_hora_utc`` (calculada).
+Colunas inseridas (``LinhaIot.COLUNAS``): ``pid, device_id, ts_unix, chd1_value .. chd6_value, payload_json,
+recebido_em``. Nunca ``id`` (identity) nem ``data_hora_utc`` (calculada). ``chd4_value..chd6_value`` existem só
+depois de ``sql/canais_4_a_6_iot001.sql``; antes disso o sink detecta as colunas da tabela e insere só as que
+existem (os canais 4–6 ficam no ``payload_json``).
 
 Payload real do NOVUS (tópico ``NOVUS/Teste_Alumbra/events``, confirmado pelo usuário): ``timestamp`` e os
 canais vêm aninhados em ``channels``; ``timestamp`` é epoch em segundos UTC::
@@ -62,7 +64,7 @@ Regras de cada coluna
 - ``ts_unix``: epoch em **segundos** (UTC). Aceita s, ms, µs e ns (pela magnitude), texto de dígitos, ISO 8601
   (com fuso, ou sem fuso interpretado conforme ``fuso_sem_offset``) e ``dd/mm/aaaa hh:mm[:ss]``. Só aceita
   valores entre 2000-01-01 e o ano 3000.
-- ``chdN_value``: ``Decimal`` arredondado a 4 casas (``decimal(18,4)``). Aceita número, ``"23,5"`` e
+- ``chdN_value`` (N = 1 a 6): ``Decimal`` arredondado a 4 casas (``decimal(18,4)``). Aceita número, ``"23,5"`` e
   ``"1.234,5"``. Se a chave achada contiver um objeto, usa ``value``/``valor``/``v`` dele. Valor fora da faixa
   (|x| ≥ 10^14) ou não numérico vai como ``NULL`` com aviso. Ausente vai como ``NULL`` sem aviso.
 - ``payload_json``: o texto original da mensagem, igual para todas as linhas da mesma mensagem. Payload binário
@@ -142,17 +144,28 @@ class LinhaIot:
     recebido_em: datetime
     topico: str = ""
     motivo: str | None = None
+    # canais 4–6 no fim (com padrão) para não mudar a ordem posicional usada desde a v0.1.3
+    chd4_value: Decimal | None = None
+    chd5_value: Decimal | None = None
+    chd6_value: Decimal | None = None
 
-    COLUNAS: ClassVar[tuple[str, ...]] = ("pid", "device_id", "ts_unix", "chd1_value", "chd2_value", "chd3_value",
-                                          "payload_json", "recebido_em")
+    CANAIS: ClassVar[tuple[str, ...]] = ("chd1_value", "chd2_value", "chd3_value", "chd4_value", "chd5_value",
+                                         "chd6_value")
+    CANAIS_NOVOS: ClassVar[tuple[str, ...]] = ("chd4_value", "chd5_value", "chd6_value")
+    # todas as colunas que o app sabe inserir, na ordem do INSERT (o sink usa só as que existem na tabela)
+    COLUNAS: ClassVar[tuple[str, ...]] = ("pid", "device_id", "ts_unix", *CANAIS, "payload_json", "recebido_em")
 
     @property
     def completa(self) -> bool:
         return self.motivo is None
 
-    def como_tupla(self) -> tuple:
-        return (self.pid, self.device_id, self.ts_unix, self.chd1_value, self.chd2_value, self.chd3_value,
-                self.payload_json, self.recebido_em)
+    def como_tupla(self, colunas: tuple[str, ...] | list[str] | None = None) -> tuple:
+        """Valores na ordem de ``colunas`` (padrão: ``COLUNAS``)."""
+        return tuple(getattr(self, c) for c in (colunas or self.COLUNAS))
+
+    def canais_com_valor(self, canais: tuple[str, ...] | None = None) -> list[str]:
+        """Colunas de canal (``chdN_value``) com valor não nulo nesta linha."""
+        return [c for c in (canais or self.CANAIS) if getattr(self, c) is not None]
 
     def como_json(self) -> dict:
         """Para a contingência (JSON Lines): decimais como texto e ``recebido_em`` ISO com ``Z`` (UTC)."""
@@ -161,7 +174,8 @@ class LinhaIot:
         return {
             "pid": self.pid, "device_id": self.device_id, "ts_unix": self.ts_unix,
             "chd1_value": dec(self.chd1_value), "chd2_value": dec(self.chd2_value),
-            "chd3_value": dec(self.chd3_value), "payload_json": self.payload_json,
+            "chd3_value": dec(self.chd3_value), "chd4_value": dec(self.chd4_value),
+            "chd5_value": dec(self.chd5_value), "chd6_value": dec(self.chd6_value), "payload_json": self.payload_json,
             "recebido_em": self.recebido_em.isoformat(timespec="milliseconds") + "Z",
             "topico": self.topico, "motivo": self.motivo,
         }
@@ -433,6 +447,12 @@ def _utc_sem_fuso(dt: datetime | None) -> datetime:
 # ------------------------------------------------------------------------------------------------ montagem
 
 
+def _caminhos_canais(cfg: MapeamentoConfig) -> tuple:
+    """Chaves aceitas de chd1..chd6 (config antiga sem chd4..6 usa o padrão ``chdN_value``/``chdN.value``/``chdN``)."""
+    return tuple(getattr(cfg, f"chd{n}", None) or [f"chd{n}_value", f"chd{n}.value", f"chd{n}"]
+                 for n in range(1, 7))
+
+
 class _Montador:
     def __init__(self, cfg: MapeamentoConfig, topico: str, payload_json: str, recebido_em: datetime,
                  device_topico: str | None) -> None:
@@ -487,7 +507,7 @@ class _Montador:
                 motivos.append(f"ts inválido em '{chave}': {trecho(str(bruto), 40)!r}")
 
         canais: list[Decimal | None] = []
-        for n, caminhos in enumerate((cfg.chd1, cfg.chd2, cfg.chd3), start=1):
+        for n, caminhos in enumerate(_caminhos_canais(cfg), start=1):
             chave, bruto = _buscar(fontes, _lista(caminhos), f"chd{n}_value", self.avisos)
             valor, aviso = (None, None) if chave is None else converter_chd(bruto)
             if aviso:
@@ -495,7 +515,8 @@ class _Montador:
             canais.append(valor)
 
         self.linhas.append(LinhaIot(pid, device, ts, canais[0], canais[1], canais[2], self.payload_json,
-                                    self.recebido_em, self.topico, "; ".join(motivos) or None))
+                                    self.recebido_em, self.topico, "; ".join(motivos) or None,
+                                    chd4_value=canais[3], chd5_value=canais[4], chd6_value=canais[5]))
 
     def objeto(self, obj: dict) -> None:
         """Objeto JSON: uma leitura, ou um envelope com lista de leituras."""
@@ -522,7 +543,7 @@ def _celulas_par(row: list[str]) -> dict | None:
 
 
 def _parece_cabecalho(row: list[str], cfg: MapeamentoConfig) -> bool:
-    conhecidas = {_norm(c) for campo in (cfg.pid, cfg.device_id, cfg.ts_unix, cfg.chd1, cfg.chd2, cfg.chd3)
+    conhecidas = {_norm(c) for campo in (cfg.pid, cfg.device_id, cfg.ts_unix, *_caminhos_canais(cfg))
                   for c in _lista(campo)}
     return any(_norm(c) in conhecidas for c in row) and not any(_RE_DIGITOS.match(c.strip()) for c in row if c)
 

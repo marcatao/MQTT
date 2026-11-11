@@ -187,6 +187,7 @@ Outras informações sobre os contadores:
 - `chd1 = 67` e `chd2 = 119` são maiores que 1, então esses canais estão em modo **Contador** (dedução). `chd3 = 0`
   pode ser contador zerado ou nível lógico.
 - Hoje o mapeamento pega `chd1_value`…`chd3_value` dentro de `channels`. Isso está correto para este payload.
+  Desde 11/11/2026 também `chd4_value`…`chd6_value` (colunas novas, ver L11).
 
 ### 3.3 Eventos: `events` (p. 16, 93)
 
@@ -722,7 +723,14 @@ versão v0.1.8. Os comportamentos marcados com **[simulado]** foram verificados 
 
 ### L11 (baixa): canais além de `chd1`–`chd3` só ficam no `payload_json`
 
-- **Estado (04/11/2026): pendente.** O sinal `canais_vistos` informa à GUI os canais presentes em `channels` (chdN, chN, chrN), mas não há aviso nem coluna nova.
+- **Estado (11/11/2026): parcialmente resolvida.** `chd4`–`chd6` agora são gravados nas colunas `chd4_value`,
+  `chd5_value` e `chd6_value` (`decimal(18,4) NULL`), criadas por `sql/canais_4_a_6_iot001.sql` (idempotente, só
+  acrescenta colunas). O mapeamento aceita `chdN_value`, `chdN.value` ou `chdN` (aninhados em `channels`) com as
+  mesmas regras de `chd1`–`chd3`; canal ausente vira NULL. Antes do script ser rodado, o sink detecta as colunas da
+  tabela (`INFORMATION_SCHEMA.COLUMNS`, a cada conexão) e insere só as que existem; se chegar valor em `chd4`–`chd6`
+  sem coluna, um AVISO sai uma vez por sessão e o valor continua no `payload_json`. "Testar conexão" mostra se as
+  colunas existem. Continuam só no `payload_json`: `ch1_user_range`/`ch2_user_range` (analógicas) e `chr1`–`chr8`
+  (remotos). O sinal `canais_vistos` informa à GUI os canais presentes em `channels` (chdN, chN, chrN).
 
 - **Problema:** `chd4`–`chd6`, `ch1_user_range`/`ch2_user_range` e `chr1`–`chr8` (p. 15–16) não têm coluna. Se o
   usuário habilitar a analógica e desabilitar `chd1`–`chd3`, a linha sai **completa com os três canais NULL** sem

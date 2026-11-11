@@ -249,7 +249,7 @@ def test_evento_nao_grava_nem_e_erro(montar, inicio):
                                      "completa recebida no período"]
     assert conexao.gravado == []
     assert p.contadores == (1, 0, 0) and col.erros == []
-    assert [v[0] for v in col.vistos] == [DEV]       # o dispositivo está vivo
+    assert col.vistos == []      # evento não é leitura de contagem: não mexe no "Último envio" (11/11/2026)
 
 
 def test_evento_nao_substitui_a_leitura_do_minuto(montar, inicio):

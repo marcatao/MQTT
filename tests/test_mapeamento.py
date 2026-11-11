@@ -38,14 +38,14 @@ def test_json_plano():
     assert r.ok and r.formato == "JSON"
     (l,) = r.linhas
     assert l.completa
-    assert l.como_tupla() == (17, "N1", TS, _d("23.4568"), _d("40.0000"), None, payload,
+    assert l.como_tupla() == (17, "N1", TS, _d("23.4568"), _d("40.0000"), None, None, None, None, payload,
                               datetime(2026, 10, 30, 15, 0, 0, 123000))
     assert r.avisos == []
 
 
 def test_colunas_inseridas_nao_incluem_id_nem_data_hora_utc():
     assert LinhaIot.COLUNAS == ("pid", "device_id", "ts_unix", "chd1_value", "chd2_value", "chd3_value",
-                                "payload_json", "recebido_em")
+                                "chd4_value", "chd5_value", "chd6_value", "payload_json", "recebido_em")
 
 
 def test_json_aninhado_chd_value_e_chaves_alternativas():
@@ -279,3 +279,52 @@ def test_duas_chaves_aninhadas_usa_a_primeira_do_json_e_avisa_uma_vez():
 def test_aninhado_nao_entra_em_listas_nem_inventa():
     r = _m('{"pid":1,"device_id":"N1","historico":[{"timestamp":1730000000}]}')
     assert "sem ts_unix" in r.linhas[0].motivo
+
+
+# ------------------------------------------------------------------------------------- canais 4 a 6 (11/11/2026)
+
+
+def test_chd4_a_chd6_aninhados_em_channels():
+    payload = ('{"pid":51387408,"device_id":"Teste_Alumbra","channels":{"timestamp":1793386748,"chd1_value":67,'
+               '"chd2_value":119,"chd3_value":0,"chd4_value":4.5,"chd5_value":"5,25","chd6_value":6}}')
+    (l,) = _m(payload, topico="NOVUS/Teste_Alumbra/events").linhas
+    assert l.completa
+    assert (l.chd4_value, l.chd5_value, l.chd6_value) == (_d("4.5000"), _d("5.2500"), _d("6.0000"))
+    tupla = l.como_tupla()
+    assert tupla[3:9] == (_d("67.0000"), _d("119.0000"), _d("0.0000"), _d("4.5000"), _d("5.2500"), _d("6.0000"))
+    assert l.canais_com_valor(LinhaIot.CANAIS_NOVOS) == ["chd4_value", "chd5_value", "chd6_value"]
+    assert l.como_json()["chd5_value"] == "5.2500"
+
+
+def test_chd4_a_chd6_formatos_alternativos():
+    r = _m(f'{{"pid": 1, "device_id": "N1", "ts": {TS}, "chd4": {{"value": 1.23456}}, "chd5.value": 2, '
+           f'"chd6": "3"}}')
+    (l,) = r.linhas
+    assert (l.chd4_value, l.chd5_value, l.chd6_value) == (_d("1.2346"), _d("2.0000"), _d("3.0000"))
+
+
+def test_chd4_a_chd6_ausentes_viram_null_sem_aviso():
+    r = _m('{"pid":1,"device_id":"N1","channels":{"timestamp":1793386748,"chd1_value":1}}')
+    (l,) = r.linhas
+    assert (l.chd4_value, l.chd5_value, l.chd6_value) == (None, None, None)
+    assert l.canais_com_valor(LinhaIot.CANAIS_NOVOS) == []
+    assert r.avisos == []
+
+
+def test_chd6_fora_da_faixa_vira_null_com_aviso():
+    r = _m(f'{{"pid": 1, "device_id": "N1", "ts": {TS}, "chd6_value": 1e15}}')
+    (l,) = r.linhas
+    assert l.chd6_value is None and any("chd6_value" in a for a in r.avisos)
+
+
+def test_chaves_chd4_a_chd6_configuraveis():
+    cfg = MapeamentoConfig(chd4=["contador_a"])
+    (l,) = _m(f'{{"pid": 1, "device_id": "N1", "ts": {TS}, "contador_a": 9, "chd4_value": 1}}', cfg).linhas
+    assert l.chd4_value == _d("9.0000")
+
+
+def test_tabular_com_chd4_no_cabecalho():
+    r = _m(f"pid;device_id;ts;chd4\n1;N1;{TS};7")
+    (l,) = r.linhas
+    assert l.completa and l.chd4_value == _d("7.0000")
+

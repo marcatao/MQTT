@@ -74,6 +74,11 @@ class MapeamentoConfig:
     chd1: list[str] = field(default_factory=lambda: ["chd1_value", "chd1.value", "chd1"])
     chd2: list[str] = field(default_factory=lambda: ["chd2_value", "chd2.value", "chd2"])
     chd3: list[str] = field(default_factory=lambda: ["chd3_value", "chd3.value", "chd3"])
+    # chd4..chd6: gravados nas colunas chd4_value..chd6_value (sql/canais_4_a_6_iot001.sql); enquanto o script não
+    # for rodado, o sink detecta que as colunas não existem e os valores ficam só no payload_json
+    chd4: list[str] = field(default_factory=lambda: ["chd4_value", "chd4.value", "chd4"])
+    chd5: list[str] = field(default_factory=lambda: ["chd5_value", "chd5.value", "chd5"])
+    chd6: list[str] = field(default_factory=lambda: ["chd6_value", "chd6.value", "chd6"])
     # chave que traz uma lista de leituras dentro de um objeto (campos de fora valem para todos os itens)
     leituras: list[str] = field(default_factory=lambda: ["leituras", "readings", "dados", "data", "registros"])
     # sem device_id no payload: usa o {id} de NOVUS/{id}/events|config|command|ack/...; nos outros tópicos, o nível
@@ -121,8 +126,23 @@ class DispositivosConfig:
     topico_comando: str = "NOVUS/{id}/command"
     topico_resposta: str = "NOVUS/{id}/ack/command"   # confirmação de comando (ack_command)
     arquivo_topicos: str = "dispositivos.json"        # relativo à pasta do programa (pasta_base())
-    diagnostico_minutos: float = 30         # pede "diag" ao ver o device em cada conexão e a cada N min; 0 desliga
+    diagnostico_minutos: float = 3          # pede "diag" ao ver o device em cada conexão e a cada N min; 0 desliga
     timeout_comando_segundos: float = 15    # sem resposta nesse tempo: "sem resposta do dispositivo"
+
+
+@dataclass
+class OeeConfig:
+    """Cadastro dos dispositivos no portal OEE (Laravel, outro repositório), no mesmo SQL Server do integrador.
+
+    Usa a mesma conexão/login de ``[sqlserver]`` e o nome em 3 partes ``[banco].[schema].[tabela]``. Se o banco, a
+    tabela ou a permissão (INSERT/UPDATE) faltarem, a etapa se desliga em silêncio (1 INFO). O integrador nunca cria
+    nem altera a tabela do OEE; ver app/core/oee_dispositivos.py e sql/permissoes_oee.sql.
+    """
+    habilitado: bool = True
+    banco: str = "OEE"                      # no .env do OEE pode ser outro (ex.: OEE_Alumbra)
+    tabela: str = "dbo.dispositivos_iot"
+    unidade: str = "manutencao"             # manutencao | tecnologia | ambos (CHECK no portal)
+    tipo: str = "contador"                  # sensor | clp | gateway | contador | outro
 
 
 @dataclass
@@ -135,6 +155,7 @@ class Config:
     inicio: InicioConfig = field(default_factory=InicioConfig)
     mosquitto: MosquittoConfig = field(default_factory=MosquittoConfig)
     dispositivos: DispositivosConfig = field(default_factory=DispositivosConfig)
+    oee: OeeConfig = field(default_factory=OeeConfig)
 
 
 def _preencher(destino, dados: dict) -> None:
@@ -151,6 +172,6 @@ def carregar(caminho: Path | None = None) -> Config:
         with caminho.open("rb") as f:
             dados = tomllib.load(f)
         for secao in ("mqtt", "sqlserver", "gravacao", "mapeamento", "vigia", "inicio", "mosquitto",
-                      "dispositivos"):
+                      "dispositivos", "oee"):
             _preencher(getattr(cfg, secao), dados.get(secao, {}))
     return cfg

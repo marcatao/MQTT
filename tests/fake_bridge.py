@@ -73,7 +73,17 @@ class FakePipelineBridge(QObject):
 
     # ----- ajudas para testes e capturas (emitem como o bridge real) -----
     def emitir_dispositivo(self, device_id: str, topico: str, iso: str | None = None) -> None:
+        """Emite `dispositivo_visto` direto: use só para simular uma LEITURA DE CONTAGEM (channels)."""
         self.dispositivo_visto.emit(device_id, topico, iso or _iso_agora())
+
+    def emitir_mensagem(self, device_id: str, topico: str, tipo: str = "contagem", iso: str | None = None) -> bool:
+        """Simula uma mensagem recebida, como o core (CLAUDE.md, 11/11/2026): só a leitura de contagem
+        (`tipo="contagem"`, objeto `channels`) emite `dispositivo_visto`; "diag", "resposta" e "evento" não.
+        Devolve True se emitiu."""
+        if tipo != "contagem":
+            return False
+        self.emitir_dispositivo(device_id, topico, iso)
+        return True
 
     def emitir_erro(self, categoria: str, mensagem: str, topico: str | None = None, detalhe: str | None = None,
                     payload: str | None = None, quando: str | None = None) -> None:
@@ -258,9 +268,12 @@ class FakePipelineBridge(QObject):
             self._log("INFO", f"Mensagem em {sub} · {formato} · {campos} campos")
             device = sub.rsplit("/", 1)[-1]
             agora_m = time.monotonic()
-            if agora_m - self._visto_em.get(device, -1e9) >= 5.0:  # como o bridge real: 1 a cada 5 s por device
+            if n % 7 == 0:
+                # Como o core: resposta de diagnóstico (ack/command) não é leitura → sem dispositivo_visto.
+                self.emitir_mensagem(device, f"NOVUS/{device}/ack/command", "diag")
+            elif agora_m - self._visto_em.get(device, -1e9) >= 5.0:  # como o bridge real: 1 a cada 5 s por device
                 self._visto_em[device] = agora_m
-                self.emitir_dispositivo(device, sub)
+                self.emitir_mensagem(device, sub, "contagem")
                 if device not in self._diag_enviado:  # como o core: canais e diag na primeira vez que vê o device
                     self._diag_enviado.add(device)
                     self.emitir_canais(device, ["chd1", "chd2", "chd3"])

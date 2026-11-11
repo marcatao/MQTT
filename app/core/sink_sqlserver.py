@@ -2,7 +2,13 @@
 
 Recebe ``LinhaIot`` (``app.core.mapeamento``). Linhas incompletas (``motivo`` preenchido: sem pid, device_id ou
 ts_unix) nunca vão ao banco: seguem direto para a contingência e não contam como gravadas (o pipeline já as contou
-como erro). Só as colunas ``pid, device_id, ts_unix, chd1..3_value, payload_json, recebido_em`` são inseridas.
+como erro). Só as colunas ``pid, device_id, ts_unix, chd1..6_value, payload_json, recebido_em`` são inseridas.
+
+Colunas detectadas (canais 4–6, 11/11/2026): ao abrir cada conexão, o sink lê ``INFORMATION_SCHEMA.COLUMNS`` da
+tabela configurada e monta o INSERT e o ``setinputsizes`` só com as colunas ``chdN_value`` que existem. Assim o
+INSERT não falha antes de ``sql/canais_4_a_6_iot001.sql`` ser rodado; se chegar valor num canal sem coluna, um AVISO
+sai uma vez por sessão (o valor continua no ``payload_json``). O resultado vale para a conexão: ao reconectar
+(queda, troca de configuração) é lido de novo, e depois do script as colunas novas entram sozinhas.
 
 ``SinkSqlServer`` junta registros e grava quando o lote chega a ``lote_max`` ou passa ``lote_segundos`` (o que vier
 primeiro), numa transação, com ``executemany`` parametrizado e ``fast_executemany``. Erros são classificados pelo
@@ -63,12 +69,33 @@ class Sink(Protocol):
     def fechar(self) -> int: ...        # descarrega o que restou e libera recursos
 
 
-def montar_insert(tabela: str) -> str:
-    """INSERT parametrizado; o nome da tabela é validado (só ``[A-Za-z0-9_]``, ``.`` e colchetes)."""
+COLUNAS_FIXAS_INICIO = ("pid", "device_id", "ts_unix")
+COLUNAS_FIXAS_FIM = ("payload_json", "recebido_em")
+CANAIS_BASE = ("chd1_value", "chd2_value", "chd3_value")   # existem na IOT001 desde a v0.1.3
+
+
+def colunas_insert(existentes: set[str] | None) -> tuple[str, ...]:
+    """Colunas do INSERT dadas as colunas da tabela (minúsculas). Vazio/None = desconhecidas: usa chd1..chd3."""
+    if existentes:
+        canais = tuple(c for c in LinhaIot.CANAIS if c in existentes)
+    else:
+        canais = CANAIS_BASE   # tabela invisível ou consulta falhou: o próprio INSERT dirá o motivo (42S02...)
+    return (*COLUNAS_FIXAS_INICIO, *canais, *COLUNAS_FIXAS_FIM)
+
+
+def montar_insert(tabela: str, colunas: tuple[str, ...] | list[str] | None = None) -> str:
+    """INSERT parametrizado; o nome da tabela é validado (só ``[A-Za-z0-9_]``, ``.`` e colchetes).
+
+    ``colunas``: subconjunto de ``LinhaIot.COLUNAS`` (padrão: todas). Os nomes vêm só dessa lista fixa.
+    """
     alvo = sql_conexao.tabela_citada(tabela)
-    colunas = ", ".join(f"[{c}]" for c in LinhaIot.COLUNAS)
-    marcadores = ", ".join("?" for _ in LinhaIot.COLUNAS)
-    return f"INSERT INTO {alvo} ({colunas}) VALUES ({marcadores})"
+    colunas = tuple(colunas or LinhaIot.COLUNAS)
+    desconhecidas = [c for c in colunas if c not in LinhaIot.COLUNAS]
+    if desconhecidas:
+        raise ValueError(f"Colunas desconhecidas para a IOT001: {desconhecidas}")
+    nomes = ", ".join(f"[{c}]" for c in colunas)
+    marcadores = ", ".join("?" for _ in colunas)
+    return f"INSERT INTO {alvo} ({nomes}) VALUES ({marcadores})"
 
 
 # ------------------------------------------------------------------------------------------ contingência
@@ -204,6 +231,8 @@ class SinkSqlServer:
         self.pausa_apos_falha = pausa_apos_falha
         self._lote = _Lote(gravacao.lote_max, gravacao.lote_segundos)
         self._conexao = None
+        self._colunas: tuple[str, ...] | None = None   # colunas do INSERT nesta conexão (None = ainda não lidas)
+        self._avisou_canais = False                     # AVISO de chd4..6 sem coluna: 1 vez por sessão
         self._indisponivel_ate = 0.0
         self._erros: list[dict] = []  # um item por erro (vira registro na janela de erros do pipeline)
         self._fallback = SinkContingencia(gravacao, logar, pasta_base)
@@ -396,16 +425,57 @@ class SinkSqlServer:
         erros, self._erros = self._erros, []
         return erros
 
+    def _detectar_colunas(self) -> tuple[str, ...]:
+        """Lê as colunas da tabela (INFORMATION_SCHEMA) na conexão atual; erro de conexão sobe (reconecta)."""
+        schema, tabela = sql_conexao.validar_tabela(self._sql.tabela)
+        existentes: set[str] = set()
+        cursor = self._conexao.cursor()
+        try:
+            existentes = sql_conexao.colunas_da_tabela(cursor, schema, tabela)
+        except Exception as exc:  # noqa: BLE001
+            if classificar_erro(exc)[0] == "conexao":
+                raise
+            self._logar("AVISO", f"Não foi possível ler as colunas de {self._sql.tabela} "
+                                 f"({type(exc).__name__}); gravando só chd1_value..chd3_value.")
+        finally:
+            try:
+                cursor.close()
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            self._conexao.commit()   # fecha a transação implícita do SELECT (autocommit desligado)
+        except Exception:  # noqa: BLE001 - se a conexão caiu, o INSERT logo abaixo mostra
+            pass
+        colunas = colunas_insert(existentes)
+        self.sql_insert = montar_insert(self._sql.tabela, colunas)
+        return colunas
+
+    def _avisar_canais_sem_coluna(self, itens: list[LinhaIot], colunas: tuple[str, ...]) -> None:
+        if self._avisou_canais:
+            return
+        faltam = [c for c in LinhaIot.CANAIS_NOVOS if c not in colunas]
+        if not faltam or not any(i.canais_com_valor(tuple(faltam)) for i in itens):
+            return
+        self._avisou_canais = True
+        nomes = "chd4_value..chd6_value" if len(faltam) == len(LinhaIot.CANAIS_NOVOS) else ", ".join(faltam)
+        self._logar("AVISO", f"A tabela {self._sql.tabela} ainda não tem {nomes}: rode "
+                             "sql/canais_4_a_6_iot001.sql. Os valores continuam no payload_json.")
+
     def _inserir(self, itens: list[LinhaIot]) -> None:
         if self._conexao is None:
             self._conexao = (self._conectar or sql_conexao.conectar)(self._sql)
+            self._colunas = None
+        if self._colunas is None:
+            self._colunas = self._detectar_colunas()
+        colunas = self._colunas
+        self._avisar_canais_sem_coluna(itens, colunas)
         cursor = self._conexao.cursor()
         try:
             cursor.fast_executemany = True
-            tipos = _tipos_parametros()
+            tipos = _tipos_parametros(colunas)
             if tipos is not None and hasattr(cursor, "setinputsizes"):
                 cursor.setinputsizes(tipos)
-            cursor.executemany(self.sql_insert, [r.como_tupla() for r in itens])
+            cursor.executemany(self.sql_insert, [r.como_tupla(colunas) for r in itens])
             self._conexao.commit()
             self.gravados_sql += len(itens)
         except Exception:
@@ -427,6 +497,7 @@ class SinkSqlServer:
             except Exception:  # noqa: BLE001
                 pass
             self._conexao = None
+        self._colunas = None   # a próxima conexão lê as colunas de novo
 
 
 def classificar_erro(exc: BaseException) -> tuple[str, str]:
@@ -444,8 +515,8 @@ def classificar_erro(exc: BaseException) -> tuple[str, str]:
     return "outro", sqlstate
 
 
-def _tipos_parametros():
-    """Tipos explícitos para o fast_executemany, na ordem de ``LinhaIot.COLUNAS``.
+def _tipos_parametros(colunas: tuple[str, ...] | list[str] | None = None):
+    """Tipos explícitos para o fast_executemany, na ordem de ``colunas`` (padrão: ``LinhaIot.COLUNAS``).
 
     Evita conversões implícitas (ex.: NVARCHAR → VARCHAR no device_id, que impede uso de índice) e erro quando a
     1ª linha do lote tem NULL. Só quando o pyodbc já foi carregado por ``sql_conexao.conectar``; com conexões
@@ -454,16 +525,16 @@ def _tipos_parametros():
     pyodbc = sys.modules.get("pyodbc")
     if pyodbc is None or not hasattr(pyodbc, "SQL_VARCHAR"):
         return None
-    return [
-        (pyodbc.SQL_BIGINT, 0, 0),            # pid bigint
-        (pyodbc.SQL_VARCHAR, 100, 0),         # device_id varchar(100)
-        (pyodbc.SQL_BIGINT, 0, 0),            # ts_unix bigint
-        (pyodbc.SQL_DECIMAL, 18, 4),          # chd1_value decimal(18,4)
-        (pyodbc.SQL_DECIMAL, 18, 4),          # chd2_value
-        (pyodbc.SQL_DECIMAL, 18, 4),          # chd3_value
-        (pyodbc.SQL_WVARCHAR, 0, 0),          # payload_json nvarchar(max) (tamanho 0 = max)
-        (pyodbc.SQL_TYPE_TIMESTAMP, 23, 3),   # recebido_em datetime2(3), UTC
-    ]
+    decimal = (pyodbc.SQL_DECIMAL, 18, 4)        # chdN_value decimal(18,4)
+    tipos = {
+        "pid": (pyodbc.SQL_BIGINT, 0, 0),             # bigint
+        "device_id": (pyodbc.SQL_VARCHAR, 100, 0),    # varchar(100)
+        "ts_unix": (pyodbc.SQL_BIGINT, 0, 0),         # bigint
+        **{c: decimal for c in LinhaIot.CANAIS},
+        "payload_json": (pyodbc.SQL_WVARCHAR, 0, 0),  # nvarchar(max) (tamanho 0 = max)
+        "recebido_em": (pyodbc.SQL_TYPE_TIMESTAMP, 23, 3),   # datetime2(3), UTC
+    }
+    return [tipos[c] for c in (colunas or LinhaIot.COLUNAS)]
 
 
 def criar_sink(sql: SqlServerConfig, gravacao: GravacaoConfig, logar: Logar = _sem_log,

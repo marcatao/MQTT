@@ -34,9 +34,11 @@ Sem duplicatas (``_MemoriaGravadas``, 24 h, tamanho limitado): não vão ao sink
 reenvios QoS 1 caem aqui e contam como "duplicadas ignoradas" (não são erro). A memória vale enquanto o programa
 estiver aberto, entre conexões.
 
-Dispositivos (``ao_dispositivo``): para cada leitura ou evento com ``device_id``, avisa (device_id, tópico,
-hora local da recepção), no máx. 1 vez a cada ``INTERVALO_DISPOSITIVO`` s por device; a primeira de cada device
-(desde a conexão) sai sempre. Respostas (``ack/*``) não avisam (o tópico mostrado na aba Clientes é o dos dados).
+Dispositivos (``ao_dispositivo``): só para **leituras** (``channels`` ou formato genérico) com ``device_id``, avisa
+(device_id, tópico, hora local da recepção), no máx. 1 vez a cada ``INTERVALO_DISPOSITIVO`` s por device; a primeira
+de cada device (desde a conexão) sai sempre. Eventos e respostas (diag, ``ack/*``) não avisam: o "Último envio" da
+aba Clientes é o da última leitura de contagem (decidido em 11/11/2026). ``ao_leitura`` (vigia) continua valendo
+para qualquer mensagem MQTT.
 ``ao_canais(device_id, json)``: quando o conjunto de canais em ``channels`` de um device muda (1ª vez inclusive).
 
 Comandos (``zerar_contadores``, ``pedir_diagnostico``; ``[dispositivos]``): publicados com QoS 1 em
@@ -63,6 +65,10 @@ batem sempre. Categorias: "payload" (inválido, binário, vazio, incompleto), "s
 falha do banco, linha recusada na bissecção), "contingencia" (falha ao gravar o arquivo), "fila" (fila cheia),
 "mqtt" (queda do broker, conexão recusada, assinatura recusada), "comando" (zerar contadores recusado ou sem
 resposta).
+
+Portal OEE (``app.core.oee_dispositivos``, ``[oee]``): cada ``reported.diag`` faz o upsert do device em
+``dispositivos_iot`` e cada leitura completa renova ``ultimo_sinal_em`` (máx. 1/min por device), numa thread com
+conexão própria. Falhas só viram AVISO (limitado) e nunca contam erro nem atrasam a gravação na IOT001.
 
 Erros "mqtt" contam **um por queda (incidente)**, não um por tentativa de reconexão (o paho tenta a cada 1–60 s):
 - conexão perdida sem o usuário pedir, ou tentativa de conexão que falha (inacessível/CONNACK recusado) sem incidente
@@ -93,6 +99,7 @@ from app.core import digirail
 from app.core import erros as _erros
 from app.core import topicos as _topicos
 from app.core.mqtt_client import ClienteMqtt, validar_parametros
+from app.core.oee_dispositivos import CadastroOee
 from app.core.mapeamento import EVENTO, RESPOSTA, LinhaIot, ResultadoMapa, _device_da_mensagem, mapear
 from app.core.parser import trecho
 from app.core.sink_sqlserver import Sink, criar_sink
@@ -353,8 +360,10 @@ class Pipeline:
         ao_canais: Callable[[str, str], None] = _nada,
         ao_diagnostico: Callable[[str, str], None] = _nada,
         ao_resposta_comando: Callable[[str, str, bool, str], None] = _nada,
+        cadastro_oee: CadastroOee | None = None,
     ) -> None:
-        """``relogio``, ``intervalo_gravacao`` (sobrepõe a config) e ``fabrica_cliente`` existem para os testes."""
+        """``relogio``, ``intervalo_gravacao`` (sobrepõe a config), ``fabrica_cliente`` e ``cadastro_oee`` existem
+        para os testes."""
         self.config = config
         self._ao_status = ao_status
         self._ao_log = ao_log
@@ -415,6 +424,10 @@ class Pipeline:
         self._trava_topicos = threading.Lock()
         self._extras_dispositivos: list[str] = []    # tópicos salvos assinados como extra (exatos)
 
+        # portal OEE: fila/thread/conexão próprias (nunca atrasa a gravação na IOT001)
+        self._oee = cadastro_oee if cadastro_oee is not None else CadastroOee(
+            config.sqlserver, getattr(config, "oee", None), self._log, relogio=relogio)
+
     # ------------------------------------------------------------------------------ API pública
 
     def conectar(self, broker: str, porta: int, topico: str, qos: int) -> Future:
@@ -430,6 +443,7 @@ class Pipeline:
         self.config.sqlserver = sql
         with self._trava:
             self._sql_pendente = sql
+        self._oee.definir_sql(sql)
 
     def encerrar(self, timeout: float = 5.0) -> bool:
         """Bloqueia até ``timeout`` segundos. Devolve True se terminou limpo."""
@@ -445,6 +459,7 @@ class Pipeline:
             self._log("AVISO", "Encerramento demorou mais que o esperado; alguns registros podem ter ficado "
                                "só na memória.")
         self._controle.shutdown(wait=False, cancel_futures=True)
+        self._oee.parar(timeout=0.5)
         return ok
 
     def zerar_contadores(self, device_id: str, canais: list[int]) -> Future | None:
@@ -746,6 +761,8 @@ class Pipeline:
             self._ultima_msg_t = None
         self._dispositivos_t = {}
         self._diag_t = {}
+        self._oee.definir_sql(self.config.sqlserver)
+        self._oee.nova_sessao()      # detecção do portal OEE de novo a cada conexão
         proximo = proximo_ciclo(self._relogio(), intervalo) if intervalo > 0 else None
         if intervalo > 0:
             self._log("INFO", f"Amostragem: 1 leitura por dispositivo a cada {intervalo:g} s "
@@ -925,7 +942,7 @@ class Pipeline:
             res.device_id = dev_dono    # resposta no ack daquele device é dele, diga o payload o que disser
         extra = " (retida)" if retida else ""
         if res.tipo == EVENTO:
-            self._avisar_dispositivos([res.device_id], topico, t_receb)
+            # evento não é leitura de contagem: não mexe no "Último envio" (dispositivo_visto)
             self._visto_para_diagnostico(res.device_id)
             if limitador.pode(self._log):
                 eventos = res.objeto.get("events") if isinstance(res.objeto, dict) else None
@@ -948,6 +965,7 @@ class Pipeline:
         for linha in completas:
             self._visto_para_diagnostico(linha.device_id)
             self._conferir_relogio(linha, t_receb)
+            self._oee.sinal(linha.device_id)   # ultimo_sinal_em no portal OEE (máx. 1/min por device)
         self._conferir_canais(res, topico, dev_dono)
 
         if amostra is None:
@@ -1218,6 +1236,7 @@ class Pipeline:
                 quem = cmd.device_id if cmd is not None else device
                 if quem:
                     self._avisar(self._ao_diagnostico, quem, json.dumps(diag, ensure_ascii=False))
+                    self._cadastrar_oee(quem, diag)
                 origem = "" if cmd is not None else " (enviado pelo próprio dispositivo)"
                 self._log("INFO", f"Diagnóstico de {quem or topico}{origem}: {digirail.resumo_diag(diag)}")
                 if cmd is not None and cmd.manual:
@@ -1239,6 +1258,14 @@ class Pipeline:
                 erro = dados.get("error") if isinstance(dados, dict) else None
                 self._log("INFO", f"Resposta '{comando}' de {device or topico}"
                                   f"{f' (error={erro})' if erro not in (None, 0) else ''}; não é leitura.")
+
+    def _cadastrar_oee(self, device: str, diag: dict) -> None:
+        """Upsert do device no portal OEE (thread própria; nunca levanta exceção nem conta erro)."""
+        try:
+            topico = self.topicos_do_dispositivo(device).get("events")
+        except Exception:  # noqa: BLE001
+            topico = None
+        self._oee.diagnostico(device, diag, topico)
 
     def _ciclo(self, sink: Sink, amostra: _Amostragem, intervalo: float, momento: float | None,
                fechar: bool = False, referencia: float | None = None) -> float | None:

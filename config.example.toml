@@ -45,6 +45,10 @@ ts_unix = ["ts_unix", "ts", "timestamp", "time", "epoch", "unix", "datahora", "d
 chd1 = ["chd1_value", "chd1.value", "chd1"]
 chd2 = ["chd2_value", "chd2.value", "chd2"]
 chd3 = ["chd3_value", "chd3.value", "chd3"]
+# chd4..chd6 vão para chd4_value..chd6_value depois de rodar sql/canais_4_a_6_iot001.sql (antes, só no payload_json)
+chd4 = ["chd4_value", "chd4.value", "chd4"]
+chd5 = ["chd5_value", "chd5.value", "chd5"]
+chd6 = ["chd6_value", "chd6.value", "chd6"]
 leituras = ["leituras", "readings", "dados", "data", "registros"]  # lista de leituras dentro de um objeto
 device_do_topico = true      # sem device_id no payload: {id} de NOVUS/{id}/..., ou o nível do curinga da assinatura
 fuso_sem_offset = "local"    # data/hora ISO sem fuso: "local" (do PC) ou "utc"
@@ -82,5 +86,17 @@ topico_ack_config = "NOVUS/{id}/ack/config"
 topico_comando = "NOVUS/{id}/command"
 topico_resposta = "NOVUS/{id}/ack/command"   # confirmação de comando
 arquivo_topicos = "dispositivos.json"        # na pasta do programa
-diagnostico_minutos = 30          # pede diagnóstico ao ver o dispositivo (a cada conexão) e a cada N min; 0 desliga
+diagnostico_minutos = 3           # pede diagnóstico ao ver o dispositivo (a cada conexão) e a cada N min; 0 desliga
 timeout_comando_segundos = 15     # sem resposta nesse tempo: "sem resposta do dispositivo"
+
+[oee]
+# Cadastro dos dispositivos no portal OEE (mesmo SQL Server e mesmo login de [sqlserver], nome em 3 partes).
+# Cada diagnóstico recebido cria/atualiza a linha do device (codigo = device_id); as leituras renovam
+# ultimo_sinal_em (no máx. 1 vez por minuto). Nunca mexe em maquina_id, nome, tipo, ativo nem unidade de quem já
+# existe. Sem o banco, a tabela ou a permissão, a etapa se desliga sozinha (1 INFO no log). Permissões:
+# sql/permissoes_oee.sql (rodar como admin). O integrador não cria nem altera a tabela do OEE.
+habilitado = true
+banco = "OEE"                    # nome do banco do portal (no .env do OEE pode ser outro, ex.: "OEE_Alumbra")
+tabela = "dbo.dispositivos_iot"
+unidade = "manutencao"           # manutencao | tecnologia | ambos (só na inserção)
+tipo = "contador"                # só na inserção

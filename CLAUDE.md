@@ -138,7 +138,8 @@ em 30/10/2026. O app não muda por causa disso.
 
 Regras de mapeamento payload → linha:
 
-- Colunas inseridas: `pid, device_id, ts_unix, chd1_value, chd2_value, chd3_value, payload_json, recebido_em`.
+- Colunas inseridas: `pid, device_id, ts_unix, chd1_value … chd6_value, payload_json, recebido_em` (chd4–6 só se a
+  coluna existir na tabela; canal não enviado = NULL).
 - `recebido_em` em **UTC** (mesmo critério do DEFAULT da tabela), hora em que o app recebeu a mensagem.
 - `device_id` é `varchar` (não Unicode): enviar como `SQL_VARCHAR`; se faltar no payload, usar o dispositivo deduzido do
   tópico (nível após o prefixo da assinatura).
@@ -188,7 +189,7 @@ class PipelineBridge(QObject):
     proxima_gravacao = Signal(float)        # epoch (s) do próximo ciclo; só com amostragem (> 0); no padrão (0) não é emitido
     ultima_gravacao_ok = Signal(str)        # ISO 8601 local "AAAA-MM-DDTHH:MM:SS" do último INSERT com sucesso no SQL
     ultima_leitura = Signal(str)            # ISO 8601 local da última mensagem MQTT recebida (para o vigia)
-    dispositivo_visto = Signal(str, str, str)  # (device_id, tópico, ISO local) de leitura recebida; máx. 1 a cada 5 s por device
+    dispositivo_visto = Signal(str, str, str)  # (device_id, tópico, ISO local) só de leitura de contagem (channels); máx. 1 a cada 5 s por device
     erro_registrado = Signal(str)           # JSON de UM erro (ver "Erros detalhados"); 1 sinal para cada +1 no contador de erros
     canais_vistos = Signal(str, str)        # (device_id, JSON lista ["chd1","chd2","chd3"]) quando o conjunto de canais muda
     diagnostico_dispositivo = Signal(str, str)  # (device_id, JSON do objeto "diag" do DigiRail: sn, fw_v, curr/avg_rssi, mqtt_queue, ipv4...)
@@ -308,7 +309,7 @@ lacunas L1/L2 serem corrigidas: QoS 1, "Reter Dados" desligado, diagnóstico per
     nos canais com "reset por MQTT" habilitado no NXperience; a resposta traz `error` (0 = ok). Sem resposta em 15 s
     → falha "sem resposta do dispositivo". Falha registra erro categoria `"comando"`.
   - **Diagnóstico**: `{"timestamp": T, "desired": {"diag": {}}}` ao ver um dispositivo pela primeira vez em cada
-    conexão e a cada `[dispositivos] diagnostico_minutos = 30` (0 desliga). Preenche na aba Clientes: nº de série,
+    conexão e a cada `[dispositivos] diagnostico_minutos = 3` (era 30 até 11/11/2026; 0 desliga). Preenche na aba Clientes: nº de série,
     firmware, sinal Wi-Fi (RSSI), leituras guardadas no aparelho (`mqtt_queue`) e IP.
 - **Aba Clientes**: colunas novas Nº série, Firmware, Wi-Fi e Fila; em cada linha, botão **Zerar contadores** que abre
   a escolha dos canais (chd1–chd6, individual ou todos), pede confirmação e mostra o resultado.
@@ -373,8 +374,7 @@ que o integrador não ouvia.
 ## Pendências conhecidas
 
 - Índice único `(device_id, ts_unix)` na IOT001 (opcional, decidir com o usuário).
-- Lacunas do DigiRail ainda abertas (seção 7 de `docs/digirail_iot_mqtt.md`): L6 vigia × intervalo de envio (agora só se o envio passar de 60 min); L7 JSON inválido do firmware (parcial, confirmar com captura real); L11 canais além de chd1–chd3 só no
-  `payload_json`. L1–L5, L8–L10 resolvidas na v0.1.10 (L5 só em memória: some ao reiniciar o programa).
+- Lacunas do DigiRail ainda abertas (seção 7 de `docs/digirail_iot_mqtt.md`): L6 vigia × intervalo de envio (agora só se o envio passar de 60 min); L7 JSON inválido do firmware (parcial, confirmar com captura real); L11 entradas analógicas e canais remotos (chr1–chr8) só no `payload_json` (chd4–chd6 gravados desde 11/11/2026). L1–L5, L8–L10 resolvidas na v0.1.10 (L5 só em memória: some ao reiniciar o programa).
 
 - Reprocessar os arquivos de `contingencia/` (`.jsonl`) no SQL Server quando o banco voltar.
 - Possível duplicação de um lote se o `commit` chegar ao servidor e a resposta se perder (exigiria id de lote ou

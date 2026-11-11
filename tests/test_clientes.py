@@ -149,7 +149,8 @@ def test_registro_conta_e_liga_device_id_pelo_topico():
     r = RegistroClientes()
     r.processar_texto(SAIDA, T0)
     a, b = r.cliente("NOVUS_A"), r.cliente("NOVUS_B")
-    assert (a.ip, a.mensagens, a.ultimo_envio, a.status) == ("192.168.100.50", 2, T0 + 15, "Conectado")
+    # PUBLISH não define o último envio (só dispositivo_visto, leituras de contagem)
+    assert (a.ip, a.mensagens, a.ultimo_envio, a.status) == ("192.168.100.50", 2, None, "Conectado")
     assert (b.usuario, b.mensagens) == ("novus", 1)
     assert r.cliente("mqtt-sqlserver-4f2a").status == "Assinante"
     assert set(r.retirar_ips_novos()) == {"192.168.100.50", "192.168.100.51", "127.0.0.1"}
@@ -157,6 +158,7 @@ def test_registro_conta_e_liga_device_id_pelo_topico():
     # o device_id vai para o cliente que publicou por último no MESMO tópico
     r.dispositivo_visto("Teste_Alumbra", "NOVUS/Teste_Alumbra/a", T0 + 16)
     assert a.nome == "Teste_Alumbra" and b.nome is None
+    assert a.ultimo_envio == T0 + 16 and b.ultimo_envio is None
     assert a.nome_exibido == "Teste_Alumbra" and b.nome_exibido == "NOVUS_B"
     assert len(r.linhas) == 3  # nenhuma linha avulsa
 
@@ -281,6 +283,7 @@ def test_cores_e_textos_de_inatividade(novo_painel):
     painel = novo_painel(relogio=relogio, executor_arp=lambda: "", locais=set())
     painel.definir_paleta(estilo.CLARA)
     painel.ao_saida_mosquitto("saida", f"{int(T0)}: Received PUBLISH from dev (d0, q0, r0, m0, 't/1', ... (1 bytes))")
+    painel.ao_dispositivo_visto("dev1", "t/1", datetime.fromtimestamp(T0).strftime("%Y-%m-%dT%H:%M:%S"))
     modelo = painel.modelo
 
     def celula(col, papel=Qt.ItemDataRole.DisplayRole):

@@ -24,7 +24,9 @@ class PipelineBridge(QObject):
     proxima_gravacao = Signal(float)         # epoch (s) do próximo ciclo; só com amostragem (intervalo > 0)
     ultima_gravacao_ok = Signal(str)         # "AAAA-MM-DDTHH:MM:SS" local do último INSERT com commit no SQL Server
     ultima_leitura = Signal(str)             # "AAAA-MM-DDTHH:MM:SS" local da última mensagem MQTT (máx. 1 a cada 5 s)
-    dispositivo_visto = Signal(str, str, str)  # (device_id, tópico, ISO local) de leitura recebida; máx. 1/5 s por device
+    # (device_id, tópico, ISO local) só de leitura de contagem (channels); eventos, diag e respostas não emitem;
+    # máx. 1 a cada 5 s por device. O vigia usa ultima_leitura (qualquer mensagem), não este.
+    dispositivo_visto = Signal(str, str, str)
     erro_registrado = Signal(str)            # JSON de UM erro (app.core.erros); 1 sinal para cada +1 no contador de erros
     canais_vistos = Signal(str, str)         # (device_id, JSON lista ["chd1","chd2","chd3"]) quando o conjunto muda
     diagnostico_dispositivo = Signal(str, str)  # (device_id, JSON do objeto "diag" do DigiRail: sn, fw_v, rssi...)

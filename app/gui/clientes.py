@@ -3,9 +3,12 @@
 O MQTT não traz IP nem MAC, então a lista junta três fontes (CLAUDE.md, "Aba Clientes"):
 
 * a saída do `mosquitto -v` que a aba Mosquitto já captura (`ConsoleMosquitto.saida`): IP, client id, PUBLISH,
-  SUBSCRIBE e desconexões (`interpretar_linha`, testável sem Qt);
+  SUBSCRIBE e desconexões (`interpretar_linha`, testável sem Qt). O PUBLISH conta mensagens, define tópico e status
+  e alimenta os tópicos não ouvidos, mas não mexe no Último envio;
 * o sinal `dispositivo_visto(device_id, tópico, iso)` do bridge: o nome (device_id) é ligado ao client id que
-  publicou por último no MESMO tópico; sem Mosquitto na aba, a linha fica só com nome, tópico e último envio;
+  publicou por último no MESMO tópico; sem Mosquitto na aba, a linha fica só com nome, tópico e último envio.
+  O core só o emite para leituras de contagem (`channels`), e ele é a ÚNICA fonte do Último envio, do "Há quanto
+  tempo", da cor de atrasado e do chip "N dispositivos enviando" (diagnóstico, respostas e eventos não contam);
 * a tabela ARP do Windows (`arp -a`), consultada fora da thread da GUI a cada 60 s e quando surge um IP novo
   (`interpretar_arp`, `normalizar_mac`; o executor é injetável para testar em Linux);
 * os sinais do DigiRail (`diagnostico_dispositivo`, `canais_vistos`, `resposta_comando`): nº de série, firmware,
@@ -106,8 +109,10 @@ COLUNAS = ("Nome", "IP", "MAC", "Último envio", "Há quanto tempo", "Tópico", 
 # meio; tópico, contagem e a ação no fim. Colunas menos usadas podem ser escondidas (clique direito no cabeçalho).
 ORDEM_VISUAL = (COL_NOME, COL_STATUS, COL_HA, COL_ULTIMO, COL_WIFI, COL_FILA, COL_IP, COL_MAC, COL_SERIE,
                 COL_FIRMWARE, COL_DIAG, COL_TOPICO, COL_MENSAGENS, COL_ACAO)
+DICA_ULTIMO_ENVIO = "Última leitura de contagem recebida (diagnóstico e eventos não contam)."
 DICAS_COLUNAS = {
-    COL_HA: "Tempo desde o último envio do dispositivo.",
+    COL_ULTIMO: DICA_ULTIMO_ENVIO,
+    COL_HA: "Tempo desde a última leitura de contagem recebida (diagnóstico e eventos não contam).",
     COL_WIFI: "Sinal Wi-Fi (RSSI) informado pelo diagnóstico do aparelho.",
     COL_FILA: "Leituras guardadas no aparelho esperando envio por MQTT (mqtt_queue do diagnóstico).",
     COL_SERIE: "Número de série, pelo diagnóstico do aparelho.",
@@ -420,7 +425,8 @@ class RegistroClientes:
         elif ev.tipo == "publish":
             c.conectado = True
             c.mensagens = (c.mensagens or 0) + 1
-            c.ultimo_envio = max(c.ultimo_envio or 0.0, quando)
+            # O PUBLISH não mexe no último envio: pode ser diagnóstico, resposta de comando ou evento. O último envio
+            # vem só de `dispositivo_visto` (leituras de contagem), decidido com o usuário em 11/11/2026.
             c.topico = ev.topico
             if ev.topico is not None:
                 self._publicador[ev.topico] = c.chave
@@ -897,8 +903,11 @@ class ModeloClientes(QAbstractTableModel):
             return None
         if col == COL_HA:
             dica = DICA_INATIVIDADE.get(nivel_inatividade(self.idade(c)))
-            envio = f"Último envio: {formatar_epoch(c.ultimo_envio)}" if c.ultimo_envio else None
+            envio = (f"Última leitura de contagem: {formatar_epoch(c.ultimo_envio)}" if c.ultimo_envio
+                     else "Nenhuma leitura de contagem recebida ainda.")
             return "\n".join(t for t in (envio, dica) if t) or None
+        if col == COL_ULTIMO:
+            return DICA_ULTIMO_ENVIO
         if col == COL_STATUS and c.client_id and c.assinante and c.mensagens:
             return "Publica e também assina tópicos."
         if col == COL_TOPICO and c.topico:
@@ -1052,7 +1061,8 @@ class PainelClientes(QWidget):
         barra = QHBoxLayout()
         barra.setSpacing(8)
         self.chip_enviando = ChipInfo("enviando", "Dispositivos enviando", self)
-        self.chip_enviando.setToolTip("Clientes que publicaram nos últimos 2 minutos.")
+        self.chip_enviando.setToolTip("Dispositivos que mandaram leitura de contagem nos últimos 2 minutos "
+                                      "(diagnóstico e eventos não contam).")
         self.opcao_assinantes = QCheckBox("Mostrar assinantes", self)
         self.opcao_assinantes.setToolTip("Mostra também quem só assina tópicos: este programa e o mosquitto_sub.")
         self.opcao_assinantes.toggled.connect(self._ao_mostrar_assinantes)
