@@ -188,6 +188,24 @@ def test_ordenar_por_estado(novo_painel):
     assert [l[COL_ESTADO].split(" ")[0] for l in p.linhas_visiveis()] == ["98", "99", "7", "2"]
 
 
+def test_97_sem_apontamento_iot_tem_cor_propria_e_fica_com_as_paradas(novo_painel):
+    from app.gui.apontamentos import DelegadoLegenda
+    assert tom_legenda("97") == "sem_iot"
+    p = novo_painel()
+    assert isinstance(p.delegado, DelegadoLegenda)
+    for paleta in (estilo.CLARA, estilo.ESCURA):
+        p.definir_paleta(paleta)
+        cor_97 = p.delegado.cores("sem_iot")
+        assert cor_97 == (paleta.texto, paleta.borda_forte)
+        assert cor_97 != p.delegado.cores("neutro")                  # diferente do "outro" (motivo do operador)
+        assert cor_97 not in {p.delegado.cores(t) for t in ("sucesso", "aviso", "erro")}
+    sem_iot = maquina(maquina_id=5, codigo="INJ05", nome="Injetora 05", legenda="97",
+                      legenda_descricao="Sem apontamento IOT")
+    p.ao_ciclo(ciclo(TRES + [sem_iot]))
+    p.tabela.sortByColumn(COL_ESTADO, Qt.SortOrder.AscendingOrder)
+    assert [l[COL_ESTADO].split(" ")[0] for l in p.linhas_visiveis()] == ["98", "97", "99", "7", "2"]
+
+
 def test_contagem_regressiva_da_proxima(novo_painel):
     relogio = Relogio()
     p = novo_painel(relogio=relogio)

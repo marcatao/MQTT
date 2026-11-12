@@ -113,4 +113,7 @@ minutos = 3                      # periodicidade (a aba "Apontamentos reais" pod
 legenda_produzindo = "2"         # códigos das legendas no portal (já cadastradas)
 legenda_micro = "99"
 legenda_macro = "98"
+legenda_sem_iot = "97"           # Sem apontamento IOT: aparelho sem leitura (sem ela no portal, tudo vira 2/99/98)
+sem_leitura_segundos = 120       # mais que isso sem nenhuma linha na IOT001 = sem leitura (o DigiRail manda a cada ~10 s)
+dias_correcao = 7                # dados retroativos dentro de um 97 de até N dias atrás refazem aquele trecho
 fuso = "America/Sao_Paulo"       # dia local: um apontamento não passa da meia-noite

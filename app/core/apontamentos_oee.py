@@ -8,6 +8,10 @@ Especificação: ``docs/apontamentos_reais.md`` (fonte da verdade). Resumo:
   contador zerado = nova base). Com vários canais, vale a produção de qualquer um.
 - Intervalo entre produções ``gap``: ``< micro`` → 2 Produção Normal; ``micro ≤ gap < macro`` → 99 Microparada;
   ``≥ macro`` → 98 Macro parada. A parada começa na última produção; o trecho em aberto usa ``agora − p``.
+- **Sem leitura** (nenhuma linha na IOT001 de nenhum device da máquina por mais de ``sem_leitura_segundos``): o trecho
+  vira 97 Sem apontamento IOT e o intervalo entre produções desconta esse tempo. Leituras que chegam depois dentro de
+  um 97 do integrador (até ``dias_correcao`` dias) fazem a janela recomeçar no dia dele (correção retroativa). Sem a
+  legenda 97 no portal: AVISO e tudo como antes (2/99/98).
 - Trechos iguais seguidos = um apontamento; nenhum passa da meia-noite local (``[apontamentos] fuso``); encadeados
   (``fim = próximo início − 1 s``); trecho < 2 s é absorvido; o último fica em aberto (``fim`` NULL).
 - Reconciliação por máquina, numa transação: os do integrador (``observacao`` começando por ``[IoT]``) são
@@ -46,7 +50,7 @@ AoErro = Callable[[str, str | None], None]          # (mensagem, detalhe)
 AoResultado = Callable[[str], None]                 # JSON do ciclo
 Relogio = Callable[[], float]
 
-PRODUZINDO, MICRO, MACRO = "produzindo", "micro", "macro"
+PRODUZINDO, MICRO, MACRO, SEM_IOT = "produzindo", "micro", "macro", "sem_iot"
 MARCA = "[IoT]"
 OBSERVACAO = "[IoT] Apontamento automático do integrador MQTT"
 CANAIS = tuple(f"chd{n}_value" for n in range(1, 7))
@@ -124,28 +128,78 @@ def classificar(gap: float, micro: int, macro: int) -> str:
     return MACRO
 
 
-def segmentos_continuos(prods: Iterable[int], ini: int, agora: int, micro: int, macro: int
-                        ) -> list[tuple[int, int, str]]:
+def buracos_sem_leitura(ts_leituras: Iterable[int], desde: int, agora: int, limite: int) -> list[tuple[int, int]]:
+    """Períodos ``(a, b)`` sem nenhuma leitura por mais de ``limite`` segundos dentro de ``[desde, agora]``.
+
+    ``ts_leituras``: ``ts_unix`` de TODAS as linhas da IOT001 dos dispositivos da máquina (união, inclusive as com
+    valores NULL). Vale também para o começo (``desde`` → 1ª leitura) e o fim (última leitura → ``agora``, aparelho
+    ainda fora). Sem leitura nenhuma: ``[(desde, agora)]``. O buraco vai da última leitura antes dele até a primeira
+    depois dele.
+    """
+    tss = sorted({int(t) for t in ts_leituras if desde <= int(t) <= agora})
+    if not tss:
+        return [(desde, agora)] if agora > desde else []
+    pontos = [desde, *tss, agora]
+    return [(a, b) for a, b in zip(pontos, pontos[1:]) if b - a > limite]
+
+
+def _sem_leitura_em(buracos: list[tuple[int, int]], a: int, b: int) -> int:
+    """Segundos de ``[a, b)`` que caem em buracos sem leitura."""
+    return sum(max(0, min(hb, b) - max(ha, a)) for ha, hb in buracos)
+
+
+def _recortar(a: int, b: int, estado: str, buracos: list[tuple[int, int]]) -> list[list]:
+    """``[a, b)`` com ``estado``, trocando as partes dentro dos buracos por ``SEM_IOT``."""
+    saida: list[list] = []
+    cursor = a
+    for ha, hb in buracos:
+        if hb <= cursor or ha >= b:
+            continue
+        s, e = max(ha, cursor), min(hb, b)
+        if s > cursor:
+            saida.append([cursor, s, estado])
+        saida.append([s, e, SEM_IOT])
+        cursor = e
+    if cursor < b:
+        saida.append([cursor, b, estado])
+    return saida
+
+
+def segmentos_continuos(prods: Iterable[int], ini: int, agora: int, micro: int, macro: int,
+                        buracos: Iterable[tuple[int, int]] = ()) -> list[tuple[int, int, str]]:
     """Trechos ``(inicio, fim_exclusivo, estado)`` que cobrem ``[ini, agora]`` sem buracos, já mesclados.
 
     ``prods``: produções (ts_unix), podendo incluir as anteriores a ``ini`` (a última delas define o 1º intervalo).
     Sem produção antes de ``ini``, o período até a 1ª produção é macroparada. Produções depois de ``agora`` (relógio
     do aparelho adiantado) são ignoradas. O último trecho termina em ``agora`` (em aberto) e pode ter duração zero
     (produção exatamente em ``agora``).
+
+    ``buracos`` (de ``buracos_sem_leitura``): as partes sem leitura viram ``SEM_IOT`` e o intervalo de cada
+    ``[p, t)`` (e o em aberto) desconta o tempo sem leitura; as partes com leitura são classificadas por esse
+    intervalo observado. Sem buracos, o resultado é o de sempre (2/99/98).
     """
+    buracos = sorted((int(a), int(b)) for a, b in buracos if int(b) > int(a))
     ordenadas = sorted({int(p) for p in prods if int(p) <= agora})
     antes = [p for p in ordenadas if p < ini]
     dentro = [p for p in ordenadas if p >= ini]
     anterior: int | None = antes[-1] if antes else None
     cursor = ini
     brutos: list[list] = []
+
+    def gap_observado(t: int) -> float:
+        if anterior is None:
+            return float("inf")
+        return (t - anterior) - _sem_leitura_em(buracos, anterior, t)
+
     for t in dentro:
-        gap = (t - anterior) if anterior is not None else float("inf")
         if t > cursor:
-            brutos.append([cursor, t, classificar(gap, micro, macro)])
+            brutos.extend(_recortar(cursor, t, classificar(gap_observado(t), micro, macro), buracos))
         anterior, cursor = t, t
-    gap = (agora - anterior) if anterior is not None else float("inf")
-    brutos.append([cursor, agora, classificar(gap, micro, macro)])
+    estado_final = classificar(gap_observado(agora), micro, macro)
+    if agora > cursor:
+        brutos.extend(_recortar(cursor, agora, estado_final, buracos))
+    else:
+        brutos.append([cursor, agora, estado_final])
     mesclados: list[list] = []
     for seg in brutos:
         if mesclados and mesclados[-1][2] == seg[2] and mesclados[-1][1] == seg[0]:
@@ -221,17 +275,25 @@ def dividir_por_dia(segmentos: list[tuple[int, int, str]], fuso: tzinfo) -> list
 
 @dataclass(frozen=True)
 class LegendasIot:
-    """Ids das legendas do integrador (pelos códigos ``2``, ``99``, ``98``)."""
+    """Ids das legendas do integrador (pelos códigos ``2``, ``99``, ``98`` e, se existir, ``97``)."""
     produzindo: int
     micro: int
     macro: int
+    sem_iot: int | None = None      # None: legenda 97 ausente; o estado SEM_IOT não é gerado
 
     def de(self, estado: str) -> int:
+        if estado == SEM_IOT:
+            if self.sem_iot is None:
+                raise ValueError("legenda de sem leitura (97) ausente")
+            return self.sem_iot
         return {PRODUZINDO: self.produzindo, MICRO: self.micro, MACRO: self.macro}[estado]
 
     @property
     def todas(self) -> set[int]:
-        return {self.produzindo, self.micro, self.macro}
+        ids = {self.produzindo, self.micro, self.macro}
+        if self.sem_iot is not None:
+            ids.add(self.sem_iot)
+        return ids
 
 
 def do_integrador(apontamento: dict) -> bool:
@@ -553,6 +615,7 @@ class ApontamentosOee:
         self._esquema: Esquema | None = None
         self._infos: set[tuple] = set()             # INFO "portal não encontrado" já dado (até funcionar)
         self._aviso_legendas = False
+        self._aviso_sem_iot = False                 # AVISO da legenda 97 ausente já dado (até resolver)
         self._sem_parametros: set[int] = set()      # máquinas sem micro/macro já avisadas (sessão)
         self._erro_conexao = False                  # incidente de conexão aberto (1 erro por incidente)
         self._trocou_sql = False                    # definir_sql: a próxima execução reconecta
@@ -748,8 +811,8 @@ class ApontamentosOee:
                 continue
             for k in total:
                 total[k] += contagem[k]
-            for aviso in avisos:
-                self._logar("AVISO", aviso)
+            for nivel, aviso in avisos:
+                self._logar(nivel, aviso)
         n_maq = processadas
         resumo = (f"Apontamentos reais: {n_maq} {'máquina' if n_maq == 1 else 'máquinas'}, "
                   f"{total['criados']} criados, {total['alterados']} atualizados, {total['excluidos']} excluídos")
@@ -824,7 +887,18 @@ class ApontamentosOee:
                 self._logar("AVISO", msg)
             return None, msg
         self._aviso_legendas = False
-        return LegendasIot(achadas["produzindo"], achadas["micro"], achadas["macro"]), todas
+        codigo_97 = str(self._cfg.legenda_sem_iot or "").strip()
+        ids_97 = [l.id for l in todas.values() if l.ativo and codigo_97 and l.codigo == codigo_97]
+        sem_iot = min(ids_97) if ids_97 else None
+        if sem_iot is None:
+            if not self._aviso_sem_iot:
+                self._aviso_sem_iot = True
+                self._logar("AVISO", f"Apontamentos reais: legenda {codigo_97 or '(sem código)'} (Sem apontamento "
+                                     "IOT) não cadastrada ou inativa no portal OEE; períodos sem leitura do aparelho "
+                                     "serão tratados como parada (99/98) até ela ser cadastrada.")
+        else:
+            self._aviso_sem_iot = False
+        return LegendasIot(achadas["produzindo"], achadas["micro"], achadas["macro"], sem_iot), todas
 
     def _ler_maquinas(self) -> list[Maquina]:
         cursor = self._conexao.cursor()
@@ -848,8 +922,8 @@ class ApontamentosOee:
                 "aviso": None if m.canais else "Sem canal IoT de produção com dispositivo ativo."}
 
     def _processar(self, m: Maquina, linha: dict, legendas: LegendasIot, todas: dict[int, Legenda], agora: int
-                   ) -> tuple[dict, list[str]]:
-        """Uma máquina, numa transação. Devolve (contagem, avisos para o log depois do commit)."""
+                   ) -> tuple[dict, list[tuple[str, str]]]:
+        """Uma máquina, numa transação. Devolve (contagem, [(nível, mensagem)] para o log depois do commit)."""
         e = self._esquema
         A = e.t["apontamentos_estado"]
         hoje = inicio_do_dia(agora, self._fuso)
@@ -860,8 +934,6 @@ class ApontamentosOee:
                         "AND LEFT([observacao], 5) = ?", m.id, utc_sql(ontem), utc_sql(hoje), MARCA)
             ini = ontem if cur.fetchone() is not None else hoje
 
-            # leituras: por dispositivo, só as colunas dos canais da máquina
-            desde = ini - m.macro - MARGEM_LEITURAS
             por_device: dict[str, list[str]] = {}
             ausentes: list[str] = []
             for device, canal in m.canais:
@@ -874,7 +946,21 @@ class ApontamentosOee:
                 linha["aviso"] = (f"Canal sem coluna na IOT001: {', '.join(ausentes)} "
                                   "(rode sql/canais_4_a_6_iot001.sql); máquina ignorada.")
                 return {"criados": 0, "alterados": 0, "excluidos": 0}, []
+            logs: list[tuple[str, str]] = []
+            if legendas.sem_iot is not None:
+                retro = self._correcao_retroativa(cur, m, legendas.sem_iot, list(por_device), ini, agora)
+                if retro is not None:
+                    inicio_97, device = retro
+                    ini = inicio_do_dia(inicio_97, self._fuso)
+                    logs.append(("INFO", f"Apontamentos reais: dados retroativos de {device} — recalculando a "
+                                         f"máquina {self._nome(m)} desde "
+                                         f"{datetime.fromtimestamp(ini, self._fuso):%d/%m}."))
+
+            # leituras: por dispositivo, só as colunas dos canais da máquina (todas as linhas: os ts de todas
+            # contam para os buracos sem leitura, mesmo com valores NULL)
+            desde = ini - m.macro - MARGEM_LEITURAS
             listas: list[list[int]] = []
+            ts_todas: list[int] = []
             ultima_leitura: int | None = None
             for device, canais in por_device.items():
                 cols = ", ".join(f"[{c}]" for c in canais)
@@ -883,6 +969,7 @@ class ApontamentosOee:
                 leituras = cur.fetchall() or []
                 for i in range(len(canais)):
                     listas.append(producoes((l[0], l[1 + i]) for l in leituras))
+                ts_todas.extend(int(l[0]) for l in leituras)
                 if leituras:
                     ultima_leitura = max(ultima_leitura or 0, int(leituras[-1][0]))
             if ultima_leitura is None:
@@ -895,7 +982,12 @@ class ApontamentosOee:
             prods = juntar_producoes(*listas)
             prods = [p for p in prods if p <= agora]
 
-            desejados = dividir_por_dia(segmentos_continuos(prods, ini, agora, m.micro, m.macro), self._fuso)
+            buracos: list[tuple[int, int]] = []
+            if legendas.sem_iot is not None:
+                limite = max(1, int(self._cfg.sem_leitura_segundos or 120))
+                buracos = buracos_sem_leitura(ts_todas, desde, agora, limite)
+            desejados = dividir_por_dia(segmentos_continuos(prods, ini, agora, m.micro, m.macro, buracos),
+                                        self._fuso)
             cur.execute(f"SELECT [id], [legenda_id], [inicio], [fim], [observacao], [ordem_producao_id] "
                         f"FROM {A} WITH (UPDLOCK) WHERE [maquina_id] = ? AND [inicio] <= ? "
                         "AND ([fim] IS NULL OR [fim] >= ?) ORDER BY [inicio], [id]",
@@ -906,6 +998,7 @@ class ApontamentosOee:
                           for r in cur.fetchall() or []]
             plano = planejar(desejados, existentes, ini, agora, legendas, m.ordem_producao_id, self._fuso)
             contagem, avisos = self._aplicar(cur, m, plano, todas, agora)
+            logs.extend(("AVISO", a) for a in avisos)
 
             # situação da máquina pelo apontamento mais recente (SituacaoMaquina do portal)
             L = e.t["legendas"]
@@ -955,7 +1048,35 @@ class ApontamentosOee:
         if ultima_leitura is None:
             avisos_linha.append("Nenhuma leitura do dispositivo na IOT001")
         linha["aviso"] = "; ".join(avisos_linha) + "." if avisos_linha else None
-        return contagem, avisos
+        return contagem, logs
+
+    def _correcao_retroativa(self, cur, m: Maquina, legenda_97: int, devices: list[str], ini: int, agora: int
+                             ) -> tuple[int, str] | None:
+        """97 do integrador mais antigo dos últimos ``dias_correcao`` dias (e anterior a ``ini``) que já tem leitura
+        na IOT001 dentro dele (``ts_unix > inicio`` e ``<= fim``; fim NULL = agora). Devolve (inicio, device).
+
+        Lê os candidatos (poucos: um por queda e por dia) e testa cada um com ``SELECT TOP 1`` por device, usando o
+        índice (device_id, ts_unix) da IOT001. Sem leitura nova, nada muda (a janela não volta à toa).
+        """
+        dias = max(0, int(self._cfg.dias_correcao or 0))
+        limite = agora - dias * 86400
+        if not dias or limite >= ini or not devices:
+            return None
+        e = self._esquema
+        cur.execute(f"SELECT [inicio], [fim] FROM {e.t['apontamentos_estado']} WHERE [maquina_id] = ? "
+                    "AND [legenda_id] = ? AND LEFT([observacao], 5) = ? AND [inicio] >= ? AND [inicio] < ? "
+                    "ORDER BY [inicio], [id]", m.id, legenda_97, MARCA, utc_sql(limite), utc_sql(ini))
+        candidatos = [(epoch_de(r[0]), epoch_de(r[1])) for r in cur.fetchall() or []]
+        for inicio, fim in candidatos:
+            fim = agora if fim is None else min(fim, agora)
+            if fim <= inicio:
+                continue
+            for device in devices:
+                cur.execute(f"SELECT TOP 1 1 FROM {e.iot} WHERE [device_id] = CAST(? AS varchar(100)) "
+                            "AND [ts_unix] > ? AND [ts_unix] <= ?", device, inicio, fim)
+                if cur.fetchone() is not None:
+                    return inicio, device
+        return None
 
     def _aplicar(self, cur, m: Maquina, plano: Plano, todas: dict[int, Legenda], agora: int
                  ) -> tuple[dict, list[str]]:

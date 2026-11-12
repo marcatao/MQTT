@@ -62,8 +62,9 @@ EXPLICACAO = ("Gera a timeline das máquinas no portal OEE a partir das contagen
               "2 Produção Normal, 99 Microparada, 98 Macro parada.")
 TEXTO_AGUARDANDO = "Aguardando a primeira execução…"
 
-LEGENDAS = {"2": "Produção Normal", "99": "Microparada", "98": "Macro parada"}
-TONS_LEGENDA = {"2": "sucesso", "99": "aviso", "98": "erro"}  # outro código: neutro (cinza-azulado)
+LEGENDAS = {"2": "Produção Normal", "99": "Microparada", "98": "Macro parada", "97": "Sem apontamento IOT"}
+# 97 (aparelho sem leitura): cinza mais forte que o neutro dos motivos do operador (texto sobre borda_forte)
+TONS_LEGENDA = {"2": "sucesso", "99": "aviso", "98": "erro", "97": "sem_iot"}  # outro código: neutro (cinza-azulado)
 
 COLUNAS = ("Máquina", "Dispositivo/canal", "Micro (s)", "Macro (s)", "Estado atual", "Desde", "Última produção",
            "Apontamentos hoje", "Última leitura")
@@ -127,8 +128,17 @@ def formatar_data_completa(texto: Any) -> str | None:
 
 
 def tom_legenda(codigo: Any) -> str:
-    """Tom da pílula (DelegadoPilula) pela legenda: 2 verde, 99 âmbar, 98 vermelho, outro neutro."""
+    """Tom da pílula (DelegadoLegenda) pela legenda: 2 verde, 99 âmbar, 98 vermelho, 97 cinza, outro neutro."""
     return TONS_LEGENDA.get(_texto(codigo), "neutro")
+
+
+class DelegadoLegenda(DelegadoPilula):
+    """Pílula do Estado atual: os tons de sempre + ``sem_iot`` (97), cinza próprio nos temas claro e escuro."""
+
+    def cores(self, tom: str) -> tuple[str, str]:
+        if tom == "sem_iot":
+            return self.paleta.texto, self.paleta.borda_forte
+        return super().cores(tom)
 
 
 @dataclass
@@ -340,7 +350,8 @@ class ModeloApontamentos(QAbstractTableModel):
             return d.timestamp() if d else 0.0
         if col == COL_ESTADO:
             # Agrupa por gravidade: macro, micro, outras legendas (motivos do operador), produção, sem estado.
-            ordem = {"98": 0, "99": 1, "2": 3}.get(m.legenda, 2 if m.legenda else 4)
+            # 97 (sem leitura do aparelho) fica junto das paradas, logo depois da macro.
+            ordem = {"98": 0, "97": 1, "99": 2, "2": 4}.get(m.legenda, 3 if m.legenda else 5)
             return f"{ordem}|{m.texto_estado}".casefold()
         return self.texto(m, col).casefold()
 
@@ -471,7 +482,7 @@ class PainelApontamentos(QWidget):
         cab.setMinimumSectionSize(56)
         cab.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         cab.setStretchLastSection(True)
-        self.delegado = DelegadoPilula(self.tabela)
+        self.delegado = DelegadoLegenda(self.tabela)
         self.tabela.setItemDelegateForColumn(COL_ESTADO, self.delegado)
 
         self.vazio = QLabel(self)
