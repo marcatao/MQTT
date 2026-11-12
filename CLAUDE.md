@@ -391,6 +391,9 @@ Especificação completa em `docs/apontamentos_reais.md` (fonte da verdade; cód
 - **O IoT prevalece sobre o apontamento manual** (aparado ou excluído, com aviso no log). O objetivo é dizer se a
   máquina trabalhou ou parou; depois o operador troca 98/99 pelo motivo (Setup, Manutenção...) e o integrador
   **mantém** a legenda do operador enquanto o trecho continuar parado.
+- **Sem leitura do aparelho** (desligado/fora da rede, nenhuma linha na IOT001 por mais de 120 s): legenda **97 Sem
+  apontamento IOT** (decidido em 12/11/2026). O intervalo entre produções conta só o tempo com leitura. Se o aparelho
+  voltar e mandar dados retroativos para a IOT001, o trecho 97 é **corrigido** com os dados reais (até 7 dias atrás).
 - Primeira execução: a partir de **hoje 00:00** (hora de Brasília); depois reconcilia de ontem 00:00 até agora.
 - Atualiza a máquina como o portal (`SituacaoMaquina`: situação, desde, legenda, OP) e o status das OPs afetadas
   (`StatusOrdemProducao`). Permissões em `sql/permissoes_oee.sql`.

@@ -15,7 +15,8 @@ O objetivo é dizer **se a máquina trabalhou ou parou**. Depois, o operador vai
 - `OEE.dbo.dispositivos_iot`: `id`, `codigo` (= `device_id` da IOT001), `ativo`.
 - `OEE.dbo.legendas`: `id`, `codigo` (varchar 12), `descricao`, `tipo` (`produzindo` | `parada` | `planejada` |
   `desligada`), `ativo`. Usadas pelo integrador: **`'2'` Produção Normal**, **`'99'` Microparada**, **`'98'` Macro
-  parada** (já cadastradas no portal; se faltar alguma, o ciclo não aponta e avisa no log).
+  parada** (já cadastradas no portal; se faltar alguma, o ciclo não aponta e avisa no log); **`'97'` Sem
+  apontamento IOT** para os períodos sem leitura (ver abaixo).
 - `OEE.dbo.apontamentos_estado`: `id` (identity), `maquina_id`, `legenda_id`, `ordem_producao_id` (NULL ok),
   `inicio` (datetime, UTC), `fim` (NULL = ainda neste estado; CHECK `fim IS NULL OR fim > inicio`), `referencia`
   (40), `observacao` (500), `criado_em`, `criado_por_id`, `atualizado_em`, `atualizado_por_id` (usuários; o integrador
@@ -44,6 +45,25 @@ O **intervalo** é o tempo entre duas produções seguidas (`p` = anterior, `t` 
 A parada começa na última produção `p` e termina na produção seguinte `t` (a partir de `t` a máquina volta a
 "produzindo"). Se até agora não houve nova produção, o intervalo em aberto é `agora − p` e a mesma tabela vale: o
 apontamento em aberto vira 99 quando passa da micro e 98 quando passa da macro (o início continua em `p`).
+
+## Sem leitura do aparelho: 97 Sem apontamento IOT (decidido em 12/11/2026)
+
+- **Sem leitura** = nenhuma linha na IOT001 de nenhum dos dispositivos da máquina por mais de
+  `[apontamentos] sem_leitura_segundos` (padrão **120 s**; o DigiRail manda a cada ~10 s). O trecho vai da última
+  leitura antes do buraco até a primeira leitura depois dele (ou até agora, se o aparelho ainda não voltou; ou do
+  início da janela até a primeira leitura) e recebe a legenda **97 Sem apontamento IOT** (código em
+  `[apontamentos] legenda_sem_iot = "97"`; situação da máquina = parada).
+- Com buracos sem leitura, o intervalo entre produções conta **só o tempo com leitura**: para `[p, t)`, o intervalo
+  observado é `(t − p) − tempo sem leitura dentro de [p, t)`, e os trechos com leitura dessa faixa são classificados
+  (2 / 99 / 98) por esse intervalo observado. O mesmo vale para o intervalo em aberto (até agora).
+- Máquina sem nenhuma leitura na janela: a janela inteira é 97 (antes era 98).
+- **Correção retroativa**: se depois chegam leituras na IOT001 com `ts_unix` dentro de um apontamento 97 do integrador
+  (o aparelho reenvia a memória quando volta), o trecho é recalculado com os dados reais. A cada ciclo, para cada
+  máquina, procura o apontamento 97 do integrador mais antigo dos últimos `[apontamentos] dias_correcao` (padrão
+  **7**) dias que tem leitura dentro dele (`ts_unix > inicio` e `<= fim`); se houver, a janela daquele ciclo começa
+  às 00:00 local do dia dele (em vez de ontem/hoje). Sem leitura nova, a janela não muda (não relê 7 dias à toa).
+- Legenda 97 ausente no portal: AVISO (1 vez até resolver) e os trechos sem leitura voltam a ser tratados como antes
+  (sem leitura = sem produção → 99/98), para não parar a timeline.
 
 ## Apontamentos únicos e encadeados (regras do portal, `HorarioApontamento`)
 
