@@ -114,6 +114,7 @@ pronto para baixar. O número vem da contagem de builds do GitHub, por isso algu
 
 | Versão | Data | Principais melhorias |
 | --- | --- | --- |
+| **v0.1.16** | 12/11/2026 | Nova aba **Apontamentos reais**: a cada 3 min (dá para mudar na tela) o integrador monta no portal OEE a timeline de cada máquina ativa com IoT, comparando o tempo sem o contador subir com a micro e a macro parada do cadastro (**2** Produção Normal, **99** Microparada, **98** Macro parada). Um apontamento por estado, que vai crescendo; atualiza também a situação da máquina e o status da OP. Botão **Executar agora**. |
 | **v0.1.15** | 11/11/2026 | **Canais 4 a 6** (`chd4`–`chd6`) gravados na tabela, com script `sql/canais_4_a_6_iot001.sql`; canal não enviado fica vazio (NULL). **Diagnóstico a cada 3 min.** **Último envio** só muda com dados de contagem. **Cadastro automático no portal OEE** (`dispositivos_iot`): cria ou atualiza o aparelho a cada diagnóstico, sem nunca alterar a Máquina. |
 | **v0.1.14** | 05/11/2026 | Primeira versão publicada a partir da `main`, com o README novo. O programa é igual ao da v0.1.13. |
 | **v0.1.13** | 04/11/2026 | **Gravação imediata:** cada leitura vai para o banco assim que chega, sem a amostragem de 1 min. **Reinício automático** depois de 1 h sem gravar, com contador regressivo na aba Atividade. Campo **Endereço Mosquitto**, com seletor de pasta, salvo entre aberturas. (A v0.1.12 falhou no build e não foi publicada.) |
