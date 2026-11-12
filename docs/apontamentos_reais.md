@@ -1,0 +1,96 @@
+# Apontamentos reais pelo IoT (MQTT.dbo.IOT001 → OEE.dbo.apontamentos_estado)
+
+Decidido com o usuário em 12/11/2026. O integrador gera, a partir das leituras de contagem gravadas na `IOT001`, a
+**timeline** de cada máquina no portal OEE (produzindo × microparada × macroparada) e atualiza a situação da máquina.
+O objetivo é dizer **se a máquina trabalhou ou parou**. Depois, o operador vai apontar o motivo da parada no portal
+(troca 98 por Setup, Manutenção etc.).
+
+## Origem dos dados (portal OEE, repositório marcatao/OEE, só leitura do código)
+
+- `OEE.dbo.maquinas`: `id`, `codigo`, `nome`, `ativo` (bit), `d_e_l_e_t_` (`'*'` = excluída no Protheus),
+  `micro_parada_s`, `macro_parada_s` (int, segundos, `macro > micro`), `iot1_dispositivo_id`..`iot3_dispositivo_id`
+  (FK `dispositivos_iot.id`), `iot1_canal`..`iot3_canal` (`chd1_value`..`chd6_value`), `iot1_tipo`..`iot3_tipo`
+  (`producao` | `refugo` | NULL), `situacao` (`produzindo` | `parada` | NULL, CHECK), `situacao_desde` (UTC),
+  `situacao_legenda_id` (FK legendas), `ordem_producao_id` (FK ordens_producao, OP atual), `atualizado_em`.
+- `OEE.dbo.dispositivos_iot`: `id`, `codigo` (= `device_id` da IOT001), `ativo`.
+- `OEE.dbo.legendas`: `id`, `codigo` (varchar 12), `descricao`, `tipo` (`produzindo` | `parada` | `planejada` |
+  `desligada`), `ativo`. Usadas pelo integrador: **`'2'` Produção Normal**, **`'99'` Microparada**, **`'98'` Macro
+  parada** (já cadastradas no portal; se faltar alguma, o ciclo não aponta e avisa no log).
+- `OEE.dbo.apontamentos_estado`: `id` (identity), `maquina_id`, `legenda_id`, `ordem_producao_id` (NULL ok),
+  `inicio` (datetime, UTC), `fim` (NULL = ainda neste estado; CHECK `fim IS NULL OR fim > inicio`), `referencia`
+  (40), `observacao` (500), `criado_em`, `criado_por_id`, `atualizado_em`, `atualizado_por_id` (usuários; o integrador
+  deixa NULL).
+- `OEE.dbo.ordens_producao`: `id`, `c2_datrf`, `c2_status`, `c2_quje`, `status` (`aberta` | `andamento` | `parada` |
+  `fechada`).
+
+Máquinas processadas: `ativo = 1`, `d_e_l_e_t_ <> '*'`, `micro_parada_s` e `macro_parada_s` preenchidos e pelo menos
+um canal IoT com dispositivo ativo e tipo `producao` (tipo NULL conta como produção; `refugo` não entra no estado).
+Máquina sem micro/macro: ignorada com 1 INFO por sessão.
+
+## Regra do estado
+
+Os canais são **contadores** (o DigiRail manda uma leitura a cada ~10 s mesmo parado). Uma **produção** é uma leitura
+em que o valor do canal subiu em relação à leitura anterior do mesmo canal (contador zerado ou valor menor = nova
+base, não é produção). Com mais de um canal de produção, vale a produção de qualquer um deles.
+
+O **intervalo** é o tempo entre duas produções seguidas (`p` = anterior, `t` = seguinte, `gap = t − p`):
+
+| Intervalo | Período `[p, t)` | Legenda |
+| --- | --- | --- |
+| `gap < micro_parada_s` | produzindo | **2** Produção Normal |
+| `micro_parada_s ≤ gap < macro_parada_s` | microparada | **99** Microparada |
+| `gap ≥ macro_parada_s` | parada | **98** Macro parada |
+
+A parada começa na última produção `p` e termina na produção seguinte `t` (a partir de `t` a máquina volta a
+"produzindo"). Se até agora não houve nova produção, o intervalo em aberto é `agora − p` e a mesma tabela vale: o
+apontamento em aberto vira 99 quando passa da micro e 98 quando passa da macro (o início continua em `p`).
+
+## Apontamentos únicos e encadeados (regras do portal, `HorarioApontamento`)
+
+- Períodos seguidos com o mesmo estado formam **um único apontamento**, que vai crescendo; o último fica em aberto
+  (`fim` NULL).
+- Um apontamento não passa de um dia no fuso `America/Sao_Paulo`: na meia-noite local fecha às 23:59:59 e continua
+  num novo apontamento às 00:00:00 com o mesmo estado.
+- Encadeados: o seguinte começa 1 s depois do fim do anterior (`fim = próximo_inicio − 1 s`). Precisão de segundos;
+  trecho com menos de 2 s é absorvido pelo anterior (respeita `fim > inicio`).
+- Datas gravadas em UTC (`datetime`, sem fração).
+
+## Reconciliação (a cada ciclo)
+
+Janela por máquina: de **ontem 00:00 local** (se a máquina já tem apontamento do integrador ontem) ou de **hoje 00:00
+local** (primeira execução) até agora. Leituras lidas a partir de `início_da_janela − macro_parada_s` (para saber a
+última produção antes da janela; sem produção nesse trecho, o período até a primeira produção é macroparada).
+
+1. Calcula os segmentos desejados na janela (regra acima, dividida por dia).
+2. Compara com os apontamentos existentes da máquina que cruzam a janela:
+   - **Do integrador** (marcados com `observacao` começando por `[IoT]`): o de mesmo `inicio` é reaproveitado
+     (atualiza `fim` e `legenda_id`); os que sobram são reaproveitados ou excluídos; os que faltam são inseridos.
+     Se o operador trocou a legenda de uma parada (98/99 → Setup, Manutenção...) e o trecho continua sendo parada, a
+     legenda do operador é **mantida**; se o trecho virou produção, volta para 2.
+   - **Manuais** (sem a marca): o **IoT prevalece**. Manual que cruza um segmento do integrador tem `inicio`/`fim`
+     ajustados para fora do trecho; manual inteiramente coberto é excluído. Cada ajuste/exclusão vai para o log
+     (AVISO) com máquina, legenda e horário.
+3. Apontamento novo leva a OP atual da máquina (`maquinas.ordem_producao_id`); reaproveitado mantém a dele.
+4. Tudo de uma máquina numa transação.
+
+## Máquina e OP (o que o portal faz em `SituacaoMaquina` e `StatusOrdemProducao`)
+
+- Depois da reconciliação, o apontamento **mais recente** da máquina (`ORDER BY inicio DESC, id DESC`) dá:
+  `situacao` = `produzindo` se a legenda é do tipo `produzindo`, senão `parada`; `situacao_desde` = `inicio`;
+  `situacao_legenda_id` = `legenda_id`; `ordem_producao_id` = a OP do apontamento. Só grava se algo mudou
+  (`atualizado_em` = agora UTC).
+- Status das OPs envolvidas (dos apontamentos criados, alterados ou excluídos): `fechada` se `c2_datrf` preenchido;
+  `parada` se `c2_status = 'U'` ou o apontamento em aberto mais recente da OP não é `produzindo`; `andamento` se há
+  apontamento em aberto produzindo, `c2_quje > 0` ou a OP tem algum apontamento; senão `aberta`. Só grava se mudou.
+
+## Execução e tela
+
+- Thread própria no core (sem Qt), a cada **3 min** (`[apontamentos] minutos = 3`; a tela pode mudar, valor salvo em
+  `QSettings`). Botão "Executar agora". Roda sempre que o SQL Server está configurado (com senha), mesmo sem MQTT.
+- Sem banco/tabela/permissão do OEE: 1 INFO e tenta de novo no próximo ciclo (não é erro). Falha de SQL no meio do
+  ciclo: erro categoria `"apontamentos"`, rollback da máquina, segue para a próxima.
+- Aba **Apontamentos reais** (ao lado de Clientes): periodicidade, Executar agora, última/próxima execução, e uma
+  linha por máquina com Máquina, Dispositivo/canal, Micro/Macro, Estado atual (legenda), Desde, Última produção,
+  Apontamentos hoje e Última mensagem.
+- Permissões: `sql/permissoes_oee.sql` (SELECT em maquinas, dispositivos_iot, legendas, ordens_producao;
+  SELECT/INSERT/UPDATE/DELETE em apontamentos_estado; UPDATE em maquinas e ordens_producao) e SELECT na IOT001.

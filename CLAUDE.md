@@ -371,6 +371,27 @@ que o integrador não ouvia.
   - Estrutura da tabela vem de `database/migrations/2026_11_06_000002_criar_dispositivos_iot.php` do OEE (+ `unidade`).
     O integrador **não cria nem altera** tabelas do OEE.
 
+### Apontamentos reais pelo IoT (decidido com o usuário em 12/11/2026)
+
+Especificação completa em `docs/apontamentos_reais.md` (fonte da verdade; código em `app/core/apontamentos_oee.py`).
+
+- Nova aba **Apontamentos reais** ao lado de Clientes. A cada **3 min** (periodicidade editável na tela, salva em
+  `QSettings`; padrão em `[apontamentos] minutos`), o integrador lê as máquinas ativas com IoT de
+  `OEE.dbo.maquinas` (dispositivo + canal de produção, `micro_parada_s`, `macro_parada_s`), as leituras da
+  `MQTT.dbo.IOT001` e grava a timeline em `OEE.dbo.apontamentos_estado`.
+- **Intervalo = tempo sem o contador do canal aumentar** (não o tempo entre mensagens). `< micro` → legenda **2**
+  Produção Normal; `micro ≤ intervalo < macro` → **99** Microparada; `≥ macro` → **98** Macro parada. A parada começa
+  na última produção.
+- Apontamentos únicos: o mesmo estado cresce num só apontamento (o último em aberto); segue as regras do portal (não
+  passa de um dia local, o seguinte começa 1 s depois do anterior). Marcados com `observacao` `[IoT] ...`.
+- As legendas 2, 98 e 99 **já existem no portal**; o integrador não cria legendas (falta = aviso, não aponta).
+- **O IoT prevalece sobre o apontamento manual** (aparado ou excluído, com aviso no log). O objetivo é dizer se a
+  máquina trabalhou ou parou; depois o operador troca 98/99 pelo motivo (Setup, Manutenção...) e o integrador
+  **mantém** a legenda do operador enquanto o trecho continuar parado.
+- Primeira execução: a partir de **hoje 00:00** (hora de Brasília); depois reconcilia de ontem 00:00 até agora.
+- Atualiza a máquina como o portal (`SituacaoMaquina`: situação, desde, legenda, OP) e o status das OPs afetadas
+  (`StatusOrdemProducao`). Permissões em `sql/permissoes_oee.sql`.
+
 ## Pendências conhecidas
 
 - Índice único `(device_id, ts_unix)` na IOT001 (opcional, decidir com o usuário).
