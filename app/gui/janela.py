@@ -9,8 +9,10 @@ Operação contínua (CLAUDE.md): no topo da caixa ATIVIDADE, a contagem regress
 aparece com amostragem ligada ([gravacao] intervalo_gravacao_segundos > 0). Limpeza da caixa à meia-noite (hora
 local) e o vigia, que reinicia o programa se faltar gravação (ou leitura, sem SQL) por `[vigia] minutos`.
 
-O cartão da direita tem três abas: "Atividade" (a caixa de logs), "Mosquitto" (console do broker local, processo
-filho do app; ver app/gui/mosquitto.py) e "Clientes" (quem envia dados, com IP e MAC; ver app/gui/clientes.py).
+O cartão da direita tem quatro abas: "Atividade" (a caixa de logs), "Mosquitto" (console do broker local, processo
+filho do app; ver app/gui/mosquitto.py), "Clientes" (quem envia dados, com IP e MAC; ver app/gui/clientes.py) e
+"Apontamentos reais" (timeline das máquinas no portal OEE gerada pelo core; ver app/gui/apontamentos.py, sinal
+opcional `apontamentos_atualizados` e métodos `definir_periodicidade_apontamentos`/`executar_apontamentos_agora`).
 Os processos filhos param ao fechar a janela e antes do reinício do vigia.
 
 O card ERROS é clicável e abre a janela "Erros registrados" (app/gui/erros.py), alimentada por
@@ -48,6 +50,7 @@ from app.config import Config, MosquittoConfig, SqlServerConfig
 
 from . import estilo, tempo
 from . import vigia as vigia_mod
+from .apontamentos import PainelApontamentos
 from .clientes import PainelClientes
 from .credenciais import CofreSenhas
 from .erros import JanelaErros
@@ -357,6 +360,13 @@ class JanelaPrincipal(QMainWindow):
         self.abas.addTab(self.painel_clientes, "Clientes")
         self.abas.setTabToolTip(2, "Dispositivos que enviam dados ao broker: nome, IP, MAC e último envio.")
         self.mosquitto.saida.connect(self.painel_clientes.ao_saida_mosquitto)
+
+        minutos_apont = getattr(getattr(self.config, "apontamentos", None), "minutos", None)
+        self.painel_apontamentos = PainelApontamentos(self.abas, relogio=self._relogio, settings=self.settings,
+                                                      minutos_padrao=minutos_apont)
+        self.abas.addTab(self.painel_apontamentos, "Apontamentos reais")
+        self.abas.setTabToolTip(3, "Timeline das máquinas no portal OEE (produção, microparada e macro parada) "
+                                   "gerada a partir das contagens da IOT001.")
 
         cartao.corpo.addWidget(self.abas, 1)
         return cartao
@@ -709,6 +719,22 @@ class JanelaPrincipal(QMainWindow):
         painel.registrar_log.connect(self._log_local)
         # Tópicos por dispositivo (v0.1.11): o painel só usa os métodos do contrato; bridge antigo → sem botão.
         painel.definir_api_topicos(self.bridge)
+        self._ligar_apontamentos()
+
+    def _ligar_apontamentos(self) -> None:
+        """Aba Apontamentos reais: sinal e métodos opcionais. Ao abrir, reaplica a periodicidade salva."""
+        aba = self.painel_apontamentos
+        if hasattr(self.bridge, "apontamentos_atualizados"):
+            self.bridge.apontamentos_atualizados.connect(aba.ao_ciclo)
+        tem_periodo = hasattr(self.bridge, "definir_periodicidade_apontamentos")
+        tem_executar = hasattr(self.bridge, "executar_apontamentos_agora")
+        if tem_periodo:
+            aba.periodicidade_alterada.connect(self.bridge.definir_periodicidade_apontamentos)
+        if tem_executar:
+            aba.executar_pedido.connect(self.bridge.executar_apontamentos_agora)
+        aba.definir_disponivel(tem_periodo and tem_executar)
+        if tem_periodo:
+            aba.aplicar_periodicidade(forcar=True)
 
     def _log_local(self, nivel: str, mensagem: str) -> None:
         self.logs.adicionar(datetime.fromtimestamp(self._relogio()).strftime("%H:%M:%S"), nivel, mensagem)
@@ -724,6 +750,7 @@ class JanelaPrincipal(QMainWindow):
         self.logs.definir_paleta(paleta)
         self.painel_mosquitto.caixa.definir_paleta(paleta)
         self.painel_clientes.definir_paleta(paleta)
+        self.painel_apontamentos.definir_paleta(paleta)
         self.janela_erros.definir_paleta(paleta)
         self._icone_aba_mosquitto(self.mosquitto.estado)
         self._atualizar_icone_olho()
@@ -939,6 +966,7 @@ class JanelaPrincipal(QMainWindow):
         self._conferir_dia()
         self._atualizar_tempo()
         self.painel_clientes.tique()
+        self.painel_apontamentos.tique()
         self.vigia.verificar()
 
     def _agendar_meia_noite(self) -> None:
@@ -1050,6 +1078,7 @@ class JanelaPrincipal(QMainWindow):
                       self._timer_meia_noite):
                 t.stop()
             self.painel_clientes.parar()
+            self.painel_apontamentos.parar()
             self.janela_erros.close()
             self._salvar_valores()
             self.detalhe_status.setText("Encerrando…")

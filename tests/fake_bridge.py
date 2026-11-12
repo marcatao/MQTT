@@ -42,6 +42,7 @@ class FakePipelineBridge(QObject):
     canais_vistos = Signal(str, str)   # (device_id, JSON lista ["chd1","chd2"]) quando o conjunto de canais muda
     diagnostico_dispositivo = Signal(str, str)  # (device_id, JSON do objeto "diag" do DigiRail)
     resposta_comando = Signal(str, str, bool, str)  # (device_id, "reset_counters"|"diag", sucesso, mensagem)
+    apontamentos_atualizados = Signal(str)  # JSON do ciclo dos apontamentos reais (ver app/bridge.py)
 
     def __init__(self, config: Config, parent=None, *, atraso_conexao: float = 0.2,
                  intervalo: float = 0.05, falhar_conexao: bool = False, sql_ok: bool = True,
@@ -100,7 +101,31 @@ class FakePipelineBridge(QObject):
     def emitir_resposta(self, device_id: str, comando: str, sucesso: bool, mensagem: str) -> None:
         self.resposta_comando.emit(device_id, comando, sucesso, mensagem)
 
+    def emitir_apontamentos(self, resultado: dict | None = None, **campos) -> dict:
+        """Emite `apontamentos_atualizados` com um ciclo de exemplo (ou o `resultado` dado); devolve o dict."""
+        dados = dict(resultado) if resultado is not None else apontamentos_exemplo(self.minutos_apontamentos)
+        dados.update(campos)
+        self.apontamentos_atualizados.emit(json.dumps(dados, ensure_ascii=False))
+        return dados
+
     # ----- contrato -----
+    minutos_apontamentos: float = 3.0
+
+    def definir_periodicidade_apontamentos(self, minutos: float) -> None:
+        self.chamadas.append(("definir_periodicidade_apontamentos", float(minutos)))
+        self.minutos_apontamentos = float(minutos)
+
+    def executar_apontamentos_agora(self) -> None:
+        self.chamadas.append(("executar_apontamentos_agora",))
+        if not self.responder_comandos:
+            return
+
+        def trabalho():
+            time.sleep(self.atraso_resposta)
+            self.emitir_apontamentos()
+
+        threading.Thread(target=trabalho, daemon=True).start()
+
     def definir_sql(self, sql: SqlServerConfig) -> None:
         self.chamadas.append(("definir_sql", sql))
         self.sql = sql
@@ -309,6 +334,31 @@ def diag_exemplo(device_id: str) -> dict:
             "cfg_timestamp": int(time.time()) - 86400, "fw_v": "1.23", "mqtt_queue": 0, "sn": f"{21000000 + n:08d}",
             "curr_rssi": str(50 + n % 20), "min_rssi": "-46", "max_rssi": "-87", "avg_rssi": "-58",
             "ipv4": [192, 168, 100, 50 + n], "gateway": [192, 168, 100, 1], "mask": [255, 255, 255, 0]}
+
+
+def apontamentos_exemplo(minutos: float = 3.0) -> dict:
+    """Resultado de um ciclo de apontamentos reais no formato de `apontamentos_atualizados`."""
+    agora = time.time()
+    return {
+        "quando": _iso(agora), "proxima": _iso(agora + minutos * 60), "minutos": float(minutos), "ok": True,
+        "mensagem": "Apontamentos reais: 2 máquinas, 1 criados, 2 atualizados, 0 excluídos",
+        "criados": 1, "alterados": 2, "excluidos": 0,
+        "maquinas": [
+            {"maquina_id": 1, "codigo": "INJ01", "nome": "Injetora 01", "canais": "Teste_Alumbra/chd1_value",
+             "micro_s": 60, "macro_s": 300, "legenda": "2", "legenda_descricao": "Produção Normal",
+             "desde": _iso(agora - 1800), "ultima_producao": _iso(agora - 12), "apontamentos_hoje": 7,
+             "ultima_leitura": _iso(agora - 5), "aviso": None},
+            {"maquina_id": 2, "codigo": "INJ02", "nome": "Injetora 02",
+             "canais": "Teste_Alumbra/chd2_value, Teste_Alumbra/chd3_value", "micro_s": 60, "macro_s": 300,
+             "legenda": "98", "legenda_descricao": "Macro parada", "desde": _iso(agora - 3600),
+             "ultima_producao": _iso(agora - 3600), "apontamentos_hoje": 4, "ultima_leitura": _iso(agora - 5),
+             "aviso": None},
+        ],
+    }
+
+
+def _iso(t: float) -> str:
+    return datetime.fromtimestamp(t).strftime("%Y-%m-%dT%H:%M:%S")
 
 
 def _casa(filtro: str, topico: str) -> bool:

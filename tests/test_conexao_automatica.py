@@ -97,7 +97,8 @@ def test_opcao_desligada_nao_faz_nada(abrir):
     esperar(lambda: False, timeout=0.6)
     nomes = _nomes(bridge)
     assert "conectar" not in nomes and "testar_sql" not in nomes
-    assert set(nomes) == {"definir_sql"}  # só o envio de sempre do SQL, sem teste nem conexão
+    # só o envio de sempre do SQL (e a periodicidade dos apontamentos reais), sem teste nem conexão
+    assert set(nomes) <= {"definir_sql", "definir_periodicidade_apontamentos"} and "definir_sql" in nomes
     assert janela.estado == "desconectado" and not janela.vigia.ativo
 
 

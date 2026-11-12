@@ -31,6 +31,11 @@ class PipelineBridge(QObject):
     canais_vistos = Signal(str, str)         # (device_id, JSON lista ["chd1","chd2","chd3"]) quando o conjunto muda
     diagnostico_dispositivo = Signal(str, str)  # (device_id, JSON do objeto "diag" do DigiRail: sn, fw_v, rssi...)
     resposta_comando = Signal(str, str, bool, str)  # (device_id, "reset_counters"|"diag", sucesso, mensagem)
+    # JSON do ciclo dos apontamentos reais (app.core.apontamentos_oee), 1 por ciclo concluído (ou falho):
+    # {"quando", "proxima" (ISO local|null), "minutos", "ok", "mensagem", "criados", "alterados", "excluidos",
+    #  "maquinas": [{"maquina_id", "codigo", "nome", "canais", "micro_s", "macro_s", "legenda", "legenda_descricao",
+    #                "desde", "ultima_producao", "apontamentos_hoje", "ultima_leitura", "aviso"}]}
+    apontamentos_atualizados = Signal(str)
 
     def __init__(self, config: Config, parent=None) -> None:
         super().__init__(parent)
@@ -48,6 +53,7 @@ class PipelineBridge(QObject):
             ao_canais=self.canais_vistos.emit,
             ao_diagnostico=self.diagnostico_dispositivo.emit,
             ao_resposta_comando=self.resposta_comando.emit,
+            ao_apontamentos=self.apontamentos_atualizados.emit,
         )
 
     def _emitir_log(self, nivel: str, mensagem: str) -> None:
@@ -78,6 +84,14 @@ class PipelineBridge(QObject):
 
     def encerrar(self, timeout: float = 5.0) -> None:
         self._pipeline.encerrar(timeout)
+
+    def definir_periodicidade_apontamentos(self, minutos: float) -> None:
+        """Não bloqueia: periodicidade (min) dos apontamentos reais; vale já (reagenda a próxima execução)."""
+        self._pipeline.definir_periodicidade_apontamentos(float(minutos))
+
+    def executar_apontamentos_agora(self) -> None:
+        """Não bloqueia: roda um ciclo de apontamentos reais já; responde em ``apontamentos_atualizados``."""
+        self._pipeline.executar_apontamentos_agora()
 
     def zerar_contadores(self, device_id: str, canais: list[int]) -> None:
         """Não bloqueia: publica ``reset_counters`` (canais 1–6) e responde em ``resposta_comando``."""

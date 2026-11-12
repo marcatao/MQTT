@@ -84,7 +84,7 @@ def test_padroes_preenchidos(montar):
     assert janela.campo_usuario.text() == "mqtt"
     assert janela.seletor_cripto.valor() == "Optional"
     assert not janela.opcao_confiar.isChecked()
-    assert bridge.chamadas[0][0] == "definir_sql"
+    assert [c[0] for c in bridge.chamadas if c[0] != "definir_periodicidade_apontamentos"][0] == "definir_sql"
 
 
 def test_conectar_logs_contadores_desconectar(montar):

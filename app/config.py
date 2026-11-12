@@ -146,6 +146,22 @@ class OeeConfig:
 
 
 @dataclass
+class ApontamentosConfig:
+    """Apontamentos reais pelo IoT no portal OEE (``apontamentos_estado``), ver docs/apontamentos_reais.md.
+
+    Usa o login de ``[sqlserver]`` e o banco do OEE de ``[oee] banco``. ``minutos`` é só o padrão: a periodicidade
+    escolhida na aba "Apontamentos reais" fica em QSettings e vale mais. As legendas são pelo ``codigo`` (já
+    cadastradas no portal; o integrador não cria legendas).
+    """
+    habilitado: bool = True
+    minutos: float = 3                      # periodicidade do ciclo
+    legenda_produzindo: str = "2"           # Produção Normal
+    legenda_micro: str = "99"               # Microparada
+    legenda_macro: str = "98"               # Macro parada
+    fuso: str = "America/Sao_Paulo"         # dia local (um apontamento não passa da meia-noite)
+
+
+@dataclass
 class Config:
     mqtt: MqttConfig = field(default_factory=MqttConfig)
     sqlserver: SqlServerConfig = field(default_factory=SqlServerConfig)
@@ -156,6 +172,7 @@ class Config:
     mosquitto: MosquittoConfig = field(default_factory=MosquittoConfig)
     dispositivos: DispositivosConfig = field(default_factory=DispositivosConfig)
     oee: OeeConfig = field(default_factory=OeeConfig)
+    apontamentos: ApontamentosConfig = field(default_factory=ApontamentosConfig)
 
 
 def _preencher(destino, dados: dict) -> None:
@@ -172,6 +189,6 @@ def carregar(caminho: Path | None = None) -> Config:
         with caminho.open("rb") as f:
             dados = tomllib.load(f)
         for secao in ("mqtt", "sqlserver", "gravacao", "mapeamento", "vigia", "inicio", "mosquitto",
-                      "dispositivos", "oee"):
+                      "dispositivos", "oee", "apontamentos"):
             _preencher(getattr(cfg, secao), dados.get(secao, {}))
     return cfg

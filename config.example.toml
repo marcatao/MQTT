@@ -100,3 +100,17 @@ banco = "OEE"                    # nome do banco do portal (no .env do OEE pode 
 tabela = "dbo.dispositivos_iot"
 unidade = "manutencao"           # manutencao | tecnologia | ambos (só na inserção)
 tipo = "contador"                # só na inserção
+
+[apontamentos]
+# Apontamentos reais pelo IoT no portal OEE (docs/apontamentos_reais.md). A cada ciclo o integrador lê as máquinas
+# ativas com dispositivo IoT de produção (banco de [oee]), as leituras da IOT001 e grava a timeline em
+# apontamentos_estado: contador subiu = produção; intervalo < micro = 2 Produção Normal, entre micro e macro = 99
+# Microparada, >= macro = 98 Macro parada. O IoT prevalece sobre apontamentos manuais (aparados/excluídos, com aviso).
+# Precisa do SQL Server configurado com senha (ou autenticação do Windows); roda mesmo sem o MQTT conectado.
+# Permissões: sql/permissoes_oee.sql. O integrador não cria legendas nem altera tabelas do OEE.
+habilitado = true
+minutos = 3                      # periodicidade (a aba "Apontamentos reais" pode mudar; o valor da tela vale mais)
+legenda_produzindo = "2"         # códigos das legendas no portal (já cadastradas)
+legenda_micro = "99"
+legenda_macro = "98"
+fuso = "America/Sao_Paulo"       # dia local: um apontamento não passa da meia-noite

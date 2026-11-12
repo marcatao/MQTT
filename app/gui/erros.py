@@ -82,6 +82,7 @@ CATEGORIAS = {  # valor → (rótulo na tabela, rótulo no filtro, tom da pílul
     "mqtt": ("MQTT", "MQTT", "roxo"),
     "fila": ("Fila", "Fila", "neutro"),
     "comando": ("Comando", "Comandos ao dispositivo", "ciano"),
+    "apontamentos": ("Apontamentos", "Apontamentos reais (OEE)", "erro"),
 }
 COLUNAS = ("Data/hora", "Categoria", "Mensagem")
 COL_QUANDO, COL_CATEGORIA, COL_MENSAGEM = range(3)

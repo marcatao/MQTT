@@ -1,5 +1,11 @@
 /*
-    permissoes_oee.sql - permissões do Integrador MQTT na tabela dbo.dispositivos_iot do portal OEE.
+    permissoes_oee.sql - permissões do Integrador MQTT nas tabelas do portal OEE.
+
+    1) dbo.dispositivos_iot: cadastro dos dispositivos (SELECT, INSERT, UPDATE).
+    2) Apontamentos reais pelo IoT (docs/apontamentos_reais.md, app/core/apontamentos_oee.py): SELECT em maquinas,
+       dispositivos_iot, legendas e ordens_producao; SELECT, INSERT, UPDATE e DELETE em apontamentos_estado; UPDATE
+       em maquinas (situação e OP atual) e ordens_producao (status). O SELECT na IOT001 vem de
+       sql/permissoes_iot001.sql.
 
     O integrador cadastra/atualiza os dispositivos (codigo = device_id) a cada diagnóstico recebido e renova
     ultimo_sinal_em com as leituras (ver app/core/oee_dispositivos.py). Ele usa o MESMO login do SQL Server da
@@ -46,10 +52,55 @@ ELSE
     PRINT 'AVISO: usuário [mqtt] ou tabela dbo.dispositivos_iot ausente; nada foi concedido.';
 GO
 
+-- 3) Apontamentos reais pelo IoT (GRANT é idempotente; cada tabela só se existir) ------------------------------
+IF DATABASE_PRINCIPAL_ID(N'mqtt') IS NOT NULL
+BEGIN
+    IF OBJECT_ID(N'dbo.maquinas', N'U') IS NOT NULL
+    BEGIN
+        GRANT SELECT, UPDATE ON OBJECT::dbo.maquinas TO [mqtt];
+        PRINT 'GRANT SELECT, UPDATE em dbo.maquinas para [mqtt].';
+    END
+    ELSE PRINT 'AVISO: tabela dbo.maquinas ausente; nada foi concedido nela.';
+
+    IF OBJECT_ID(N'dbo.legendas', N'U') IS NOT NULL
+    BEGIN
+        GRANT SELECT ON OBJECT::dbo.legendas TO [mqtt];
+        PRINT 'GRANT SELECT em dbo.legendas para [mqtt].';
+    END
+    ELSE PRINT 'AVISO: tabela dbo.legendas ausente; nada foi concedido nela.';
+
+    IF OBJECT_ID(N'dbo.ordens_producao', N'U') IS NOT NULL
+    BEGIN
+        GRANT SELECT, UPDATE ON OBJECT::dbo.ordens_producao TO [mqtt];
+        PRINT 'GRANT SELECT, UPDATE em dbo.ordens_producao para [mqtt].';
+    END
+    ELSE PRINT 'AVISO: tabela dbo.ordens_producao ausente; nada foi concedido nela.';
+
+    IF OBJECT_ID(N'dbo.apontamentos_estado', N'U') IS NOT NULL
+    BEGIN
+        GRANT SELECT, INSERT, UPDATE, DELETE ON OBJECT::dbo.apontamentos_estado TO [mqtt];
+        PRINT 'GRANT SELECT, INSERT, UPDATE, DELETE em dbo.apontamentos_estado para [mqtt].';
+    END
+    ELSE PRINT 'AVISO: tabela dbo.apontamentos_estado ausente; nada foi concedido nela.';
+END
+ELSE
+    PRINT 'AVISO: usuário [mqtt] ausente no banco do OEE; nada foi concedido para os apontamentos reais.';
+GO
+
 -- Conferência: deve listar INSERT, SELECT e UPDATE para [mqtt].
 SELECT pr.name AS usuario, pe.permission_name, pe.state_desc
 FROM sys.database_permissions AS pe
 JOIN sys.database_principals AS pr ON pr.principal_id = pe.grantee_principal_id
 WHERE pe.major_id = OBJECT_ID(N'dbo.dispositivos_iot') AND pr.name = N'mqtt'
 ORDER BY pe.permission_name;
+GO
+
+-- Conferência dos apontamentos reais: permissões do [mqtt] nas tabelas usadas.
+SELECT OBJECT_NAME(pe.major_id) AS tabela, pe.permission_name, pe.state_desc
+FROM sys.database_permissions AS pe
+JOIN sys.database_principals AS pr ON pr.principal_id = pe.grantee_principal_id
+WHERE pr.name = N'mqtt'
+  AND pe.major_id IN (OBJECT_ID(N'dbo.maquinas'), OBJECT_ID(N'dbo.dispositivos_iot'), OBJECT_ID(N'dbo.legendas'),
+                      OBJECT_ID(N'dbo.ordens_producao'), OBJECT_ID(N'dbo.apontamentos_estado'))
+ORDER BY tabela, pe.permission_name;
 GO

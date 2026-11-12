@@ -64,7 +64,11 @@ Erros (``ao_erro``): todo +1 no contador de erros passa por ``_erro``, que soma,
 batem sempre. Categorias: "payload" (inválido, binário, vazio, incompleto), "sql" (lote para a contingência por
 falha do banco, linha recusada na bissecção), "contingencia" (falha ao gravar o arquivo), "fila" (fila cheia),
 "mqtt" (queda do broker, conexão recusada, assinatura recusada), "comando" (zerar contadores recusado ou sem
-resposta).
+resposta), "apontamentos" (falha de SQL numa máquina nos apontamentos reais, ou SQL Server inacessível: 1 por
+incidente).
+
+Apontamentos reais (``app.core.apontamentos_oee``, ``[apontamentos]``): thread e conexão próprias, a cada N minutos
+(e em ``executar_apontamentos_agora``), mesmo sem MQTT; o resultado de cada ciclo vai em ``ao_apontamentos`` (JSON).
 
 Portal OEE (``app.core.oee_dispositivos``, ``[oee]``): cada ``reported.diag`` faz o upsert do device em
 ``dispositivos_iot`` e cada leitura completa renova ``ultimo_sinal_em`` (máx. 1/min por device), numa thread com
@@ -99,6 +103,7 @@ from app.core import digirail
 from app.core import erros as _erros
 from app.core import topicos as _topicos
 from app.core.mqtt_client import ClienteMqtt, validar_parametros
+from app.core.apontamentos_oee import ApontamentosOee
 from app.core.oee_dispositivos import CadastroOee
 from app.core.mapeamento import EVENTO, RESPOSTA, LinhaIot, ResultadoMapa, _device_da_mensagem, mapear
 from app.core.parser import trecho
@@ -361,6 +366,8 @@ class Pipeline:
         ao_diagnostico: Callable[[str, str], None] = _nada,
         ao_resposta_comando: Callable[[str, str, bool, str], None] = _nada,
         cadastro_oee: CadastroOee | None = None,
+        ao_apontamentos: Callable[[str], None] = _nada,
+        apontamentos_oee: ApontamentosOee | None = None,
     ) -> None:
         """``relogio``, ``intervalo_gravacao`` (sobrepõe a config), ``fabrica_cliente`` e ``cadastro_oee`` existem
         para os testes."""
@@ -428,6 +435,21 @@ class Pipeline:
         self._oee = cadastro_oee if cadastro_oee is not None else CadastroOee(
             config.sqlserver, getattr(config, "oee", None), self._log, relogio=relogio)
 
+        # apontamentos reais no portal OEE (docs/apontamentos_reais.md): thread/conexão próprias, roda mesmo sem
+        # MQTT. Só começa sozinho com o SQL real (sem fabrica_sink de teste) ou quando os testes passam um pronto.
+        self._ao_apontamentos = ao_apontamentos
+        if apontamentos_oee is not None:
+            self._apontamentos = apontamentos_oee
+            iniciar_apontamentos = True
+        else:
+            self._apontamentos = ApontamentosOee(
+                config.sqlserver, getattr(config, "oee", None), getattr(config, "apontamentos", None), self._log,
+                ao_erro=lambda msg, detalhe=None: self._erro("apontamentos", msg, detalhe=detalhe),
+                ao_resultado=lambda texto: self._avisar(self._ao_apontamentos, texto), relogio=relogio)
+            iniciar_apontamentos = fabrica_sink is None
+        if iniciar_apontamentos:
+            self._apontamentos.iniciar()
+
     # ------------------------------------------------------------------------------ API pública
 
     def conectar(self, broker: str, porta: int, topico: str, qos: int) -> Future:
@@ -444,6 +466,15 @@ class Pipeline:
         with self._trava:
             self._sql_pendente = sql
         self._oee.definir_sql(sql)
+        self._apontamentos.definir_sql(sql)
+
+    def definir_periodicidade_apontamentos(self, minutos: float) -> None:
+        """Não bloqueia: troca a periodicidade dos apontamentos reais (vale já)."""
+        self._apontamentos.definir_periodicidade(minutos)
+
+    def executar_apontamentos_agora(self) -> None:
+        """Não bloqueia: pede um ciclo de apontamentos reais já; o resultado vem em ``ao_apontamentos``."""
+        self._apontamentos.executar_agora()
 
     def encerrar(self, timeout: float = 5.0) -> bool:
         """Bloqueia até ``timeout`` segundos. Devolve True se terminou limpo."""
@@ -460,6 +491,7 @@ class Pipeline:
                                "só na memória.")
         self._controle.shutdown(wait=False, cancel_futures=True)
         self._oee.parar(timeout=0.5)
+        self._apontamentos.parar(timeout=0.5)
         return ok
 
     def zerar_contadores(self, device_id: str, canais: list[int]) -> Future | None:

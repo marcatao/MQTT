@@ -194,6 +194,7 @@ class PipelineBridge(QObject):
     canais_vistos = Signal(str, str)        # (device_id, JSON lista ["chd1","chd2","chd3"]) quando o conjunto de canais muda
     diagnostico_dispositivo = Signal(str, str)  # (device_id, JSON do objeto "diag" do DigiRail: sn, fw_v, curr/avg_rssi, mqtt_queue, ipv4...)
     resposta_comando = Signal(str, str, bool, str)  # (device_id, comando "reset_counters"|"diag", sucesso, mensagem em português)
+    apontamentos_atualizados = Signal(str)  # JSON de cada ciclo dos apontamentos reais (formato em app/core/apontamentos_oee.py)
 
     def __init__(self, config: Config, parent=None): ...
     def definir_sql(self, sql: SqlServerConfig) -> None: ...   # a GUI chama antes de conectar e quando o usuário altera
@@ -209,6 +210,8 @@ class PipelineBridge(QObject):
     def restaurar_topicos_padrao(self, device_id: str) -> None: ...            # apaga os salvos desse device
     def topicos_ouvidos(self) -> list[str]: ...    # filtros assinados agora (assinatura do usuário + extras)
     def topico_coberto(self, topico: str) -> bool: ...  # o integrador recebe mensagens desse tópico?
+    def definir_periodicidade_apontamentos(self, minutos: float) -> None: ...  # apontamentos reais; não bloqueia
+    def executar_apontamentos_agora(self) -> None: ...                       # não bloqueia
 ```
 
 Os sinais são emitidos de outras threads; o Qt entrega na thread da GUI (conexão enfileirada). A GUI só usa isso.
@@ -274,7 +277,7 @@ mensagem inteira, não só o booleano.
   registrados (data/hora, categoria, mensagem, tópico, detalhe e trecho do payload), com filtro, cópia e exportação
   CSV. Cada erro que soma 1 no contador gera exatamente um registro. O core grava os registros também em
   `logs/erros_AAAAMMDD.jsonl`, e a janela lê o arquivo do dia ao abrir, para não perder a lista num reinício. Formato
-  do JSON: `{"quando": ISO local, "categoria": "payload"|"sql"|"contingencia"|"mqtt"|"fila"|"comando", "mensagem": str,
+  do JSON: `{"quando": ISO local, "categoria": "payload"|"sql"|"contingencia"|"mqtt"|"fila"|"comando"|"apontamentos", "mensagem": str,
   "topico": str|null, "detalhe": str|null, "payload": str|null (máx. 2000 caracteres)}`.
   Broker MQTT (categoria `"mqtt"`): **um erro por queda (incidente)**, não um por tentativa de reconexão. Conexão
   perdida sem o usuário pedir ("Conexão com o broker IP:porta perdida", detalhe com o motivo e a hora da última

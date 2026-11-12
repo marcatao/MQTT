@@ -61,8 +61,16 @@ def test_script_permissoes_oee():
     caminho = RAIZ / "sql" / "permissoes_oee.sql"
     texto = caminho.read_text(encoding="utf-8")
     codigo = _codigo_sql(caminho).upper()
+    # DELETE só como permissão em apontamentos_estado (apontamentos reais); o script nunca apaga nada
+    grant_apont = "GRANT SELECT, INSERT, UPDATE, DELETE ON OBJECT::DBO.APONTAMENTOS_ESTADO TO [MQTT]"
+    assert grant_apont in codigo
+    sem_grant = codigo.replace(grant_apont, "").replace("SELECT, INSERT, UPDATE, DELETE EM DBO.APONTAMENTOS_ESTADO", "")
     for proibida in ("DROP", "DELETE", "TRUNCATE", "ALTER TABLE", "CREATE TABLE"):
-        assert proibida not in codigo, proibida
+        assert proibida not in sem_grant, proibida
+    for grant in ("GRANT SELECT, UPDATE ON OBJECT::DBO.MAQUINAS TO [MQTT]",
+                  "GRANT SELECT ON OBJECT::DBO.LEGENDAS TO [MQTT]",
+                  "GRANT SELECT, UPDATE ON OBJECT::DBO.ORDENS_PRODUCAO TO [MQTT]"):
+        assert grant in codigo, grant
     assert "USE [OEE]" in codigo
     assert "CREATE USER [MQTT] FOR LOGIN [MQTT]" in codigo and "DATABASE_PRINCIPAL_ID(N'MQTT') IS NULL" in codigo
     assert "GRANT SELECT, INSERT, UPDATE ON OBJECT::DBO.DISPOSITIVOS_IOT TO [MQTT]" in codigo

@@ -19,6 +19,7 @@ echo [2/3] Empacotando com PyInstaller...
   --icon "build\icone.ico" ^
   --paths "." ^
   --collect-submodules keyring ^
+  --collect-data tzdata ^
   --add-data "config.example.toml;." ^
   app\main.py || goto :erro
 
