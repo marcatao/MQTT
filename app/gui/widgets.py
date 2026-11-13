@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Callable
 
 from PySide6.QtCore import QLocale, QModelIndex, QObject, QRectF, QTimer, Signal, Qt
-from PySide6.QtGui import QColor, QFont, QFontMetrics, QGuiApplication, QKeyEvent, QMouseEvent, QPainter, QTextCharFormat, QTextCursor
+from PySide6.QtGui import QColor, QFont, QFontMetrics, QGuiApplication, QKeyEvent, QMouseEvent, QPainter, QPen, QTextCharFormat, QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
     QBoxLayout,
@@ -34,6 +34,8 @@ LOCALE_BR = QLocale(QLocale.Language.Portuguese, QLocale.Country.Brazil)
 # Papel do modelo com o "tom" de uma pílula (DelegadoPilula):
 # "sucesso" | "aviso" | "erro" | "destaque" | "roxo" | "ciano" | "neutro"
 PAPEL_PILULA = Qt.ItemDataRole.UserRole + 1
+PAPEL_PILULA_TEXTO = Qt.ItemDataRole.UserRole + 41  # texto da pílula, quando mais curto que o da célula (opcional)
+PAPEL_PILULA_SELO = Qt.ItemDataRole.UserRole + 42   # selo contornado depois da pílula, ex.: "OEE" (opcional)
 
 
 class _Mensageiro(QObject):
@@ -776,7 +778,7 @@ class DelegadoPilula(QStyledItemDelegate):
             return
         opt = QStyleOptionViewItem(opcao)
         self.initStyleOption(opt, indice)
-        texto = opt.text
+        texto = indice.data(PAPEL_PILULA_TEXTO) or opt.text
         opt.text = ""
         estilo = opt.widget.style() if opt.widget else QApplication.style()
         estilo.drawControl(QStyle.ControlElement.CE_ItemViewItem, opt, pintor, opt.widget)
@@ -785,7 +787,11 @@ class DelegadoPilula(QStyledItemDelegate):
         fonte.setWeight(QFont.Weight.DemiBold)
         fonte.setPointSizeF(max(7.0, fonte.pointSizeF() * 0.9))
         metricas = QFontMetrics(fonte)
-        disponivel = opt.rect.width() - 12
+        selo = indice.data(PAPEL_PILULA_SELO)
+        fonte_selo = QFont(fonte)
+        fonte_selo.setPointSizeF(max(6.5, fonte.pointSizeF() * 0.85))
+        largura_selo = QFontMetrics(fonte_selo).horizontalAdvance(selo) + 10 if selo else 0
+        disponivel = opt.rect.width() - 12 - (largura_selo + 4 if selo else 0)
         largura = min(metricas.horizontalAdvance(texto) + 22, disponivel)
         altura = min(metricas.height() + 6, opt.rect.height() - 6)
         x = opt.rect.left() + 8
@@ -802,10 +808,31 @@ class DelegadoPilula(QStyledItemDelegate):
         visivel = texto if cabe else metricas.elidedText(texto, Qt.TextElideMode.ElideRight, int(caixa.width()) - 20)
         pintor.drawText(caixa.adjusted(11, 0, 0, 0), int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft),
                         visivel)
+        if selo:
+            caixa_selo = QRectF(caixa.right() + 4, caixa.top() + 1, largura_selo, caixa.height() - 2)
+            pintor.setPen(QPen(QColor(cor_texto), 1))
+            pintor.setBrush(Qt.BrushStyle.NoBrush)
+            pintor.drawRoundedRect(caixa_selo.adjusted(0.5, 0.5, -0.5, -0.5), 4, 4)
+            pintor.setFont(fonte_selo)
+            pintor.drawText(caixa_selo, int(Qt.AlignmentFlag.AlignCenter), selo)
         pintor.restore()
 
     def sizeHint(self, opcao: QStyleOptionViewItem, indice: QModelIndex):  # noqa: N802
         tamanho = super().sizeHint(opcao, indice)
+        curto = indice.data(PAPEL_PILULA_TEXTO)
+        if curto and indice.data(PAPEL_PILULA):
+            opt = QStyleOptionViewItem(opcao)
+            self.initStyleOption(opt, indice)
+            fonte = QFont(opt.font)
+            fonte.setWeight(QFont.Weight.DemiBold)
+            fonte.setPointSizeF(max(7.0, fonte.pointSizeF() * 0.9))
+            largura = QFontMetrics(fonte).horizontalAdvance(curto) + 22 + 16
+            selo = indice.data(PAPEL_PILULA_SELO)
+            if selo:
+                fonte.setPointSizeF(max(6.5, fonte.pointSizeF() * 0.85))
+                largura += QFontMetrics(fonte).horizontalAdvance(selo) + 14
+            tamanho.setWidth(largura)
+            return tamanho
         tamanho.setWidth(tamanho.width() + 16)
         return tamanho
 

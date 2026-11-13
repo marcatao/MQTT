@@ -59,6 +59,29 @@ não traz ``device_id``. Os ``events``/``ack_command``/``ack_config`` salvos que
 viram assinaturas extras (QoS 1): registradas ao conectar (o cliente refaz em cada reconexão) e recalculadas na
 thread de controle depois de salvar/restaurar (assina os novos, desassina os que sobraram).
 
+Reiniciar pelo relé (``reiniciar_dispositivo``, ``[reinicio]``, manual 6.5.1 OUTPUT): o DigiRail não tem comando
+de reiniciar; o integrador liga a saída digital ``outN`` (``{"timestamp": T, "desired": {"output": {"outN": 1}}}``,
+QoS 1, no ``command`` efetivo do device), que aciona um relé que corta a alimentação do próprio aparelho. Estado por
+device (``_Reinicio``), um por vez; o relógio é o do pipeline:
+- fase "pulso" (``pulso_segundos``): qualquer mensagem do device (leitura, evento, ``reported`` como o ack do output
+  ou o diag) recebida 1 s ou mais depois do envio = ele não desligou → publica ``outN = 0`` e falha "A saída N ligou
+  mas o aparelho não reiniciou…". Sem mensagem: ``ao_reinicio_etapa`` "Aguardando o aparelho voltar…";
+- fase "aguardando": a 1ª mensagem do device → publica ``outN = 0`` (segurança) e sucesso "Reiniciado: voltou em
+  42 s"; sem voltar em ``timeout_volta_segundos`` (contados do envio) → falha "Não voltou em 3 min" + erro "comando"
+  e fase "tardio": quando ele voltar, publica ``outN = 0`` (INFO) e o estado some;
+- ``reported.output.error`` ≠ 0 (1 fora da faixa, 2 desconhecido) → falha imediata;
+- desconectar/encerrar cancela (tenta ``outN = 0``, responde falha "cancelado", sem erro).
+Diagnóstico automático não é pedido a device em reinício.
+
+Diagnóstico sem duplicar (``JANELA_DIAG``): o automático (1ª vez e periódico) não sai se outro ``diag`` foi enviado
+ao device (por qualquer origem) ou respondido por ele há menos de 20 s; o diag dos apontamentos reais
+(``diagnosticar_dispositivos``) não publica de novo se há um ``diag`` pendente enviado há menos de 20 s: espera a
+resposta dele.
+
+Cadastro OEE na aba Clientes (``ao_dispositivos_oee``): logo ao conectar e a cada ``INTERVALO_LISTA_OEE`` s, a
+thread de processamento pede ``CadastroOee.listar`` (thread/conexão do cadastro, não atrasa a IOT001); se o OEE
+existir, o JSON da lista sai no callback. Sem OEE: nada.
+
 Erros (``ao_erro``): todo +1 no contador de erros passa por ``_erro``, que soma, monta o registro JSON
 (``app.core.erros``), grava em ``<pasta_logs>/erros_AAAAMMDD.jsonl`` e avisa o callback. Assim contador e registros
 batem sempre. Categorias: "payload" (inválido, binário, vazio, incompleto), "sql" (lote para a contingência por
@@ -98,7 +121,7 @@ from typing import Callable
 
 import paho.mqtt.client as _paho
 
-from app.config import Config, DispositivosConfig, SqlServerConfig, pasta_base
+from app.config import Config, DispositivosConfig, ReinicioConfig, SqlServerConfig, pasta_base
 from app.core import digirail
 from app.core import erros as _erros
 from app.core import topicos as _topicos
@@ -317,6 +340,29 @@ class _Comando:
     cancelado: bool = False
 
 
+@dataclass
+class _Reinicio:
+    """Reinício pelo relé em andamento (``fase`` "pulso" | "aguardando") ou vencido à espera da volta ("tardio")."""
+    device_id: str
+    saida: int
+    inicio: float           # relógio do pipeline no envio de outN = 1
+    timestamp: int          # do pedido outN = 1 (casa o ack)
+    topico: str
+    pulso: float
+    timeout: float
+    fase: str = "pulso"
+    online: str | None = None   # o que o device mandou durante o pulso (prova de que não desligou)
+
+
+def tempo_texto(segundos: float) -> str:
+    """Como ``duracao_texto``, mas minutos/horas redondos sem os zeros: 180 → "3 min"; 90 → "1 min 30 s"."""
+    total = int(round(max(0.0, segundos)))
+    if total >= 60 and total % 60 == 0:
+        h, m = divmod(total // 60, 60)
+        return " ".join(([f"{h} h"] if h else []) + ([f"{m} min"] if m else []))
+    return duracao_texto(total)
+
+
 class _Limitador:
     """No máx. ``por_segundo`` logs "por mensagem"; o excedente vira "… e mais N mensagens no último segundo"."""
 
@@ -349,6 +395,9 @@ class Pipeline:
     LOGS_POR_SEGUNDO = 20           # linhas "Mensagem de ..." por segundo; o excedente vira um resumo
     INTERVALO_ULTIMA_LEITURA = 5.0  # s: no máx. 1 aviso de "última leitura" a cada 5 s
     INTERVALO_DISPOSITIVO = 5.0     # s: no máx. 1 aviso de "dispositivo visto" a cada 5 s por device_id
+    JANELA_DIAG = 20.0              # s: diag automático não repete um diag enviado/respondido há menos que isso
+    INTERVALO_LISTA_OEE = 60.0      # s: lista do cadastro OEE para a aba Clientes
+    ATRASO_ONLINE = 1.0             # s: mensagem do device a partir disso depois do outN = 1 prova que ele não caiu
 
     def __init__(
         self,
@@ -374,6 +423,8 @@ class Pipeline:
         ao_apontamentos: Callable[[str], None] = _nada,
         apontamentos_oee: ApontamentosOee | None = None,
         ao_recalculo: Callable[[int, str, bool, str], None] = _nada,
+        ao_reinicio_etapa: Callable[[str, str], None] = _nada,
+        ao_dispositivos_oee: Callable[[str], None] = _nada,
     ) -> None:
         """``relogio``, ``intervalo_gravacao`` (sobrepõe a config), ``fabrica_cliente`` e ``cadastro_oee`` existem
         para os testes."""
@@ -389,6 +440,8 @@ class Pipeline:
         self._ao_canais = ao_canais
         self._ao_diagnostico = ao_diagnostico
         self._ao_resposta_comando = ao_resposta_comando
+        self._ao_reinicio_etapa = ao_reinicio_etapa
+        self._ao_dispositivos_oee = ao_dispositivos_oee
         self._dispositivos_t: dict[str, float] = {}  # device_id → epoch do último aviso (só a thread de processamento)
         self._relogio = relogio
         self._intervalo_fixo = intervalo_gravacao
@@ -430,6 +483,10 @@ class Pipeline:
         self._diag_t: dict[str, float] = {}          # device_id → último diag automático (por conexão)
         self._topicos_publicados: set[str] = set()   # eco dos nossos comandos é ignorado
         self._mudos: set[str] = set()                # devices sem resposta ao diag do ciclo (1 erro por incidente)
+        self._diag_enviado_t: dict[str, float] = {}  # device_id → último diag publicado (qualquer origem)
+        self._diag_resposta_t: dict[str, float] = {}  # device_id → último reported.diag recebido
+        self._reinicios: dict[str, _Reinicio] = {}   # device_id → reinício pelo relé (protegido por _trava_cmd)
+        self._oee_lista_t: float | None = None       # último pedido da lista do cadastro OEE (None = pedir já)
 
         # tópicos por dispositivo (dispositivos.json) e as assinaturas extras que eles exigem
         self._topicos = _topicos.TopicosDispositivos(self._caminho_topicos(), self._cfg_dispositivos(),
@@ -519,6 +576,11 @@ class Pipeline:
         return self._submeter(self._pedir_diag, device_id, True, comando="diag", device_id=device_id)
 
     # -- tópicos por dispositivo ----------------------------------------------------------------------------
+
+    def reiniciar_dispositivo(self, device_id: str) -> Future | None:
+        """Não bloqueia: liga ``outN`` (relé que corta a alimentação do aparelho) e acompanha a volta; etapas em
+        ``ao_reinicio_etapa`` e o resultado em ``ao_resposta_comando(device, "reiniciar", ok, msg)``."""
+        return self._submeter(self._reiniciar, device_id, comando="reiniciar", device_id=device_id)
 
     def topicos_do_dispositivo(self, device_id: str) -> dict[str, str]:
         """Os 5 tópicos efetivos do device (salvos ou padrão). Não bloqueia."""
@@ -714,6 +776,7 @@ class Pipeline:
             endereco = self._endereco
             if tipo == "conectado":
                 self._diag_t = {}   # cada (re)conexão ao broker pede o diagnóstico de novo ao ver o device
+                self._diag_enviado_t, self._diag_resposta_t = {}, {}
                 if self._incidente_inicio is not None:
                     voltou = max(0.0, agora - self._incidente_inicio)
                     self._incidente_inicio = None
@@ -808,6 +871,8 @@ class Pipeline:
             self._ultima_msg_t = None
         self._dispositivos_t = {}
         self._diag_t = {}
+        self._diag_enviado_t, self._diag_resposta_t = {}, {}   # janela anti-duplicata vale só dentro da conexão
+        self._oee_lista_t = None     # lista do cadastro OEE logo ao conectar
         self._oee.definir_sql(self.config.sqlserver)
         self._oee.nova_sessao()      # detecção do portal OEE de novo a cada conexão
         proximo = proximo_ciclo(self._relogio(), intervalo) if intervalo > 0 else None
@@ -865,6 +930,7 @@ class Pipeline:
         cliente, self._cliente = self._cliente, None
         with self._trava_topicos:
             self._extras_dispositivos = []
+        self._cancelar_reinicios(cliente)
         if cliente is None and self._processador is None:
             if not silencioso:
                 self._status("desconectado", "Desconectado")
@@ -990,6 +1056,7 @@ class Pipeline:
         extra = " (retida)" if retida else ""
         if res.tipo == EVENTO:
             # evento não é leitura de contagem: não mexe no "Último envio" (dispositivo_visto)
+            self._atividade_reinicio(res.device_id, t_receb)
             self._visto_para_diagnostico(res.device_id)
             if limitador.pode(self._log):
                 eventos = res.objeto.get("events") if isinstance(res.objeto, dict) else None
@@ -997,6 +1064,8 @@ class Pipeline:
             return
         if res.tipo == RESPOSTA:
             self._tratar_resposta(res, topico, limitador)
+            if isinstance(res.objeto, dict) and isinstance(res.objeto.get("reported"), dict):
+                self._atividade_reinicio(res.device_id, t_receb)   # depois: um ack de output com erro já encerrou
             return
         if not res.ok:
             self._erro("payload", f"Mensagem ignorada ({res.formato})", topico, res.erro, payload)
@@ -1009,6 +1078,8 @@ class Pipeline:
             self._erro("payload", f"Leitura não vai para o banco ({res.formato}); guardada na "
                                   "contingência", topico, linha.motivo, payload)
         self._avisar_dispositivos([l.device_id for l in res.linhas], topico, t_receb)
+        for device in dict.fromkeys(l.device_id for l in res.linhas if l.device_id):
+            self._atividade_reinicio(device, t_receb)
         for linha in completas:
             self._visto_para_diagnostico(linha.device_id)
             self._conferir_relogio(linha, t_receb)
@@ -1165,9 +1236,23 @@ class Pipeline:
             if any(c.device_id == device and c.comando == "diag" for c in self._comandos.values()):
                 if not manual:
                     return
+            if not manual:
+                r = self._reinicios.get(device)
+                if r is not None and r.fase in ("pulso", "aguardando"):
+                    return       # aparelho sendo reiniciado: não responderia
+        if not manual and self._diag_recente(device, self._relogio()):
+            logger.debug("Diagnóstico automático de %s dispensado: outro foi enviado/respondido há menos de %g s",
+                         device, self.JANELA_DIAG)
+            return
         cmd = self._enviar(device, "diag", {}, manual=manual)
         if cmd is not None:
             self._log("INFO", f"Pedido de diagnóstico enviado a {device} ({'manual' if manual else 'automático'}).")
+
+    def _diag_recente(self, device: str, agora: float) -> bool:
+        for t in (self._diag_enviado_t.get(device), self._diag_resposta_t.get(device)):
+            if t is not None and 0 <= agora - t < self.JANELA_DIAG:
+                return True
+        return False
 
     def _enviar(self, device: str, comando: str, desejado: dict, manual: bool,
                 canais: list[int] | None = None, externo: bool = False) -> _Comando | None:
@@ -1201,6 +1286,8 @@ class Pipeline:
             self._falha_comando(cmd, f"Não foi possível publicar em {topico}: {motivo}.",
                                 registrar=motivo != "não conectado ao broker")
             return None
+        if comando == "diag":
+            self._diag_enviado_t[device] = agora
         return cmd
 
     def _falha_comando(self, cmd: _Comando, mensagem: str, registrar: bool = True, sem_resposta: bool = False
@@ -1246,6 +1333,21 @@ class Pipeline:
                 if agora - t >= minutos * 60 or agora < t:
                     self._diag_t[device] = agora
                     self._pedir_diag(device, False)
+        self._verificar_reinicios(agora)
+        self._talvez_listar_oee(agora)
+
+    def _talvez_listar_oee(self, agora: float) -> None:
+        ultimo = self._oee_lista_t
+        if ultimo is not None and 0 <= agora - ultimo < self.INTERVALO_LISTA_OEE:
+            return
+        self._oee_lista_t = agora
+        listar = getattr(self._oee, "listar", None)
+        if listar is None:
+            return
+        try:
+            listar(lambda lista: self._avisar(self._ao_dispositivos_oee, json.dumps(lista, ensure_ascii=False)))
+        except Exception:  # noqa: BLE001 - nunca derruba a thread de processamento
+            logger.exception("Falha ao pedir a lista do cadastro OEE")
 
     # -- diagnóstico do ciclo de apontamentos reais --------------------------------------------------------
 
@@ -1272,7 +1374,7 @@ class Pipeline:
             except ValueError:
                 resultado[device] = None
                 continue
-            cmd = self._enviar(valido, "diag", {}, manual=False, externo=True)
+            cmd = self._esperar_diag_pendente(valido) or self._enviar(valido, "diag", {}, manual=False, externo=True)
             if cmd is None:
                 resultado[device] = None
             else:
@@ -1293,6 +1395,25 @@ class Pipeline:
                 resultado[device] = False
                 self._device_mudo(cmd, timeout)
         return resultado
+
+    def _esperar_diag_pendente(self, device: str) -> _Comando | None:
+        """Se há um ``diag`` (automático/manual) pendente para o device enviado há menos de ``JANELA_DIAG`` s, não
+        publica outro: registra uma espera (externo, sem publicar) que a resposta daquele acorda."""
+        agora = self._relogio()
+        with self._trava_cmd:
+            pendente = next((c for c in self._comandos.values() if c.device_id == device and c.comando == "diag"
+                             and not c.externo and 0 <= agora - c.inicio < self.JANELA_DIAG), None)
+            if pendente is None:
+                return None
+            ts = int(agora)
+            while (device, ts) in self._comandos:
+                ts += 1
+            cmd = _Comando(device, "diag", ts, agora, pendente.topico, False, [], pendente.topico_resposta,
+                           externo=True, evento=threading.Event())
+            self._comandos[(device, ts)] = cmd
+        logger.debug("Diagnóstico de %s para os apontamentos: aguardando o pedido enviado há %.0f s", device,
+                     agora - pendente.inicio)
+        return cmd
 
     def _diag_respondido(self, device: str | None, cmd: _Comando | None) -> None:
         """Resposta de diag: libera quem espera (o comando casado e qualquer diag do ciclo pendente do device) e
@@ -1372,6 +1493,8 @@ class Pipeline:
                 diag = dados if isinstance(dados, dict) else {}
                 cmd = self._pendente(device, ts, "diag")
                 quem = cmd.device_id if cmd is not None else device
+                if quem:
+                    self._diag_resposta_t[quem] = self._relogio()
                 self._diag_respondido(quem, cmd)
                 if quem:
                     self._avisar(self._ao_diagnostico, quem, json.dumps(diag, ensure_ascii=False))
@@ -1393,6 +1516,8 @@ class Pipeline:
                     self._avisar(self._ao_resposta_comando, cmd.device_id, "reset_counters", True, msg)
                 else:
                     self._falha_comando(cmd, msg)
+            elif comando == "output" and self._resposta_output(device, ts, dados, topico):
+                continue
             elif limitador.pode(self._log):
                 erro = dados.get("error") if isinstance(dados, dict) else None
                 self._log("INFO", f"Resposta '{comando}' de {device or topico}"
@@ -1405,6 +1530,204 @@ class Pipeline:
         except Exception:  # noqa: BLE001
             topico = None
         self._oee.diagnostico(device, diag, topico)
+
+    # -- reiniciar pelo relé (saída digital outN) ----------------------------------------------------------
+
+    def _cfg_reinicio(self):
+        return getattr(self.config, "reinicio", None) or ReinicioConfig()
+
+    @staticmethod
+    def _numero(valor, padrao: float) -> float:
+        try:
+            n = float(valor)
+        except (TypeError, ValueError):
+            return padrao
+        return n if n > 0 and math.isfinite(n) else padrao
+
+    def _reiniciar(self, device_id: str) -> None:
+        """Thread de controle: publica ``outN = 1`` e registra o reinício; o resto é na thread de processamento."""
+        cfg = self._cfg_reinicio()
+        try:
+            device = digirail.validar_device_id(device_id)
+            saida = digirail.validar_saida(getattr(cfg, "saida", 1))
+        except ValueError as exc:
+            msg = str(exc) if device_id else "Informe o dispositivo."
+            if "Saída" in msg:
+                msg = f"[reinicio] saida inválida no config.toml: {msg}"
+            self._log("ERRO", f"Reiniciar: {msg}")
+            self._avisar(self._ao_resposta_comando, str(device_id or ""), "reiniciar", False, msg)
+            return
+        pulso = self._numero(getattr(cfg, "pulso_segundos", 5), 5.0)
+        timeout = max(self._numero(getattr(cfg, "timeout_volta_segundos", 180), 180.0), pulso)
+        agora = self._relogio()
+        with self._trava_cmd:
+            atual = self._reinicios.get(device)
+            if atual is not None and atual.fase in ("pulso", "aguardando"):
+                em_andamento = True
+            else:
+                em_andamento = False
+                ts = int(agora)
+                while (device, ts) in self._comandos:
+                    ts += 1
+                topico = self._topicos.efetivos(device)["command"]
+                # registrado antes de publicar: o ack pode chegar antes de publicar() voltar
+                self._reinicios[device] = _Reinicio(device, saida, agora, ts, topico, pulso, timeout)
+        if em_andamento:
+            self._log("AVISO", f"Reiniciar {device}: já há um reinício em andamento.")
+            self._avisar(self._ao_resposta_comando, device, "reiniciar", False, "Já há um reinício em andamento")
+            return
+        ok, motivo, topico = self._publicar_saida(device, saida, 1, ts)
+        if not ok:
+            with self._trava_cmd:
+                if self._reinicios.get(device) is not None and self._reinicios[device].timestamp == ts:
+                    self._reinicios.pop(device, None)
+            msg = f"Não foi possível acionar a saída {saida}: {motivo}."
+            self._log("ERRO", f"Reiniciar {device}: {msg}")
+            if motivo != "não conectado ao broker":
+                self._erro("comando", f"Reiniciar {device} falhou", topico, msg)
+            self._avisar(self._ao_resposta_comando, device, "reiniciar", False, msg)
+            return
+        self._avisar(self._ao_reinicio_etapa, device, f"Relé acionado (saída {saida})")
+        self._log("INFO", f"Reiniciar {device}: saída {saida} (out{saida}) ligada em {topico}, timestamp {ts}. "
+                          f"O aparelho deve desligar em até {tempo_texto(pulso)}.")
+
+    def _publicar_saida(self, device: str, saida: int, valor: int, ts: int | None = None
+                        ) -> tuple[bool, str, str]:
+        """Publica ``{"timestamp": T, "desired": {"output": {"outN": valor}}}`` (QoS 1) no ``command`` efetivo."""
+        topico = self._topicos.efetivos(device)["command"]
+        cliente = self._cliente
+        publicar = getattr(cliente, "publicar", None)
+        if cliente is None or publicar is None:
+            return False, "não conectado ao broker", topico
+        if ts is None:
+            ts = int(self._relogio())
+        self._garantir_resposta(cliente, device)
+        self._topicos_publicados.add(topico)
+        try:
+            ok, motivo = publicar(topico, digirail.payload_comando(ts, "output",
+                                                                   digirail.desejado_output(saida, valor)), 1)
+        except Exception as exc:  # noqa: BLE001
+            ok, motivo = False, f"{type(exc).__name__}: {exc}"
+        return bool(ok), str(motivo or ""), topico
+
+    def _desligar_saida(self, r: _Reinicio, motivo: str) -> None:
+        """``outN = 0`` (segurança). Falha só vai para o log: o relé é responsabilidade do aparelho depois disso."""
+        ts = max(int(self._relogio()), r.timestamp + 1)
+        ok, erro, topico = self._publicar_saida(r.device_id, r.saida, 0, ts)
+        if ok:
+            logger.info("Reiniciar %s: saída %s desligada (%s) em %s", r.device_id, r.saida, motivo, topico)
+        else:
+            self._log("AVISO", f"Reiniciar {r.device_id}: não foi possível desligar a saída {r.saida} ({erro}). "
+                               "Confira o relé.")
+
+    def _atividade_reinicio(self, device: str | None, t_receb: float) -> None:
+        """Thread de processamento: mensagem do ``device`` recebida em ``t_receb`` (relógio do pipeline)."""
+        if not device or not self._reinicios:
+            return
+        with self._trava_cmd:
+            r = self._reinicios.get(device)
+            if r is None or t_receb < r.inicio + self.ATRASO_ONLINE:
+                return
+            if r.fase == "pulso" or (r.fase == "aguardando" and t_receb < r.inicio + r.pulso):
+                if r.fase == "pulso":
+                    if r.online is None:
+                        r.online = "mensagem"
+                    return
+                self._reinicios.pop(device, None)   # chegou atrasada na fila, mas é do período do pulso
+                acao = "nao_reiniciou"
+            else:
+                self._reinicios.pop(device, None)
+                acao = "voltou" if r.fase == "aguardando" else "tardio"
+        if acao == "nao_reiniciou":
+            self._nao_reiniciou(r)
+            return
+        self._desligar_saida(r, "aparelho voltou")
+        duracao = tempo_texto(t_receb - r.inicio)
+        if acao == "voltou":
+            msg = f"Reiniciado: voltou em {duracao}"
+            self._log("INFO", f"{device}: {msg} (saída {r.saida} desligada).")
+            self._avisar(self._ao_resposta_comando, device, "reiniciar", True, msg)
+        else:
+            self._log("INFO", f"{device} voltou {duracao} depois do pedido de reinício (fora do prazo); saída "
+                              f"{r.saida} desligada.")
+
+    def _nao_reiniciou(self, r: _Reinicio) -> None:
+        self._desligar_saida(r, "aparelho continuou online")
+        msg = f"A saída {r.saida} ligou mas o aparelho não reiniciou: confira a ligação do relé"
+        self._log("ERRO", f"Reiniciar {r.device_id}: {msg}.")
+        self._avisar(self._ao_resposta_comando, r.device_id, "reiniciar", False, msg)
+
+    def _verificar_reinicios(self, agora: float) -> None:
+        """Thread de processamento: fim do pulso e prazo de volta."""
+        if not self._reinicios:
+            return
+        nao_reiniciou: list[_Reinicio] = []
+        aguardando: list[_Reinicio] = []
+        vencidos: list[_Reinicio] = []
+        with self._trava_cmd:
+            for r in list(self._reinicios.values()):
+                if r.fase == "pulso" and agora - r.inicio >= r.pulso:
+                    if r.online is not None:
+                        self._reinicios.pop(r.device_id, None)
+                        nao_reiniciou.append(r)
+                    else:
+                        r.fase = "aguardando"
+                        aguardando.append(r)
+                elif r.fase == "aguardando" and agora - r.inicio >= r.timeout:
+                    r.fase = "tardio"
+                    vencidos.append(r)
+        for r in nao_reiniciou:
+            self._nao_reiniciou(r)
+        for r in aguardando:
+            self._avisar(self._ao_reinicio_etapa, r.device_id, "Aguardando o aparelho voltar…")
+            self._log("INFO", f"Reiniciar {r.device_id}: o aparelho desligou; aguardando ele voltar (até "
+                              f"{tempo_texto(r.timeout)}).")
+        for r in vencidos:
+            msg = f"Não voltou em {tempo_texto(r.timeout)}"
+            self._log("ERRO", f"Reiniciar {r.device_id}: {msg}. Quando ele voltar, a saída {r.saida} será "
+                              "desligada.")
+            self._erro("comando", f"Dispositivo {r.device_id} não voltou depois do reinício", r.topico,
+                       f"{msg} desde que a saída {r.saida} (out{r.saida}) foi ligada (timestamp {r.timestamp}). "
+                       "Confira a alimentação e a rede do aparelho.")
+            self._avisar(self._ao_resposta_comando, r.device_id, "reiniciar", False, msg)
+
+    def _resposta_output(self, device: str | None, ts: int | None, dados, topico: str) -> bool:
+        """``reported.output``: casa com o reinício do device (timestamp do outN = 1). Erro ≠ 0 = falha imediata.
+        Devolve False se não é de um reinício nosso (o chamador só loga)."""
+        if not device:
+            return False
+        with self._trava_cmd:
+            r = self._reinicios.get(device)
+            if r is None or r.fase not in ("pulso", "aguardando") or (ts is not None and ts != r.timestamp):
+                return False
+            erro = dados.get("error") if isinstance(dados, dict) else None
+            ok, msg = digirail.mensagem_output(erro, r.saida)
+            if not ok:
+                self._reinicios.pop(device, None)
+        if ok:
+            logger.info("Reiniciar %s: o aparelho confirmou a saída %s (%s)", device, r.saida, topico)
+            return True
+        self._log("ERRO", f"Reiniciar {device}: {msg}")
+        self._avisar(self._ao_resposta_comando, device, "reiniciar", False, msg)
+        return True
+
+    def _cancelar_reinicios(self, cliente) -> None:
+        """Desconectar/encerrar: cancela sem erro; tenta ``outN = 0`` antes de o cliente parar."""
+        with self._trava_cmd:
+            todos, self._reinicios = list(self._reinicios.values()), {}
+        for r in todos:
+            if r.fase not in ("pulso", "aguardando"):
+                continue
+            publicar = getattr(cliente, "publicar", None)
+            if publicar is not None:
+                try:
+                    publicar(r.topico, digirail.payload_comando(max(int(self._relogio()), r.timestamp + 1), "output",
+                                                                digirail.desejado_output(r.saida, 0)), 1)
+                except Exception:  # noqa: BLE001
+                    logger.exception("Falha ao desligar a saída de %s no cancelamento", r.device_id)
+            msg = "Reinício cancelado: conexão com o broker encerrada."
+            self._log("INFO", f"Reiniciar {r.device_id}: {msg}")
+            self._avisar(self._ao_resposta_comando, r.device_id, "reiniciar", False, msg)
 
     def _ciclo(self, sink: Sink, amostra: _Amostragem, intervalo: float, momento: float | None,
                fechar: bool = False, referencia: float | None = None) -> float | None:

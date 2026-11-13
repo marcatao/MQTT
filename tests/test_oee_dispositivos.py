@@ -79,13 +79,13 @@ def test_script_permissoes_oee():
     assert "OEE_Alumbra" in texto      # comentário: o banco pode ter outro nome
 
 
-def test_diagnostico_padrao_3_minutos_e_config_oee():
+def test_diagnostico_padrao_1_minuto_e_config_oee():
     cfg = Config()
-    assert cfg.dispositivos.diagnostico_minutos == 3
+    assert cfg.dispositivos.diagnostico_minutos == 1
     assert cfg.oee == OeeConfig(habilitado=True, banco="OEE", tabela="dbo.dispositivos_iot", unidade="manutencao",
                                 tipo="contador")
     exemplo = tomllib.loads((RAIZ / "config.example.toml").read_text(encoding="utf-8"))
-    assert exemplo["dispositivos"]["diagnostico_minutos"] == 3
+    assert exemplo["dispositivos"]["diagnostico_minutos"] == 1
     assert exemplo["oee"] == {"habilitado": True, "banco": "OEE", "tabela": "dbo.dispositivos_iot",
                               "unidade": "manutencao", "tipo": "contador"}
     for n in (4, 5, 6):

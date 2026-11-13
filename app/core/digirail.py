@@ -81,6 +81,37 @@ def mensagem_reset(erro: Any, canais: list[int] | None = None) -> tuple[bool, st
                    "no NXperience.")
 
 
+SAIDAS = (1, 2)                     # saídas digitais NPN: out1, out2 (manual p. 6, 17 e 45)
+
+
+def validar_saida(saida: Any) -> int:
+    """Número da saída digital (1 ou 2); ValueError se inválido."""
+    try:
+        n = int(saida)
+    except (TypeError, ValueError):
+        raise ValueError(f"Saída inválida: {saida!r} (use 1 ou 2).") from None
+    if isinstance(saida, bool) or n not in SAIDAS:
+        raise ValueError(f"Saída inválida: {saida!r} (use 1 ou 2).")
+    return n
+
+
+def desejado_output(saida: int, valor: int) -> dict:
+    """Corpo de ``desired.output`` (manual 6.5.1): ``{"out1": 1}`` liga, ``{"out1": 0}`` desliga."""
+    return {f"out{int(saida)}": 1 if valor else 0}
+
+
+def mensagem_output(erro: Any, saida: int) -> tuple[bool, str]:
+    """(sucesso, mensagem) a partir de ``reported.output.error`` (0 ok, 1 fora da faixa, 2 desconhecido)."""
+    try:
+        codigo = int(erro)
+    except (TypeError, ValueError):
+        return False, f"Resposta do comando da saída {saida} sem código de erro válido ({erro!r})."
+    if codigo == 0:
+        return True, f"Saída {saida} acionada."
+    motivo = ERROS_COMANDO.get(codigo, "erro desconhecido")
+    return False, f"O aparelho recusou o comando da saída {saida} (erro {codigo}: {motivo})."
+
+
 def chave_natural(nome: str) -> list:
     """Ordem natural: chd2 antes de chd10."""
     return [int(p) if p.isdigit() else p.lower() for p in _RE_DIGITOS.split(nome)]

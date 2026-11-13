@@ -126,8 +126,17 @@ class DispositivosConfig:
     topico_comando: str = "NOVUS/{id}/command"
     topico_resposta: str = "NOVUS/{id}/ack/command"   # confirmação de comando (ack_command)
     arquivo_topicos: str = "dispositivos.json"        # relativo à pasta do programa (pasta_base())
-    diagnostico_minutos: float = 3          # pede "diag" ao ver o device em cada conexão e a cada N min; 0 desliga
+    diagnostico_minutos: float = 1          # pede "diag" ao ver o device em cada conexão e a cada N min; 0 desliga
     timeout_comando_segundos: float = 15    # sem resposta nesse tempo: "sem resposta do dispositivo"
+
+
+@dataclass
+class ReinicioConfig:
+    """Botão Reiniciar da aba Clientes: liga a saída digital ``outN`` do DigiRail (manual 6.5.1 OUTPUT), que aciona
+    o relé ligado pelo usuário e corta a alimentação do próprio aparelho. Ver ``Pipeline.reiniciar_dispositivo``."""
+    saida: int = 1                          # 1 (out1) ou 2 (out2)
+    pulso_segundos: float = 5               # depois disso: se o aparelho ainda responde, o relé não funcionou
+    timeout_volta_segundos: float = 180     # sem nenhuma mensagem do aparelho nesse tempo: falha "Não voltou"
 
 
 @dataclass
@@ -175,6 +184,7 @@ class Config:
     inicio: InicioConfig = field(default_factory=InicioConfig)
     mosquitto: MosquittoConfig = field(default_factory=MosquittoConfig)
     dispositivos: DispositivosConfig = field(default_factory=DispositivosConfig)
+    reinicio: ReinicioConfig = field(default_factory=ReinicioConfig)
     oee: OeeConfig = field(default_factory=OeeConfig)
     apontamentos: ApontamentosConfig = field(default_factory=ApontamentosConfig)
 
@@ -193,6 +203,6 @@ def carregar(caminho: Path | None = None) -> Config:
         with caminho.open("rb") as f:
             dados = tomllib.load(f)
         for secao in ("mqtt", "sqlserver", "gravacao", "mapeamento", "vigia", "inicio", "mosquitto",
-                      "dispositivos", "oee", "apontamentos"):
+                      "dispositivos", "reinicio", "oee", "apontamentos"):
             _preencher(getattr(cfg, secao), dados.get(secao, {}))
     return cfg

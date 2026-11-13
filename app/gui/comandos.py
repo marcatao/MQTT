@@ -18,7 +18,7 @@ from datetime import datetime
 from typing import Any, Callable, Iterable
 
 from PySide6.QtCore import QEvent, QModelIndex, QPointF, QRectF, Qt, Signal
-from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPen
+from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPen, QPolygonF
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -48,6 +48,7 @@ AVISO_ZERAR = ("O contador volta a zero no aparelho e não pode ser desfeito. S�
 PAPEL_WIFI = Qt.ItemDataRole.UserRole + 2   # int (dBm, negativo) ou None
 PAPEL_ACAO = Qt.ItemDataRole.UserRole + 3   # (estado, texto) ou None; estado: ver DelegadoAcao.CLICAVEIS
 PAPEL_TOPICOS = Qt.ItemDataRole.UserRole + 4  # botão "Tópicos" da linha: None (sem), "normal" ou "aviso"
+PAPEL_REINICIO = Qt.ItemDataRole.UserRole + 5  # botão Reiniciar: (estado, texto) ou None; mesmos estados de PAPEL_ACAO
 TEXTO_TOPICOS = "Tópicos"
 DICA_TOPICOS = "Tópicos deste aparelho (os mesmos do NXperience)…"
 DICA_TOPICOS_AVISO = ("Este aparelho publica em tópicos que o integrador não ouve.\n"
@@ -337,13 +338,21 @@ class DelegadoAcao(QStyledItemDelegate):
 
     CLICAVEIS = ("pronto", "ok", "falha")
     ESPACO = 6
+    LARGURA_ICONE = 16  # ícone desenhado à esquerda do texto (só com `icone`)
     acionado = Signal(QModelIndex)
     topicos_acionado = Signal(QModelIndex)
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, papel: int = PAPEL_ACAO, icone: str | None = None,
+                 rotulo: Callable[[str], str] | None = None):
+        """`papel`: de onde vem (estado, texto) do botão (PAPEL_ACAO ou PAPEL_REINICIO). `icone`: None ou
+        "reiniciar" (seta circular antes do texto). `rotulo(texto)`: texto desenhado no botão, mais curto que o do
+        modelo (o modelo, o CSV e os testes continuam com o texto completo; a dica explica)."""
         super().__init__(parent)
         self.paleta: Paleta = CLARA
         self.posicao_mouse = None  # QPointF no viewport, ou None
+        self.papel = papel
+        self.icone = icone
+        self.rotulo = rotulo or (lambda texto: texto)
 
     def definir_paleta(self, p: Paleta) -> None:
         self.paleta = p
@@ -358,12 +367,17 @@ class DelegadoAcao(QStyledItemDelegate):
     def largura_topicos(self, opcao: QStyleOptionViewItem) -> int:
         return self.LARGURA_TOPICOS
 
+    def largura_conteudo(self, opcao: QStyleOptionViewItem, texto: str) -> int:
+        """Largura do texto curto (+ ícone) desenhado no botão."""
+        largura = QFontMetrics(self._fonte(opcao)).horizontalAdvance(self.rotulo(texto))
+        return largura + (self.LARGURA_ICONE + 4 if self.icone else 0)
+
     def retangulo_botao(self, opcao: QStyleOptionViewItem, texto: str, com_topicos: bool = False) -> QRectF:
-        metricas = QFontMetrics(self._fonte(opcao))
         r = opcao.rect
         altura = min(26, r.height() - 6)
         reserva = self.largura_topicos(opcao) + self.ESPACO if com_topicos else 0
-        largura = min(metricas.horizontalAdvance(texto) + 24, r.width() - 12 - reserva)
+        folga = 16 if self.icone else 24  # com ícone o botão já tem respiro à esquerda
+        largura = min(self.largura_conteudo(opcao, texto) + folga, r.width() - 12 - reserva)
         return QRectF(r.left() + 6, r.top() + (r.height() - altura) / 2, max(0, largura), altura)
 
     def retangulo_topicos(self, opcao: QStyleOptionViewItem, texto_acao: str) -> QRectF:
@@ -396,10 +410,39 @@ class DelegadoAcao(QStyledItemDelegate):
                 pintor.drawPoint(QPointF(cx - 6, cy + dy))
                 pintor.drawLine(QPointF(cx - 2.5, cy + dy), QPointF(cx + 6.5, cy + dy))
             return
+        texto = self.rotulo(texto)
+        area = QRectF(caixa)
+        if self.icone:
+            largura_texto = QFontMetrics(fonte).horizontalAdvance(texto)
+            conteudo = min(self.LARGURA_ICONE + 4 + largura_texto, caixa.width() - 8)
+            x = caixa.left() + (caixa.width() - conteudo) / 2
+            self._desenhar_icone(pintor, QRectF(x, caixa.center().y() - 7, 14, 14), QColor(cor_texto))
+            area = QRectF(x + self.LARGURA_ICONE + 4, caixa.top(),
+                          max(0.0, caixa.right() - 4 - (x + self.LARGURA_ICONE + 4)), caixa.height())
+            alinhamento = Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft
+            margem = 0
+        else:
+            alinhamento = Qt.AlignmentFlag.AlignCenter
+            margem = 12
         pintor.setFont(fonte)
         pintor.setPen(QColor(cor_texto))
-        visivel = QFontMetrics(fonte).elidedText(texto, Qt.TextElideMode.ElideRight, int(caixa.width()) - 12)
-        pintor.drawText(caixa, int(Qt.AlignmentFlag.AlignCenter), visivel)
+        visivel = QFontMetrics(fonte).elidedText(texto, Qt.TextElideMode.ElideRight, int(area.width()) - margem)
+        pintor.drawText(area, int(alinhamento), visivel)
+
+    def _desenhar_icone(self, pintor: QPainter, caixa: QRectF, cor: QColor) -> None:
+        """Seta circular (reiniciar): arco de ~300° com a ponta da seta no fim."""
+        pintor.save()
+        pintor.setPen(QPen(cor, 1.6, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+        pintor.setBrush(Qt.BrushStyle.NoBrush)
+        arco = caixa.adjusted(2, 2, -2, -2)
+        pintor.drawArc(arco, 60 * 16, 290 * 16)  # começa em 60° e gira no sentido anti-horário
+        # ponta da seta no início do arco (60°), apontando no sentido horário
+        cx, cy, raio = arco.center().x(), arco.center().y(), arco.width() / 2
+        px, py = cx + raio * 0.5, cy - raio * 0.866
+        pintor.setBrush(cor)
+        pintor.drawPolygon(QPolygonF([QPointF(px + 3.2, py - 0.6), QPointF(px - 1.4, py - 3.0),
+                                      QPointF(px - 0.6, py + 2.4)]))
+        pintor.restore()
 
     def cores(self, estado: str, sobre: bool) -> tuple[str, str, str]:
         """(fundo, borda, texto)."""
@@ -412,8 +455,11 @@ class DelegadoAcao(QStyledItemDelegate):
             return (p.superficie_alt, p.borda, p.texto_fraco)
         return (p.neutro_suave if sobre else p.superficie, p.texto_fraco if sobre else p.borda_forte, p.texto)
 
+    def _topicos(self, indice: QModelIndex):
+        return indice.data(PAPEL_TOPICOS) if self.papel == PAPEL_ACAO else None
+
     def paint(self, pintor: QPainter, opcao: QStyleOptionViewItem, indice: QModelIndex) -> None:
-        acao = indice.data(PAPEL_ACAO)
+        acao = indice.data(self.papel)
         opt = QStyleOptionViewItem(opcao)
         self.initStyleOption(opt, indice)
         opt.text = ""
@@ -422,7 +468,7 @@ class DelegadoAcao(QStyledItemDelegate):
         if not acao:
             return
         estado, texto = acao
-        topicos = indice.data(PAPEL_TOPICOS)
+        topicos = self._topicos(indice)
         caixa = self.retangulo_botao(opt, texto, com_topicos=bool(topicos))
         sobre = estado in self.CLICAVEIS and self._sobre(opt, caixa)
         fonte = self._fonte(opt)
@@ -438,10 +484,10 @@ class DelegadoAcao(QStyledItemDelegate):
 
     def botao_em(self, opcao: QStyleOptionViewItem, indice: QModelIndex, pos) -> str | None:
         """"acao", "topicos" ou None: qual botão da célula está em `pos` (coordenadas do viewport)."""
-        acao = indice.data(PAPEL_ACAO)
+        acao = indice.data(self.papel)
         if not acao:
             return None
-        topicos = indice.data(PAPEL_TOPICOS)
+        topicos = self._topicos(indice)
         if topicos and self.retangulo_topicos(opcao, acao[1]).contains(pos):
             return "topicos"
         if acao[0] in self.CLICAVEIS and self.retangulo_botao(opcao, acao[1], bool(topicos)).contains(pos):
@@ -464,8 +510,8 @@ class DelegadoAcao(QStyledItemDelegate):
     def helpEvent(self, evento, vista, opcao: QStyleOptionViewItem, indice: QModelIndex) -> bool:  # noqa: N802
         """Dica própria do botão de tópicos (o resto da célula usa a dica do modelo)."""
         if evento.type() == QEvent.Type.ToolTip:
-            topicos = indice.data(PAPEL_TOPICOS)
-            acao = indice.data(PAPEL_ACAO)
+            topicos = self._topicos(indice)
+            acao = indice.data(self.papel)
             if topicos and acao and self.retangulo_topicos(opcao, acao[1]).contains(QPointF(evento.pos())):
                 QToolTip.showText(evento.globalPos(), DICA_TOPICOS_AVISO if topicos == "aviso" else DICA_TOPICOS,
                                   vista)
@@ -474,10 +520,10 @@ class DelegadoAcao(QStyledItemDelegate):
 
     def sizeHint(self, opcao: QStyleOptionViewItem, indice: QModelIndex):  # noqa: N802
         tamanho = super().sizeHint(opcao, indice)
-        acao = indice.data(PAPEL_ACAO)
+        acao = indice.data(self.papel)
         if acao:
-            largura = QFontMetrics(self._fonte(opcao)).horizontalAdvance(acao[1]) + 40
-            if indice.data(PAPEL_TOPICOS):
+            largura = self.largura_conteudo(opcao, acao[1]) + (32 if self.icone else 40)
+            if self._topicos(indice):
                 largura += self.largura_topicos(opcao) + self.ESPACO
             tamanho.setWidth(largura)
         return tamanho
@@ -498,6 +544,54 @@ def confirmar_zerar(parent: QWidget | None, device_id: str, canais: list[int]) -
     caixa.setEscapeButton(cancelar)
     caixa.exec()
     return caixa.clickedButton() is zerar
+
+
+AVISO_REINICIO_DESCONECTADO = ("O aparelho parece desconectado; o comando só chega se ele ainda estiver ouvindo o "
+                               "broker.")
+
+
+def texto_confirmar_reinicio(device_id: str, saida: int = 1, desconectado: bool = False) -> tuple[str, str]:
+    """(pergunta, explicação) da confirmação do Reiniciar. Função pura (os testes conferem o texto)."""
+    pergunta = f"Reiniciar {device_id}?"
+    explicacao = (f"O integrador vai ligar a saída {saida} do aparelho, que aciona o relé e corta a alimentação por "
+                  "alguns segundos. A contagem para durante o reinício.")
+    if desconectado:
+        explicacao += "\n\n" + AVISO_REINICIO_DESCONECTADO
+    return pergunta, explicacao
+
+
+def caixa_confirmar_reinicio(parent: QWidget | None, device_id: str, pergunta: str,
+                             explicacao: str) -> tuple[QMessageBox, QPushButton]:
+    """Monta a confirmação (sem abrir): QMessageBox com "Cancelar" como botão padrão (Enter e Esc cancelam)."""
+    caixa = QMessageBox(parent)
+    caixa.setIcon(QMessageBox.Icon.Warning)
+    caixa.setWindowTitle(f"Reiniciar — {device_id}")
+    caixa.setText(pergunta)
+    caixa.setInformativeText(explicacao)
+    reiniciar = caixa.addButton("Reiniciar", QMessageBox.ButtonRole.DestructiveRole)
+    cancelar = caixa.addButton("Cancelar", QMessageBox.ButtonRole.RejectRole)
+    caixa.setDefaultButton(cancelar)
+    caixa.setEscapeButton(cancelar)
+    return caixa, reiniciar
+
+
+def confirmar_reinicio(parent: QWidget | None, device_id: str, pergunta: str, explicacao: str) -> bool:
+    caixa, reiniciar = caixa_confirmar_reinicio(parent, device_id, pergunta, explicacao)
+    try:
+        caixa.exec()
+        return caixa.clickedButton() is reiniciar
+    finally:
+        caixa.deleteLater()
+
+
+def texto_etapa_curto(etapa: str) -> str:
+    """Texto da etapa no botão (a dica mostra a etapa completa): "Aguardando o aparelho voltar…" →
+    "Aguardando voltar…"; o resto passa igual (o botão corta com reticências se não couber)."""
+    t = " ".join(str(etapa or "").split())
+    baixo = t.casefold()
+    if baixo.startswith("aguardando") and "voltar" in baixo:
+        return "Aguardando voltar…"
+    return t or "Reiniciando…"
 
 
 class DialogoZerarContadores(QDialog):

@@ -18,7 +18,14 @@ O MQTT não traz IP nem MAC, então a lista junta três fontes (CLAUDE.md, "Aba 
 * tópicos por dispositivo (diálogo "Tópicos…" em app/gui/topicos.py): a janela entrega o bridge em
   `definir_api_topicos`. Cada tópico publicado (linha PUBLISH do mosquitto -v) é conferido com
   `topico_coberto`; o que o integrador não ouve vira um AVISO na Atividade (1 vez por tópico por sessão), um ⚠ na
-  coluna Nome e um item no diálogo, com "Usar como…".
+  coluna Nome e um item no diálogo, com "Usar como…";
+* Reiniciar pelo relé (v0.1.19): botão no fim da linha (coluna "Reiniciar") e item no menu de contexto. Pede
+  confirmação e emite `reinicio_pedido(device_id)` (a janela liga a `bridge.reiniciar_dispositivo`); as etapas
+  chegam por `reinicio_etapa` e o resultado por `resposta_comando(device, "reiniciar", …)`. Sem nenhuma resposta em
+  5 min a tela desiste ("Falhou" + AVISO na Atividade);
+* o cadastro do portal OEE (`dispositivos_oee`, JSON a cada 1 min): os dispositivos que já estão na lista ganham a
+  coluna Máquina; os que não estão entram em cinza como "Desconectado (cadastro OEE)" e viram a linha ao vivo normal
+  (sem duplicar) assim que mandam leitura ou diagnóstico. Caixa "Mostrar cadastro OEE" (lembrada em QSettings).
 
 Partes: lógica pura (`RegistroClientes`), modelo Qt (`ModeloClientes` + `FiltroClientes`), consulta ARP
 (`ConsultaArp`) e o conteúdo da aba (`PainelClientes`).
@@ -63,6 +70,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QPushButton,
     QStackedWidget,
+    QStyledItemDelegate,
     QStyleOptionViewItem,
     QTableView,
     QVBoxLayout,
@@ -71,6 +79,7 @@ from PySide6.QtWidgets import (
 
 from .comandos import (
     PAPEL_ACAO,
+    PAPEL_REINICIO,
     PAPEL_TOPICOS,
     PAPEL_WIFI,
     DelegadoAcao,
@@ -79,15 +88,28 @@ from .comandos import (
     DialogoZerarContadores,
     dica_wifi,
     interpretar_diag,
+    confirmar_reinicio,
     lista_canais,
     numeros_canais,
+    texto_confirmar_reinicio,
+    texto_etapa_curto,
     texto_hora_diag,
     texto_relogio,
     texto_wifi,
 )
 from .estilo import CLARA, Paleta
 from .topicos import DialogoTopicos
-from .widgets import LOCALE_BR, PAPEL_PILULA, refiltrar, rodar_em_thread, ChipInfo, DelegadoPilula, avisar
+from .widgets import (
+    LOCALE_BR,
+    PAPEL_PILULA,
+    PAPEL_PILULA_SELO,
+    PAPEL_PILULA_TEXTO,
+    ChipInfo,
+    DelegadoPilula,
+    avisar,
+    refiltrar,
+    rodar_em_thread,
+)
 
 # ---------------------------------------------------------------------- constantes
 LIMITE_ATRASO_S = 120     # sem envio há mais de 2 min: âmbar + "atrasado"
@@ -100,15 +122,17 @@ PREFIXOS_SUB = ("mosqsub", "mosquitto_sub")       # mosquitto_sub antigo; o 2.x 
 SEM_VALOR = "—"
 ESTE_COMPUTADOR = "este computador"
 
-# Ordem lógica (modelo, CSV, `linhas_visiveis`): as 8 colunas de sempre e depois as do DigiRail.
+# Ordem lógica (modelo, CSV, `linhas_visiveis`): as 8 colunas de sempre, as do DigiRail e as da v0.1.19 (Máquina do
+# cadastro OEE e o botão Reiniciar). Colunas novas entram sempre no fim, para não mudar os índices antigos.
 COLUNAS = ("Nome", "IP", "MAC", "Último envio", "Há quanto tempo", "Tópico", "Status", "Mensagens",
-           "Nº série", "Firmware", "Wi-Fi", "Fila no aparelho", "Diagnóstico", "Ação")
+           "Nº série", "Firmware", "Wi-Fi", "Fila no aparelho", "Diagnóstico", "Ação", "Máquina", "Reiniciar")
 (COL_NOME, COL_IP, COL_MAC, COL_ULTIMO, COL_HA, COL_TOPICO, COL_STATUS, COL_MENSAGENS,
- COL_SERIE, COL_FIRMWARE, COL_WIFI, COL_FILA, COL_DIAG, COL_ACAO) = range(len(COLUNAS))
-# Ordem na tela: o que se olha sempre (nome, status, envio, sinal, fila) à esquerda; endereços e identificação no
-# meio; tópico, contagem e a ação no fim. Colunas menos usadas podem ser escondidas (clique direito no cabeçalho).
-ORDEM_VISUAL = (COL_NOME, COL_STATUS, COL_HA, COL_ULTIMO, COL_WIFI, COL_FILA, COL_IP, COL_MAC, COL_SERIE,
-                COL_FIRMWARE, COL_DIAG, COL_TOPICO, COL_MENSAGENS, COL_ACAO)
+ COL_SERIE, COL_FIRMWARE, COL_WIFI, COL_FILA, COL_DIAG, COL_ACAO, COL_MAQUINA, COL_REINICIO) = range(len(COLUNAS))
+# Ordem na tela: o que se olha sempre (nome, máquina, status, envio, sinal) à esquerda; endereços e identificação no
+# meio; tópico, contagem e os comandos no fim, com Reiniciar por último. Colunas menos usadas podem ser escondidas
+# (clique direito no cabeçalho).
+ORDEM_VISUAL = (COL_NOME, COL_MAQUINA, COL_STATUS, COL_HA, COL_ULTIMO, COL_WIFI, COL_FILA, COL_IP, COL_MAC,
+                COL_SERIE, COL_FIRMWARE, COL_DIAG, COL_TOPICO, COL_MENSAGENS, COL_ACAO, COL_REINICIO)
 DICA_ULTIMO_ENVIO = "Última leitura de contagem recebida (diagnóstico e eventos não contam)."
 DICAS_COLUNAS = {
     COL_ULTIMO: DICA_ULTIMO_ENVIO,
@@ -119,16 +143,21 @@ DICAS_COLUNAS = {
     COL_FIRMWARE: "Versão do firmware, pelo diagnóstico do aparelho.",
     COL_DIAG: "Hora do último diagnóstico recebido do aparelho.",
     COL_MENSAGENS: "Mensagens publicadas, contadas pela saída do mosquitto -v.",
-    COL_ACAO: "Comandos ao aparelho (precisa estar conectado ao broker).",
+    COL_ACAO: "Zerar contadores e tópicos do aparelho (comandos precisam do integrador conectado ao broker).",
+    COL_MAQUINA: "Máquina ligada a este dispositivo no portal OEE (cadastro de dispositivos IoT).",
+    COL_REINICIO: "Reiniciar o aparelho pelo relé ligado à saída digital (precisa do integrador conectado ao broker).",
 }
-COLUNAS_FIXAS = (COL_NOME, COL_ACAO)       # não podem ser escondidas
+COLUNAS_FIXAS = (COL_NOME, COL_ACAO, COL_REINICIO)  # não podem ser escondidas
 # Cabeçalho na tela mais curto que o nome da coluna (CSV, menu Colunas e QSettings usam o nome completo).
 ROTULOS_CURTOS = {COL_FILA: "Fila"}
 # Em 1440 px a tabela tem ~940 px (a coluna lateral fica com o resto): por padrão escondem-se as colunas cuja
 # informação também aparece numa dica — Último envio (dica de "Há quanto tempo"), MAC (dica do IP), Tópico (dica do
 # nome), Firmware (dica do nº de série) — e Mensagens. O menu "Colunas" (ou clique direito no cabeçalho) as mostra.
-OCULTAS_PADRAO = (COL_ULTIMO, COL_MAC, COL_TOPICO, COL_MENSAGENS, COL_FIRMWARE)
-# Exportação CSV: as 8 colunas originais na ordem de sempre, o client id e depois as do diagnóstico.
+# Desde a v0.1.19 (Máquina e Reiniciar) também o Nº série, a Fila no aparelho e o Diagnóstico: a dica do Nome mostra
+# série/firmware, as leituras guardadas no aparelho e o diagnóstico sem resposta.
+OCULTAS_PADRAO = (COL_ULTIMO, COL_MAC, COL_TOPICO, COL_MENSAGENS, COL_FIRMWARE, COL_SERIE, COL_FILA, COL_DIAG)
+# Exportação CSV: as 8 colunas originais na ordem de sempre, o client id e depois as do diagnóstico (formato
+# estável: planilhas do usuário dependem dele; a Máquina não entra).
 COLUNAS_CSV = tuple(range(COL_MENSAGENS + 1))
 COLUNAS_CSV_DIAG = (COL_SERIE, COL_FIRMWARE, COL_WIFI, COL_FILA, COL_DIAG)
 PAPEL_ORDEM = Qt.ItemDataRole.UserRole
@@ -136,6 +165,12 @@ CHAVE_COLUNAS_OCULTAS = "clientes/colunas_ocultas"
 TEMPO_SEM_RESPOSTA_S = 30  # o core responde em até 15 s; sem nada em 30 s a tela desiste
 TEXTO_ZERAR = "Zerar contadores"
 TEXTO_SEM_RESPOSTA = "sem resposta"
+TEXTO_REINICIAR = "Reiniciar"
+TEMPO_SEM_RESPOSTA_REINICIO_S = 300  # o core desiste em ~3 min (timeout_volta_segundos); a tela, em 5 min sem nada
+STATUS_OEE = "Desconectado (cadastro OEE)"
+PILULA_OEE = ("Desconectado", "OEE")  # na pílula: "Desconectado" + selo "OEE" (o texto completo fica na dica e no CSV)
+CHAVE_MOSTRAR_OEE = "clientes/mostrar_oee"
+PREFIXO_OEE = "oee:"
 MAX_TOPICOS_POR_CLIENTE = 50   # tópicos distintos lembrados por cliente (para reavaliar depois de salvar)
 
 
@@ -286,6 +321,8 @@ class Cliente:
     atividade: float = 0.0           # último evento qualquer (para descartar os mais antigos)
     publicados: list[str] = field(default_factory=list)   # tópicos distintos em que publicou (mosquitto -v)
     nao_ouvidos: list[str] = field(default_factory=list)  # desses, os que o integrador não ouve
+    so_oee: bool = False             # só do cadastro OEE: não está enviando (vira linha ao vivo quando mandar dados)
+    nome_oee: str | None = None      # nome no portal OEE (só nas linhas do cadastro; `nome` continua o device_id)
 
     @property
     def proprio(self) -> bool:
@@ -294,10 +331,14 @@ class Cliente:
 
     @property
     def nome_exibido(self) -> str:
+        if self.so_oee and self.nome_oee:
+            return self.nome_oee
         return self.nome or self.client_id or SEM_VALOR
 
     @property
     def status(self) -> str:
+        if self.so_oee:
+            return STATUS_OEE
         if self.client_id is None or self.conectado is None:
             return SEM_VALOR
         if not self.conectado:
@@ -337,6 +378,8 @@ class RegistroClientes:
         self._cobertura: dict[str, bool] = {}           # cache até o próximo `reavaliar`
         self._avisados: set[str] = set()                # tópicos já avisados nesta sessão
         self._avisos: list[tuple[str, str]] = []        # (nome exibido do cliente, tópico) a avisar
+        self.oee: dict[str, dict] = {}                  # codigo (= device_id) → item do cadastro OEE
+        self.oee_recebido = False                       # já chegou algum `dispositivos_oee`
 
     # ----- consulta -----
     def cliente(self, chave: str) -> Cliente | None:
@@ -344,6 +387,20 @@ class RegistroClientes:
 
     def por_nome(self, nome: str) -> Cliente | None:
         return next((c for c in self.linhas if c.nome == nome), None)
+
+    def ao_vivo(self, device_id: str) -> Cliente | None:
+        """Linha ao vivo (não só do cadastro OEE) com esse device_id."""
+        return next((c for c in self.linhas if c.nome == device_id and not c.so_oee), None)
+
+    def item_oee(self, c: Cliente) -> dict | None:
+        return self.oee.get(c.nome) if c.nome else None
+
+    def maquina(self, c: Cliente) -> str | None:
+        item = self.item_oee(c)
+        return texto_maquina(item.get("maquina")) if item else None
+
+    def desconectados_oee(self) -> int:
+        return sum(1 for c in self.linhas if c.so_oee)
 
     def retirar_ips_novos(self) -> list[str]:
         novos, self._ips_novos = self._ips_novos, []
@@ -454,7 +511,7 @@ class RegistroClientes:
             return NADA
         chave_cliente = self._publicador.get(topico)
         c = self._por_chave.get(chave_cliente) if chave_cliente else None
-        mudanca = NADA
+        mudanca = self._remover_oee(device_id)  # mandou dados: a linha do cadastro OEE vira a linha ao vivo
         if c is not None:
             c.nome = device_id
             c.ultimo_envio = max(c.ultimo_envio or 0.0, quando)
@@ -464,7 +521,8 @@ class RegistroClientes:
                 self._remover(avulso)
                 mudanca = ESTRUTURA
             return max(mudanca, DADOS)
-        c, mudanca = self._obter(_chave_dispositivo(device_id))
+        c, criada = self._obter(_chave_dispositivo(device_id))
+        mudanca = max(mudanca, criada)
         c.nome = device_id
         c.topico = topico or c.topico
         c.mensagens = None
@@ -481,13 +539,14 @@ class RegistroClientes:
         self.diagnosticos[device_id] = diag
         if diag.ip:
             self._ver_ip(diag.ip)
-        if self.por_nome(device_id) is not None:
-            return DADOS
+        removida = self._remover_oee(device_id)  # respondeu ao diagnóstico: está conectado
+        if self.ao_vivo(device_id) is not None:
+            return max(removida, DADOS)
         c, mudanca = self._obter(_chave_dispositivo(device_id))
         c.nome = device_id
         c.mensagens = None
         c.atividade = max(c.atividade, diag.recebido_em)
-        return max(mudanca, DADOS)
+        return max(removida, mudanca, DADOS)
 
     def registrar_canais(self, device_id: str, canais: list[int]) -> None:
         device_id = str(device_id or "").strip()
@@ -497,6 +556,46 @@ class RegistroClientes:
     def diagnostico(self, c: Cliente) -> Diagnostico | None:
         return self.diagnosticos.get(c.nome) if c.nome else None
 
+    # ----- entrada: cadastro do portal OEE (sinal dispositivos_oee) -----
+    def definir_oee(self, itens: Iterable) -> int:
+        """Lista completa do cadastro (cada sinal substitui a anterior). Quem já está na lista ao vivo só ganha a
+        Máquina; quem não está entra como linha "Desconectado (cadastro OEE)"; quem saiu do cadastro sai da lista."""
+        novos: dict[str, dict] = {}
+        for item in itens or []:
+            if isinstance(item, dict):
+                codigo = str(item.get("codigo") or "").strip()
+                if codigo:
+                    novos[codigo] = item
+        self.oee = novos
+        self.oee_recebido = True
+        mudanca = DADOS if self.linhas else NADA
+        for c in [c for c in self.linhas if c.so_oee]:
+            if c.nome not in novos or self.ao_vivo(c.nome) is not None:
+                self._remover(c)
+                mudanca = ESTRUTURA
+        for codigo, item in novos.items():
+            if self.ao_vivo(codigo) is not None:
+                continue
+            c = self._por_chave.get(PREFIXO_OEE + codigo)
+            if c is None:
+                c, _ = self._obter(PREFIXO_OEE + codigo)
+                c.so_oee, c.nome, c.mensagens = True, codigo, None
+                mudanca = ESTRUTURA
+            c.nome_oee = _texto_oee(item.get("nome")) or codigo
+            endereco = _texto_oee(item.get("endereco"))
+            c.ip = normalizar_ip(endereco) if endereco else None
+            if c.ip and _e_ip(c.ip):
+                self._ver_ip(c.ip)
+            c.topico = _texto_oee(item.get("topico"))
+        return mudanca
+
+    def _remover_oee(self, device_id: str) -> int:
+        c = self._por_chave.get(PREFIXO_OEE + device_id)
+        if c is None:
+            return NADA
+        self._remover(c)
+        return ESTRUTURA
+
     # ----- interno -----
     def _obter(self, chave: str) -> tuple[Cliente, int]:
         c = self._por_chave.get(chave)
@@ -504,14 +603,15 @@ class RegistroClientes:
             return c, NADA
         if len(self.linhas) >= self.maximo:
             self._descartar_mais_antigo()
-        c = Cliente(chave=chave, client_id=None if chave.startswith("dispositivo:") else chave)
+        c = Cliente(chave=chave, client_id=None if chave.startswith(("dispositivo:", PREFIXO_OEE)) else chave)
         self.linhas.append(c)
         self._por_chave[chave] = c
         return c, ESTRUTURA
 
     def _absorver_por_topico(self, c: Cliente, topico: str) -> int:
         """Linha só-pipeline com o mesmo tópico: o nome passa para o cliente que publicou e a linha some."""
-        avulso = next((a for a in self.linhas if a.client_id is None and a.topico == topico), None)
+        # As linhas do cadastro OEE ficam de fora: só viram ao vivo com leitura de contagem ou diagnóstico.
+        avulso = next((a for a in self.linhas if a.client_id is None and not a.so_oee and a.topico == topico), None)
         if avulso is None:
             return NADA
         c.nome = c.nome or avulso.nome
@@ -537,6 +637,40 @@ class RegistroClientes:
 
 def _chave_dispositivo(device_id: str) -> str:
     return f"dispositivo:{device_id}"
+
+
+def _texto_oee(valor) -> str | None:
+    t = str(valor).strip() if valor is not None else ""
+    return t or None
+
+
+def texto_maquina(valor) -> str | None:
+    """Campo `maquina` do cadastro OEE: texto ("INJ01 — Injetora 01"), ou objeto com codigo/nome, ou nulo."""
+    if isinstance(valor, dict):
+        codigo, nome = _texto_oee(valor.get("codigo")), _texto_oee(valor.get("nome"))
+        if codigo and nome and codigo != nome:
+            return f"{codigo} — {nome}"
+        return codigo or nome
+    return _texto_oee(valor)
+
+
+def epoch_de_iso_oee(texto) -> float | None:
+    """`ultimo_sinal_em` do sinal `dispositivos_oee`: o core já converte o UTC do OEE para ISO na hora LOCAL
+    ("AAAA-MM-DDTHH:MM:SS", como os demais sinais). Com fuso explícito ("…Z", "-03:00") o fuso é respeitado."""
+    t = _texto_oee(texto)
+    if not t:
+        return None
+    try:
+        return datetime.fromisoformat(t.replace(" ", "T", 1)).timestamp()  # ingênuo = hora local
+    except ValueError:
+        return None
+
+
+def formatar_curto(epoch: float | None) -> str:
+    """"dd/mm hh:mm" na hora local (ou "—")."""
+    if not epoch:
+        return SEM_VALOR
+    return datetime.fromtimestamp(epoch).strftime("%d/%m %H:%M")
 
 
 # ---------------------------------------------------------------------- textos de tempo
@@ -598,6 +732,24 @@ class EstadoComando:
     mensagem: str = ""
 
 
+@dataclass
+class EstadoReinicio:
+    """Último Reiniciar de um dispositivo: "enviando" (com ou sem etapa) | "ok" | "falha"."""
+    estado: str
+    inicio: float          # quando o usuário confirmou (ou a primeira etapa chegou)
+    atualizado: float      # último sinal do core (etapa) — base da proteção de 5 min
+    etapa: str = ""        # texto completo da etapa atual (o botão mostra a versão curta)
+    mensagem: str = ""
+    fim: float | None = None
+
+
+def rotulo_zerar(texto: str) -> str:
+    """Texto do botão Zerar na tabela (compacto para caber em 1440 px; a dica e o CSV têm o texto completo)."""
+    if texto == TEXTO_ZERAR:
+        return "Zerar"
+    return texto.replace("Zerado às ", "Zerado ", 1)
+
+
 # ---------------------------------------------------------------------- modelo Qt
 class ModeloClientes(QAbstractTableModel):
     def __init__(self, registro: RegistroClientes, relogio: Callable[[], float],
@@ -613,6 +765,9 @@ class ModeloClientes(QAbstractTableModel):
         self.diag_pedido: dict[str, float] = {}       # device_id → quando o diag foi pedido (sem resposta ainda)
         self.diag_falha: dict[str, tuple[float, str]] = {}  # device_id → (quando, mensagem) do último diag sem resposta
         self.topicos_editaveis = False                # há API de tópicos (botão "Tópicos" e menu)
+        self.reinicio_disponivel = False              # o bridge tem reiniciar_dispositivo
+        self.saida_reinicio = 1                       # [reinicio] saida (só para os textos)
+        self.reinicios: dict[str, EstadoReinicio] = {}  # device_id → último Reiniciar
         self._icone_aviso: QIcon | None = None
 
     # ----- atualização -----
@@ -705,6 +860,50 @@ class ModeloClientes(QAbstractTableModel):
             return ("falha", "Falhou")
         return ("pronto", TEXTO_ZERAR)
 
+    def reinicio(self, c: Cliente) -> tuple[str, str] | None:
+        """(estado, texto) do botão Reiniciar; None sem device_id."""
+        if not c.nome:
+            return None
+        r = self.reinicios.get(c.nome)
+        if r is not None and r.estado == "enviando":
+            return ("enviando", texto_etapa_curto(r.etapa) if r.etapa else "Reiniciando…")
+        if not (self.conectado and self.reinicio_disponivel):
+            return ("desabilitado", TEXTO_REINICIAR)
+        if r is not None and r.estado == "ok":
+            return ("ok", f"Reiniciado às {datetime.fromtimestamp(r.fim or r.atualizado):%H:%M}")
+        if r is not None and r.estado == "falha":
+            return ("falha", "Falhou")
+        return ("pronto", TEXTO_REINICIAR)
+
+    def aparenta_desconectado(self, c: Cliente) -> bool:
+        """Linha do cadastro OEE, Mosquitto disse que saiu, ou sem leitura há mais de 10 min."""
+        return c.so_oee or c.conectado is False or nivel_inatividade(self.idade(c)) == "parado"
+
+    def _dica_reinicio(self, c: Cliente) -> str | None:
+        acao = self.reinicio(c)
+        if acao is None:
+            return None
+        r = self.reinicios.get(c.nome)
+        estado = acao[0]
+        saida = f"saída {self.saida_reinicio}"
+        if estado == "enviando":
+            desde = f"Reinício pedido às {datetime.fromtimestamp(r.inicio):%H:%M:%S}."
+            if r.etapa:
+                return f"{desde}\nEtapa: {r.etapa}"
+            return f"{desde}\nLigando a {saida} do aparelho; aguardando o integrador."
+        if estado == "desabilitado":
+            return "Conecte ao broker para reiniciar o aparelho."
+        if estado == "ok":
+            fim = datetime.fromtimestamp(r.fim or r.atualizado)
+            return f"{r.mensagem or 'Reiniciado.'}\nConcluído às {fim:%H:%M:%S}.\nClique para reiniciar de novo."
+        if estado == "falha":
+            return f"Falhou ao reiniciar: {r.mensagem or 'sem detalhe.'}\nClique para tentar de novo."
+        dica = (f"Ligar a {saida} do aparelho, que aciona o relé e corta a alimentação por alguns segundos "
+                "(pede confirmação).")
+        if self.aparenta_desconectado(c):
+            dica += "\nO aparelho parece desconectado: o comando só chega se ele ainda estiver ouvindo o broker."
+        return dica
+
     def _texto_diag(self, c: Cliente, coluna: int) -> str:
         diag = self.registro.diagnostico(c)
         if coluna == COL_DIAG:
@@ -748,6 +947,11 @@ class ModeloClientes(QAbstractTableModel):
         if coluna == COL_ACAO:
             acao = self.acao(c)
             return acao[1] if acao else ""
+        if coluna == COL_MAQUINA:
+            return self.registro.maquina(c) or SEM_VALOR
+        if coluna == COL_REINICIO:
+            acao = self.reinicio(c)
+            return acao[1] if acao else ""
         return ""
 
     # ----- API do Qt -----
@@ -781,7 +985,16 @@ class ModeloClientes(QAbstractTableModel):
         if papel == Qt.ItemDataRole.ToolTipRole:
             return self._dica(c, col)
         if papel == PAPEL_PILULA and col == COL_STATUS:
-            return {"Conectado": "sucesso", "Assinante": "destaque", "Desconectado": "neutro"}.get(c.status)
+            return {"Conectado": "sucesso", "Assinante": "destaque", "Desconectado": "neutro",
+                    STATUS_OEE: "neutro"}.get(c.status)
+        if papel == PAPEL_PILULA_TEXTO and col == COL_STATUS and c.so_oee:
+            return PILULA_OEE[0]
+        if papel == PAPEL_PILULA_SELO and col == COL_STATUS and c.so_oee:
+            return PILULA_OEE[1]
+        if papel == Qt.ItemDataRole.FontRole and c.so_oee and col == COL_NOME:
+            fonte = QFont()
+            fonte.setItalic(True)
+            return fonte
         if papel == PAPEL_PILULA and col == COL_FILA:
             diag = self.registro.diagnostico(c)
             return "aviso" if diag and diag.fila else None  # fila > 0: leituras atrasadas no aparelho
@@ -790,6 +1003,8 @@ class ModeloClientes(QAbstractTableModel):
             return diag.rssi if diag else None
         if papel == PAPEL_ACAO and col == COL_ACAO:
             return self.acao(c)
+        if papel == PAPEL_REINICIO and col == COL_REINICIO:
+            return self.reinicio(c)
         if papel == PAPEL_TOPICOS and col == COL_ACAO:
             if not (self.topicos_editaveis and c.nome):
                 return None
@@ -820,11 +1035,15 @@ class ModeloClientes(QAbstractTableModel):
             return -1 if diag is None or diag.fila is None else diag.fila
         if col == COL_DIAG:
             return diag.recebido_em if diag else 0.0
-        if col == COL_ACAO:
+        if col in (COL_ACAO, COL_REINICIO):
             return f"{self.texto(c, col)}|{c.nome_exibido}".casefold()
+        if col == COL_STATUS:  # ao vivo antes do cadastro OEE
+            return f"{'1' if c.so_oee else '0'}{c.status}".casefold()
         return self.texto(c, col).casefold()
 
     def _cor(self, c: Cliente, col: int) -> QColor | None:
+        if c.so_oee:  # cadastro OEE sem enviar: a linha toda em cinza (a pílula do status tem a cor dela)
+            return QColor(self.paleta.texto_fraco if self.texto(c, col) == SEM_VALOR else self.paleta.texto_sec)
         if col == COL_DIAG and self.texto(c, col) == TEXTO_SEM_RESPOSTA:
             return QColor(self.paleta.aviso)
         nivel = nivel_inatividade(self.idade(c))
@@ -833,14 +1052,57 @@ class ModeloClientes(QAbstractTableModel):
         if nivel == "atrasado":
             return QColor(self.paleta.aviso)
         if col in (COL_MAC, COL_ULTIMO, COL_HA, COL_TOPICO, COL_IP, COL_SERIE, COL_FIRMWARE, COL_WIFI, COL_FILA,
-                   COL_DIAG) and self.texto(c, col) in (SEM_VALOR, ESTE_COMPUTADOR, "cabo", "pedido…"):
+                   COL_DIAG, COL_MAQUINA) and self.texto(c, col) in (SEM_VALOR, ESTE_COMPUTADOR, "cabo", "pedido…"):
             return QColor(self.paleta.texto_fraco)
         if c.conectado is False and col != COL_STATUS:
             return QColor(self.paleta.texto_sec)
         return None
 
+    def _texto_sinal_oee(self, c: Cliente) -> str:
+        item = self.registro.item_oee(c) or {}
+        epoch = epoch_de_iso_oee(item.get("ultimo_sinal_em"))
+        return f"Último sinal no OEE: {formatar_curto(epoch)}" if epoch else "Sem sinal registrado no OEE."
+
+    def _dica_oee(self, c: Cliente, col: int) -> str | None:
+        """Dicas das linhas só do cadastro OEE."""
+        item = self.registro.item_oee(c) or {}
+        if col == COL_NOME:
+            partes = [f"Dispositivo: {c.nome}", f"Nome no portal OEE: {c.nome_exibido}"]
+            maquina = self.registro.maquina(c)
+            partes.append(f"Máquina: {maquina}" if maquina else "Sem máquina ligada no OEE.")
+            extras = [f"{rotulo}: {item[k]}" for k, rotulo in (("protocolo", "Protocolo"), ("unidade", "Unidade"))
+                      if _texto_oee(item.get(k))]
+            if extras:
+                partes.append(" · ".join(extras))
+            if c.topico:
+                partes.append(f"Tópico: {c.topico}")
+            partes += ["", "Cadastrado no portal OEE, mas não está enviando dados ao broker agora.",
+                       self._texto_sinal_oee(c)]
+            return "\n".join(partes)
+        if col in (COL_STATUS, COL_HA, COL_ULTIMO):
+            prefixo = "Cadastrado no portal OEE, mas não está enviando dados ao broker agora.\n" \
+                if col == COL_STATUS else ""
+            return prefixo + self._texto_sinal_oee(c)
+        if col == COL_IP and c.ip:
+            return f"{c.ip} (endereço do cadastro OEE)"
+        if col == COL_TOPICO and c.topico:
+            return c.topico
+        return None
+
     def _dica(self, c: Cliente, col: int) -> str | None:
         diag = self.registro.diagnostico(c)
+        if col == COL_MAQUINA:
+            maquina = self.registro.maquina(c)
+            if maquina:
+                return f"Máquina no portal OEE: {maquina}"
+            if self.registro.item_oee(c) is not None:
+                return "Cadastrado no portal OEE, sem máquina ligada."
+            return ("Não cadastrado no portal OEE." if self.registro.oee_recebido
+                    else "Cadastro do portal OEE ainda não lido (ou o banco do OEE não existe).")
+        if col == COL_REINICIO:
+            return self._dica_reinicio(c)
+        if c.so_oee and col not in (COL_ACAO, COL_DIAG, COL_WIFI, COL_SERIE, COL_FIRMWARE, COL_FILA, COL_MAC):
+            return self._dica_oee(c, col)
         if col == COL_NOME:
             partes = [f"Client id: {c.client_id}" if c.client_id else "Sem client id (Mosquitto não está na aba)"]
             if c.nome:
@@ -855,7 +1117,18 @@ class ModeloClientes(QAbstractTableModel):
                 partes += [f"  • {t}" for t in c.nao_ouvidos]
                 if c.nome:
                     partes.append("Clique com o botão direito → Tópicos… para usar esses tópicos.")
+            maquina = self.registro.maquina(c)
+            if maquina:
+                partes.append(f"Máquina no OEE: {maquina}")
+            if c.nome and c.nome in self.diag_falha:
+                quando, _msg = self.diag_falha[c.nome]
+                partes.append(f"⚠ Diagnóstico sem resposta às {datetime.fromtimestamp(quando):%H:%M:%S}.")
             if diag is not None:
+                if diag.sn or diag.firmware:
+                    partes.append(f"Nº de série: {diag.sn or SEM_VALOR} · Firmware: {diag.firmware or SEM_VALOR}")
+                if diag.fila:
+                    partes.append(f"⚠ {LOCALE_BR.toString(int(diag.fila))} leitura(s) guardada(s) no aparelho "
+                                  "esperando envio.")
                 if diag.titulo:
                     partes.append(f"Título no NXperience: {diag.titulo}")
                 if diag.local:
@@ -935,11 +1208,13 @@ class ModeloClientes(QAbstractTableModel):
 
 
 class FiltroClientes(QSortFilterProxyModel):
-    """Esconde o próprio app, mosquitto_sub e quem só assina, a menos que "Mostrar assinantes" esteja marcado."""
+    """Esconde o próprio app, mosquitto_sub e quem só assina, a menos que "Mostrar assinantes" esteja marcado; as
+    linhas só do cadastro OEE dependem apenas de "Mostrar cadastro OEE"."""
 
     def __init__(self, parent: QObject | None = None):
         super().__init__(parent)
         self.mostrar_assinantes = False
+        self.mostrar_oee = True
         self.setSortRole(PAPEL_ORDEM)
         self.setDynamicSortFilter(True)
 
@@ -947,11 +1222,15 @@ class FiltroClientes(QSortFilterProxyModel):
         self.mostrar_assinantes = bool(mostrar)
         refiltrar(self)
 
+    def definir_mostrar_oee(self, mostrar: bool) -> None:
+        self.mostrar_oee = bool(mostrar)
+        refiltrar(self)
+
     def filterAcceptsRow(self, linha: int, pai: QModelIndex) -> bool:  # noqa: N802
-        if self.mostrar_assinantes:
-            return True
-        modelo = self.sourceModel()
-        return not modelo.cliente(linha).oculto_por_padrao
+        c = self.sourceModel().cliente(linha)
+        if c.so_oee:
+            return self.mostrar_oee
+        return self.mostrar_assinantes or not c.oculto_por_padrao
 
 
 # ---------------------------------------------------------------------- ARP (fora da thread da GUI)
@@ -1019,6 +1298,14 @@ def enderecos_locais() -> set[str]:
 
 
 # ---------------------------------------------------------------------- tela
+class DelegadoCorteNoFim(QStyledItemDelegate):
+    """Texto cortado no fim (a tabela corta no meio, bom para tópicos; para a Máquina o começo é o código)."""
+
+    def initStyleOption(self, opcao: QStyleOptionViewItem, indice: QModelIndex) -> None:  # noqa: N802
+        super().initStyleOption(opcao, indice)
+        opcao.textElideMode = Qt.TextElideMode.ElideRight
+
+
 class PainelClientes(QWidget):
     """Conteúdo da aba Clientes: barra (chip, Mostrar assinantes, Atualizar diagnóstico, Atualizar MAC, Colunas,
     Exportar CSV) e a tabela.
@@ -1030,6 +1317,7 @@ class PainelClientes(QWidget):
 
     zerar_pedido = Signal(str, list)
     diagnostico_pedido = Signal(str)
+    reinicio_pedido = Signal(str)
     registrar_log = Signal(str, str)
 
     def __init__(self, parent: QWidget | None = None, relogio: Callable[[], float] | None = None,
@@ -1045,6 +1333,8 @@ class PainelClientes(QWidget):
         self.ultimo_dialogo: DialogoZerarContadores | None = None
         self.ultimo_dialogo_topicos: DialogoTopicos | None = None
         self.confirmar_restaurar: Callable[[QWidget | None, str], bool] | None = None
+        # (parent, device_id, pergunta, explicação) -> bool; injetável nos testes.
+        self.confirmar_reinicio: Callable[[QWidget | None, str, str, str], bool] = confirmar_reinicio
         self.api_topicos = None  # o bridge (topicos_do_dispositivo, salvar_…, restaurar_…, topico_coberto)
         self.registro = RegistroClientes()
         self.modelo = ModeloClientes(self.registro, self._relogio, lambda: self._locais, self)
@@ -1062,10 +1352,20 @@ class PainelClientes(QWidget):
         barra.setSpacing(8)
         self.chip_enviando = ChipInfo("enviando", "Dispositivos enviando", self)
         self.chip_enviando.setToolTip("Dispositivos que mandaram leitura de contagem nos últimos 2 minutos "
-                                      "(diagnóstico e eventos não contam).")
+                                      "(diagnóstico e eventos não contam). Depois do ponto: dispositivos do cadastro "
+                                      "do portal OEE que não estão enviando agora.")
         self.opcao_assinantes = QCheckBox("Mostrar assinantes", self)
         self.opcao_assinantes.setToolTip("Mostra também quem só assina tópicos: este programa e o mosquitto_sub.")
         self.opcao_assinantes.toggled.connect(self._ao_mostrar_assinantes)
+        self.opcao_oee = QCheckBox("Mostrar cadastro OEE", self)
+        self.opcao_oee.setToolTip("Mostra também, em cinza, os dispositivos cadastrados no portal OEE que não estão "
+                                  "enviando dados agora.")
+        mostrar_oee = True
+        if self._settings is not None and self._settings.contains(CHAVE_MOSTRAR_OEE):
+            mostrar_oee = str(self._settings.value(CHAVE_MOSTRAR_OEE)).lower() not in ("false", "0", "")
+        self.opcao_oee.setChecked(mostrar_oee)
+        self.filtro.definir_mostrar_oee(mostrar_oee)
+        self.opcao_oee.toggled.connect(self._ao_mostrar_oee)
         self.botao_diag = self._botao("Atualizar diagnóstico", "")
         self.botao_mac = self._botao("Atualizar MAC", "Consultar agora a tabela ARP do Windows (arp -a).")
         self.botao_colunas = self._botao("Colunas", "Escolher as colunas visíveis (também no clique direito no "
@@ -1077,14 +1377,19 @@ class PainelClientes(QWidget):
         self.menu_colunas = QMenu(self)
         self.menu_colunas.aboutToShow.connect(self._montar_menu_colunas)
         self.botao_colunas.setMenu(self.menu_colunas)
+        # Duas linhas: o resumo (chip) e os botões; embaixo, os filtros da lista. Tudo cabe em 1440 px.
         barra.addWidget(self.chip_enviando)
-        barra.addSpacing(8)
-        barra.addWidget(self.opcao_assinantes)
         barra.addStretch(1)
         barra.addWidget(self.botao_diag)
         barra.addWidget(self.botao_mac)
         barra.addWidget(self.botao_colunas)
         barra.addWidget(self.botao_exportar)
+        filtros = QHBoxLayout()
+        filtros.setSpacing(24)
+        filtros.setContentsMargins(4, 0, 0, 0)
+        filtros.addWidget(self.opcao_assinantes)
+        filtros.addWidget(self.opcao_oee)
+        filtros.addStretch(1)
 
         self.tabela = QTableView(self)
         self.tabela.setObjectName("tabelaDados")
@@ -1122,10 +1427,15 @@ class PainelClientes(QWidget):
         self.tabela.setItemDelegateForColumn(COL_WIFI, self.delegado_wifi)
         # Botão da linha desenhado pelo delegate: lê o estado do índice, então segue a linha certa com ordenação e
         # filtro (setIndexWidget ficaria preso à posição visual).
-        self.delegado_acao = DelegadoAcao(self.tabela)
+        self.delegado_acao = DelegadoAcao(self.tabela, rotulo=rotulo_zerar)
         self.delegado_acao.acionado.connect(self._ao_acionar)
         self.delegado_acao.topicos_acionado.connect(self._ao_acionar_topicos)
         self.tabela.setItemDelegateForColumn(COL_ACAO, self.delegado_acao)
+        self.delegado_fim = DelegadoCorteNoFim(self.tabela)  # "INJ01 — Injetora…": o código fica legível
+        self.tabela.setItemDelegateForColumn(COL_MAQUINA, self.delegado_fim)
+        self.delegado_reinicio = DelegadoAcao(self.tabela, papel=PAPEL_REINICIO, icone="reiniciar")
+        self.delegado_reinicio.acionado.connect(self._ao_acionar_reinicio)
+        self.tabela.setItemDelegateForColumn(COL_REINICIO, self.delegado_reinicio)
         self.tabela.setMouseTracking(True)  # hover do botão
         self.tabela.viewport().installEventFilter(self)  # realce de cada botão da célula de ação
         self.tabela.entered.connect(self._ao_passar)
@@ -1145,6 +1455,7 @@ class PainelClientes(QWidget):
         self.pilha.addWidget(self.vazio)
 
         corpo.addLayout(barra)
+        corpo.addLayout(filtros)
         corpo.addWidget(self.pilha, 1)
 
         self._timer_arp = QTimer(self)
@@ -1155,6 +1466,10 @@ class PainelClientes(QWidget):
         self._timer_ip_novo.setSingleShot(True)
         self._timer_ip_novo.setInterval(ESPERA_IP_NOVO_MS)
         self._timer_ip_novo.timeout.connect(self.atualizar_mac)
+        self._timer_encaixe = QTimer(self)
+        self._timer_encaixe.setSingleShot(True)
+        self._timer_encaixe.setInterval(0)
+        self._timer_encaixe.timeout.connect(self._ajustar_colunas)
         for sinal in (self.filtro.rowsInserted, self.filtro.rowsRemoved, self.filtro.modelReset,
                       self.filtro.layoutChanged):
             sinal.connect(self._atualizar_vazio)
@@ -1172,17 +1487,21 @@ class PainelClientes(QWidget):
         b.setCursor(Qt.CursorShape.PointingHandCursor)
         return b
 
-    LARGURA_MAX = {COL_NOME: 170, COL_IP: 120, COL_MAC: 140, COL_ULTIMO: 150, COL_HA: 150, COL_TOPICO: 170,
-                   COL_STATUS: 110, COL_SERIE: 100, COL_FIRMWARE: 90, COL_WIFI: 100, COL_FILA: 120, COL_DIAG: 100}
-    LARGURA_MIN = {COL_MAC: 124, COL_ACAO: 144}  # o MAC e o botão nunca aparecem cortados (+ "Tópicos")
+    LARGURA_MAX = {COL_NOME: 150, COL_IP: 120, COL_MAC: 140, COL_ULTIMO: 150, COL_HA: 150, COL_TOPICO: 170,
+                   COL_STATUS: 144, COL_SERIE: 100, COL_FIRMWARE: 90, COL_WIFI: 88, COL_FILA: 120, COL_DIAG: 100,
+                   COL_MAQUINA: 128, COL_ACAO: 170}
+    # O MAC e os botões nunca aparecem cortados (Ação: "Zerar" + "Tópicos"; Reiniciar: "Aguardando voltar…").
+    LARGURA_MIN = {COL_MAC: 124, COL_ACAO: 68, COL_REINICIO: 156}
 
     def _ajustar_colunas(self, *_args) -> None:
-        """Ajusta ao conteúdo (cabeçalho incluso), com teto por coluna para caber na janela."""
+        """Ajusta ao conteúdo (cabeçalho incluso), com teto por coluna; se ainda não couber na largura visível,
+        as colunas de `ENCOLHIVEIS` cedem espaço para o botão Reiniciar (última coluna) ficar visível."""
         cab = self.tabela.horizontalHeader()
         fonte = QFont(cab.font())
         fonte.setPointSizeF(8)  # a do QSS do cabeçalho
         fonte.setWeight(QFont.Weight.DemiBold)
         metricas = QFontMetrics(fonte)
+        larguras: dict[int, int] = {}
         for col in range(len(COLUNAS)):
             if self.tabela.isColumnHidden(col):
                 continue
@@ -1194,7 +1513,29 @@ class PainelClientes(QWidget):
             largura = max(texto_cab, conteudo, minimo)
             if col in self.LARGURA_MAX:
                 largura = max(texto_cab, min(largura, self.LARGURA_MAX[col]))
+            larguras[col] = largura
+        self._caber_na_largura(larguras)
+        for col, largura in larguras.items():
             cab.resizeSection(col, largura)
+
+    # Quando a soma passa da largura visível, estas colunas cedem espaço (até o mínimo), nesta ordem, para o botão
+    # Reiniciar (última coluna) continuar visível sem rolagem horizontal. O texto cortado aparece inteiro na dica.
+    ENCOLHIVEIS = ((COL_MAQUINA, 84), (COL_TOPICO, 100), (COL_NOME, 96), (COL_STATUS, 100), (COL_IP, 92),
+                   (COL_HA, 90))
+
+    def _caber_na_largura(self, larguras: dict[int, int]) -> None:
+        disponivel = self.tabela.viewport().width()
+        if disponivel <= 0 or not self.tabela.isVisible():
+            return
+        excesso = sum(larguras.values()) - disponivel
+        for col, minimo in self.ENCOLHIVEIS:
+            if excesso <= 0:
+                break
+            if col not in larguras:
+                continue
+            corte = min(excesso, max(0, larguras[col] - minimo))
+            larguras[col] -= corte
+            excesso -= corte
 
     # ----- entradas -----
     def ao_saida_mosquitto(self, tipo: str, texto: str) -> None:
@@ -1210,8 +1551,15 @@ class PainelClientes(QWidget):
 
     def tique(self) -> None:
         """A cada 1 s (timer da janela): "Há quanto tempo", cores de inatividade, o chip e os comandos sem
-        resposta há mais de `TEMPO_SEM_RESPOSTA_S` (o core responde em até 15 s; isto é só uma rede de proteção)."""
+        resposta há mais de `TEMPO_SEM_RESPOSTA_S` (o core responde em até 15 s; isto é só uma rede de proteção).
+        Reiniciar: sem nenhum sinal do core (etapa ou resultado) em 5 min, a linha vira "Falhou"."""
         agora = self._relogio()
+        for device, r in list(self.modelo.reinicios.items()):
+            if r.estado == "enviando" and agora - r.atualizado > TEMPO_SEM_RESPOSTA_REINICIO_S:
+                minutos = TEMPO_SEM_RESPOSTA_REINICIO_S // 60
+                self._resultado_reinicio(device, False, f"Sem resposta do integrador em {minutos} min.")
+                self.registrar_log.emit("AVISO", f"Reiniciar {device}: sem resposta do integrador em {minutos} min; "
+                                                 "o resultado é desconhecido. Confira o aparelho.")
         for device, cmd in list(self.modelo.comandos.items()):
             if cmd.estado == "enviando" and agora - cmd.quando > TEMPO_SEM_RESPOSTA_S:
                 # Nenhum resposta_comando chegou: o core não registrou nada, então a tela avisa na Atividade.
@@ -1230,6 +1578,7 @@ class PainelClientes(QWidget):
         self.delegado.definir_paleta(p)
         self.delegado_wifi.definir_paleta(p)
         self.delegado_acao.definir_paleta(p)
+        self.delegado_reinicio.definir_paleta(p)
         self.tabela.viewport().update()
 
     # ----- DigiRail: diagnóstico, canais e comandos -----
@@ -1259,6 +1608,8 @@ class PainelClientes(QWidget):
     def ao_resposta_comando(self, device_id: str, comando: str, sucesso: bool, mensagem: str) -> None:
         if comando == "reset_counters":
             self._resultado_zerar(device_id, sucesso, mensagem)
+        elif comando == "reiniciar":
+            self._resultado_reinicio(device_id, sucesso, mensagem)
         elif comando == "diag":
             self.modelo.diag_pedido.pop(device_id, None)
             if not sucesso:
@@ -1267,11 +1618,11 @@ class PainelClientes(QWidget):
             self.modelo.atualizar_dispositivo(device_id)
 
     def dispositivos_listados(self) -> list[str]:
-        """device_ids das linhas visíveis (na ordem da tabela)."""
+        """device_ids das linhas visíveis e ao vivo (na ordem da tabela; sem as só do cadastro OEE)."""
         nomes = []
         for r in range(self.filtro.rowCount()):
             c = self.modelo.cliente(self.filtro.mapToSource(self.filtro.index(r, 0)).row())
-            if c.nome and c.nome not in nomes:
+            if c.nome and not c.so_oee and c.nome not in nomes:
                 nomes.append(c.nome)
         return nomes
 
@@ -1322,6 +1673,81 @@ class PainelClientes(QWidget):
                                                         str(mensagem or ""))
         # Só a linha da tabela muda: o log do resultado na Atividade vem do core (evita linha duplicada).
         self.modelo.atualizar_dispositivo(device_id)
+
+    # ----- Reiniciar pelo relé -----
+    def definir_reinicio(self, disponivel: bool, saida: int = 1) -> None:
+        """A janela informa se o bridge tem `reiniciar_dispositivo` e qual saída digital aciona o relé."""
+        self.modelo.reinicio_disponivel = bool(disponivel)
+        try:
+            self.modelo.saida_reinicio = int(saida)
+        except (TypeError, ValueError):
+            self.modelo.saida_reinicio = 1
+        self.modelo.atualizar_tudo()
+
+    def _cliente_por_device(self, device_id: str) -> Cliente | None:
+        return self.registro.ao_vivo(device_id) or self.registro.por_nome(device_id)
+
+    def reiniciar(self, device_id: str) -> bool:
+        """Pede confirmação e, confirmado, emite `reinicio_pedido`. Devolve True se pediu."""
+        c = self._cliente_por_device(device_id)
+        acao = self.modelo.reinicio(c) if c is not None else None
+        if not acao or acao[0] not in DelegadoAcao.CLICAVEIS:
+            return False
+        pergunta, explicacao = texto_confirmar_reinicio(device_id, self.modelo.saida_reinicio,
+                                                        self.modelo.aparenta_desconectado(c))
+        if not self.confirmar_reinicio(self, device_id, pergunta, explicacao):
+            return False
+        if not (self.modelo.conectado and self.modelo.reinicio_disponivel):  # desconectou durante a confirmação
+            return False
+        agora = self._relogio()
+        self.modelo.reinicios[device_id] = EstadoReinicio("enviando", agora, agora)
+        self.modelo.atualizar_dispositivo(device_id)
+        self.reinicio_pedido.emit(device_id)  # o log do envio, das etapas e do resultado vem do core
+        return True
+
+    def ao_reinicio_etapa(self, device_id: str, texto: str) -> None:
+        agora = self._relogio()
+        r = self.modelo.reinicios.get(device_id)
+        if r is None or r.estado != "enviando":  # etapa sem pedido desta tela (ex.: depois de reabrir): acompanha
+            r = EstadoReinicio("enviando", agora, agora)
+            self.modelo.reinicios[device_id] = r
+        r.etapa = str(texto or "").strip()
+        r.atualizado = agora
+        self.modelo.atualizar_dispositivo(device_id)
+        self._ajustar_colunas()
+
+    def _resultado_reinicio(self, device_id: str, sucesso: bool, mensagem: str) -> None:
+        agora = self._relogio()
+        anterior = self.modelo.reinicios.get(device_id)
+        self.modelo.reinicios[device_id] = EstadoReinicio(
+            "ok" if sucesso else "falha", anterior.inicio if anterior else agora, agora,
+            anterior.etapa if anterior else "", str(mensagem or ""), agora)
+        self.modelo.atualizar_dispositivo(device_id)
+
+    def _ao_acionar_reinicio(self, indice: QModelIndex) -> None:
+        c = self._cliente_do_proxy(indice)
+        if c is not None and c.nome:
+            self.reiniciar(c.nome)
+
+    # ----- cadastro do portal OEE -----
+    def ao_dispositivos_oee(self, texto_json: str) -> None:
+        try:
+            itens = json.loads(texto_json)
+        except (TypeError, ValueError):
+            self.registrar_log.emit("AVISO", "Cadastro do OEE: lista de dispositivos ilegível; ignorada.")
+            return
+        if not isinstance(itens, list):
+            return
+        self._aplicar(self.registro.definir_oee(itens), forcar=True)
+        self.modelo.atualizar_tudo()  # Máquina das linhas ao vivo
+        self._ajustar_colunas()
+
+    def _ao_mostrar_oee(self, mostrar: bool) -> None:
+        self.filtro.definir_mostrar_oee(mostrar)
+        if self._settings is not None:
+            self._settings.setValue(CHAVE_MOSTRAR_OEE, bool(mostrar))
+        self._atualizar_vazio()
+        self._atualizar_botao_diag()
 
     # ----- tópicos por dispositivo -----
     def definir_api_topicos(self, api) -> None:
@@ -1383,16 +1809,22 @@ class PainelClientes(QWidget):
 
     def eventFilter(self, objeto, evento) -> bool:  # noqa: N802
         """Movimento do mouse na tabela: realce só no botão sob o cursor e mãozinha sobre os botões."""
+        if objeto is self.tabela.viewport() and evento.type() == QEvent.Type.Resize:
+            if getattr(self, "_timer_encaixe", None) is not None:
+                self._timer_encaixe.start()  # janela redimensionada: refaz o encaixe das colunas (uma vez por rajada)
         if objeto is self.tabela.viewport() and evento.type() in (QEvent.Type.MouseMove, QEvent.Type.Leave):
             pos = evento.position() if evento.type() == QEvent.Type.MouseMove else None
             self.delegado_acao.posicao_mouse = pos
+            self.delegado_reinicio.posicao_mouse = pos
             indice = self.tabela.indexAt(pos.toPoint()) if pos is not None else QModelIndex()
-            if indice.isValid() and indice.column() == COL_ACAO:
+            delegado = {COL_ACAO: self.delegado_acao, COL_REINICIO: self.delegado_reinicio}.get(
+                indice.column()) if indice.isValid() else None
+            if delegado is not None:
                 opcao = QStyleOptionViewItem()
                 opcao.initFrom(self.tabela)
                 opcao.rect = self.tabela.visualRect(indice)
                 opcao.font = self.tabela.font()
-                if self.delegado_acao.botao_em(opcao, indice, pos):
+                if delegado.botao_em(opcao, indice, pos):
                     self.tabela.viewport().setCursor(Qt.CursorShape.PointingHandCursor)
                 else:
                     self.tabela.viewport().unsetCursor()
@@ -1413,9 +1845,11 @@ class PainelClientes(QWidget):
     def _ao_ativar(self, indice: QModelIndex) -> None:
         if indice.column() == COL_ACAO:
             self._ao_acionar(indice)
+        elif indice.column() == COL_REINICIO:
+            self._ao_acionar_reinicio(indice)
 
     def _ao_passar(self, indice: QModelIndex) -> None:
-        if indice.column() != COL_ACAO:  # na coluna de ação quem decide é o eventFilter (depende do botão)
+        if indice.column() not in (COL_ACAO, COL_REINICIO):  # nos botões quem decide é o eventFilter
             self.tabela.viewport().unsetCursor()
 
     def menu_da_linha(self, indice: QModelIndex) -> QMenu | None:
@@ -1439,8 +1873,18 @@ class PainelClientes(QWidget):
         topicos.setToolTip("Ver e corrigir os tópicos deste aparelho (como no NXperience)." if c.nome
                            else "Este cliente ainda não tem nome (device_id).")
         topicos.triggered.connect(lambda: self.abrir_topicos(c.nome))
+        menu.addSeparator()
+        reinicio = self.modelo.reinicio(c)
+        reiniciar = menu.addAction("Reiniciar…")
+        reiniciar.setEnabled(bool(reinicio) and reinicio[0] in DelegadoAcao.CLICAVEIS)
+        if reinicio and reinicio[0] == "enviando":
+            reiniciar.setToolTip("Reinício em andamento.")
+        else:
+            reiniciar.setToolTip("Ligar a saída do aparelho que aciona o relé e corta a alimentação (pede "
+                                 "confirmação).")
+        reiniciar.triggered.connect(lambda: self.reiniciar(c.nome))
         if not conectado:
-            for a in (zerar, diag):
+            for a in (zerar, diag, reiniciar):
                 a.setToolTip("Conecte ao broker para enviar comandos.")
         menu.setToolTipsVisible(True)
         menu.addSeparator()
@@ -1514,8 +1958,8 @@ class PainelClientes(QWidget):
         self._timer_ip_novo.stop()
 
     # ----- interno -----
-    def _aplicar(self, mudanca: int) -> None:
-        if mudanca == NADA:
+    def _aplicar(self, mudanca: int, forcar: bool = False) -> None:
+        if mudanca == NADA and not forcar:
             return
         self.modelo.aplicar(mudanca)
         novos = [ip for ip in self.registro.retirar_ips_novos() if not ip_local(ip, self._locais)]
@@ -1542,16 +1986,26 @@ class PainelClientes(QWidget):
         return sum(1 for c in self.registro.linhas
                    if c.ultimo_envio and agora - c.ultimo_envio <= LIMITE_ATRASO_S and not c.oculto_por_padrao)
 
-    def _atualizar_chip(self) -> None:
+    def texto_chip(self) -> str:
         n = self.enviando()
         texto = f"{n} dispositivo{'s' if n != 1 else ''} enviando"
-        self.chip_enviando.definir("", texto, "ok" if n else "neutro")
+        m = self.registro.desconectados_oee()
+        if m:
+            texto += f" · {m} do cadastro OEE desconectado{'s' if m != 1 else ''}"
+        return texto
+
+    def _atualizar_chip(self) -> None:
+        n = self.enviando()
+        self.chip_enviando.definir("", self.texto_chip(), "ok" if n else "neutro")
 
     def _atualizar_vazio(self, *_args) -> None:
         if self.filtro.rowCount() > 0:
             self.pilha.setCurrentWidget(self.tabela)
             return
-        if self.registro.linhas:
+        if self.registro.linhas and all(c.so_oee for c in self.registro.linhas):
+            self.vazio.setText("Nenhum dispositivo enviando agora.\n"
+                               "Marque Mostrar cadastro OEE para ver os cadastrados no portal.")
+        elif self.registro.linhas:
             self.vazio.setText("Só há assinantes conectados (este programa, mosquitto_sub).\n"
                                "Marque Mostrar assinantes para vê-los.")
         else:

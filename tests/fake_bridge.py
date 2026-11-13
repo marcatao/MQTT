@@ -41,14 +41,17 @@ class FakePipelineBridge(QObject):
     erro_registrado = Signal(str)      # JSON de UM erro; 1 sinal para cada +1 no contador de erros
     canais_vistos = Signal(str, str)   # (device_id, JSON lista ["chd1","chd2"]) quando o conjunto de canais muda
     diagnostico_dispositivo = Signal(str, str)  # (device_id, JSON do objeto "diag" do DigiRail)
-    resposta_comando = Signal(str, str, bool, str)  # (device_id, "reset_counters"|"diag", sucesso, mensagem)
+    resposta_comando = Signal(str, str, bool, str)  # (device_id, "reset_counters"|"diag"|"reiniciar", sucesso, msg)
+    reinicio_etapa = Signal(str, str)  # (device_id, "Relé acionado" | "Aguardando o aparelho voltar…")
+    # JSON lista de {codigo, nome, endereco, topico, ultimo_sinal_em, protocolo, maquina, unidade}
+    dispositivos_oee = Signal(str)
     apontamentos_atualizados = Signal(str)  # JSON do ciclo dos apontamentos reais (ver app/bridge.py)
     recalculo_concluido = Signal(int, str, bool, str)  # (maquina_id, dia, sucesso, mensagem)
 
     def __init__(self, config: Config, parent=None, *, atraso_conexao: float = 0.2,
                  intervalo: float = 0.05, falhar_conexao: bool = False, sql_ok: bool = True,
                  semente: int | None = 7, ciclo: float = 60.0, responder_comandos: bool = True,
-                 atraso_resposta: float = 0.3, comandos_ok: bool = True):
+                 atraso_resposta: float = 0.3, comandos_ok: bool = True, reinicio_ok: bool = True):
         super().__init__(parent)
         self.config = config
         self.atraso_conexao = atraso_conexao
@@ -67,6 +70,7 @@ class FakePipelineBridge(QObject):
         self.responder_comandos = responder_comandos
         self.atraso_resposta = atraso_resposta
         self.comandos_ok = comandos_ok
+        self.reinicio_ok = reinicio_ok
         self._diag_enviado: set[str] = set()
         # Tópicos por dispositivo, em memória (o bridge real grava em dispositivos.json).
         self._topicos_salvos: dict[str, dict[str, str]] = {}
@@ -101,6 +105,15 @@ class FakePipelineBridge(QObject):
 
     def emitir_resposta(self, device_id: str, comando: str, sucesso: bool, mensagem: str) -> None:
         self.resposta_comando.emit(device_id, comando, sucesso, mensagem)
+
+    def emitir_etapa(self, device_id: str, texto: str) -> None:
+        self.reinicio_etapa.emit(device_id, texto)
+
+    def emitir_oee(self, itens: list[dict] | None = None) -> list[dict]:
+        """Emite `dispositivos_oee` com a lista dada (ou a de exemplo); devolve a lista."""
+        lista = list(itens) if itens is not None else dispositivos_oee_exemplo()
+        self.dispositivos_oee.emit(json.dumps(lista, ensure_ascii=False))
+        return lista
 
     def emitir_apontamentos(self, resultado: dict | None = None, **campos) -> dict:
         """Emite `apontamentos_atualizados` com um ciclo de exemplo (ou o `resultado` dado); devolve o dict."""
@@ -209,6 +222,29 @@ class FakePipelineBridge(QObject):
         def trabalho():
             time.sleep(self.atraso_resposta)
             self.diagnostico_dispositivo.emit(device_id, json.dumps(diag_exemplo(device_id)))
+
+        threading.Thread(target=trabalho, daemon=True).start()
+
+    def reiniciar_dispositivo(self, device_id: str) -> None:
+        """Como o core (CLAUDE.md, "Reiniciar pelo relé"): etapas "Relé acionado" e "Aguardando o aparelho
+        voltar…", e depois resposta_comando(device, "reiniciar", …)."""
+        self.chamadas.append(("reiniciar_dispositivo", device_id))
+        if not self.responder_comandos:
+            return
+
+        def trabalho():
+            time.sleep(self.atraso_resposta)
+            self.reinicio_etapa.emit(device_id, "Relé acionado")
+            time.sleep(self.atraso_resposta)
+            self.reinicio_etapa.emit(device_id, "Aguardando o aparelho voltar…")
+            time.sleep(self.atraso_resposta)
+            if self.reinicio_ok:
+                self.resposta_comando.emit(device_id, "reiniciar", True, "Reiniciado: voltou em 42 s")
+            else:
+                msg = "Não voltou em 3 min"
+                self.resposta_comando.emit(device_id, "reiniciar", False, msg)
+                self.emitir_erro("comando", f"Falha ao reiniciar {device_id}: {msg}",
+                                 f"NOVUS/{device_id}/command", "Saída out1 ligada; o aparelho não voltou.")
 
         threading.Thread(target=trabalho, daemon=True).start()
 
@@ -350,6 +386,27 @@ def diag_exemplo(device_id: str) -> dict:
             "cfg_timestamp": int(time.time()) - 86400, "fw_v": "1.23", "mqtt_queue": 0, "sn": f"{21000000 + n:08d}",
             "curr_rssi": str(50 + n % 20), "min_rssi": "-46", "max_rssi": "-87", "avg_rssi": "-58",
             "ipv4": [192, 168, 100, 50 + n], "gateway": [192, 168, 100, 1], "mask": [255, 255, 255, 0]}
+
+
+def dispositivos_oee_exemplo() -> list[dict]:
+    """Cadastro OEE.dbo.dispositivos_iot no formato de `dispositivos_oee` (como o core: `ultimo_sinal_em` já em ISO
+    na hora local, convertido do UTC do OEE; `maquina` = "código – nome")."""
+    agora = time.time()
+
+    def local(segundos: float) -> str:  # o OEE grava UTC; o sinal leva a hora local
+        return _iso(agora - segundos)
+
+    return [
+        {"codigo": "Teste_Alumbra", "nome": "Teste_Alumbra", "endereco": "192.168.100.50",
+         "topico": "NOVUS/Teste_Alumbra/events", "ultimo_sinal_em": local(30), "protocolo": "mqtt",
+         "maquina": "INJ01 – Injetora 01", "unidade": "manutencao"},
+        {"codigo": "Prensa_07", "nome": "Prensa 07", "endereco": "192.168.100.64",
+         "topico": "NOVUS/Prensa_07/events", "ultimo_sinal_em": local(3 * 3600 + 120), "protocolo": "mqtt",
+         "maquina": "PRE07 – Prensa 07", "unidade": "manutencao"},
+        {"codigo": "Embaladora_02", "nome": "Embaladora 02", "endereco": None,
+         "topico": "NOVUS/Embaladora_02/events", "ultimo_sinal_em": None, "protocolo": "mqtt",
+         "maquina": None, "unidade": "manutencao"},
+    ]
 
 
 def apontamentos_exemplo(minutos: float = 3.0) -> dict:

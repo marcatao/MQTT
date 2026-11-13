@@ -30,7 +30,14 @@ class PipelineBridge(QObject):
     erro_registrado = Signal(str)            # JSON de UM erro (app.core.erros); 1 sinal para cada +1 no contador de erros
     canais_vistos = Signal(str, str)         # (device_id, JSON lista ["chd1","chd2","chd3"]) quando o conjunto muda
     diagnostico_dispositivo = Signal(str, str)  # (device_id, JSON do objeto "diag" do DigiRail: sn, fw_v, rssi...)
-    resposta_comando = Signal(str, str, bool, str)  # (device_id, "reset_counters"|"diag", sucesso, mensagem)
+    resposta_comando = Signal(str, str, bool, str)  # (device_id, "reset_counters"|"diag"|"reiniciar", sucesso, msg)
+    # (device_id, etapa do reinício pelo relé: "Relé acionado (saída 1)", "Aguardando o aparelho voltar…"); o
+    # resultado final sai em resposta_comando(device, "reiniciar", ...)
+    reinicio_etapa = Signal(str, str)
+    # JSON lista do cadastro OEE.dbo.dispositivos_iot (ativos), ao conectar e a cada 60 s, só se o OEE existir:
+    # [{"codigo", "nome", "endereco", "topico", "ultimo_sinal_em" (ISO local|null), "protocolo",
+    #   "maquina" ("código – nome"|null), "unidade"}]
+    dispositivos_oee = Signal(str)
     # JSON do ciclo dos apontamentos reais (app.core.apontamentos_oee), 1 por ciclo concluído (ou falho):
     # {"quando", "proxima" (ISO local|null), "minutos", "ok", "mensagem", "criados", "alterados", "excluidos",
     #  "maquinas": [{"maquina_id", "codigo", "nome", "canais", "micro_s", "macro_s", "legenda", "legenda_descricao",
@@ -58,6 +65,8 @@ class PipelineBridge(QObject):
             ao_resposta_comando=self.resposta_comando.emit,
             ao_apontamentos=self.apontamentos_atualizados.emit,
             ao_recalculo=self.recalculo_concluido.emit,
+            ao_reinicio_etapa=self.reinicio_etapa.emit,
+            ao_dispositivos_oee=self.dispositivos_oee.emit,
         )
 
     def _emitir_log(self, nivel: str, mensagem: str) -> None:
@@ -110,6 +119,11 @@ class PipelineBridge(QObject):
     def pedir_diagnostico(self, device_id: str) -> None:
         """Não bloqueia: publica ``diag``; responde em ``diagnostico_dispositivo`` e ``resposta_comando``."""
         self._pipeline.pedir_diagnostico(device_id)
+
+    def reiniciar_dispositivo(self, device_id: str) -> None:
+        """Não bloqueia: liga a saída ``[reinicio] saida`` (relé que corta a alimentação do aparelho) e acompanha a
+        volta; etapas em ``reinicio_etapa`` e o resultado em ``resposta_comando(device, "reiniciar", ...)``."""
+        self._pipeline.reiniciar_dispositivo(device_id)
 
     # -- tópicos por dispositivo (v0.1.11): chaves "events", "config", "ack_config", "command", "ack_command" --
 

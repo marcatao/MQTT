@@ -86,8 +86,16 @@ topico_ack_config = "NOVUS/{id}/ack/config"
 topico_comando = "NOVUS/{id}/command"
 topico_resposta = "NOVUS/{id}/ack/command"   # confirmação de comando
 arquivo_topicos = "dispositivos.json"        # na pasta do programa
-diagnostico_minutos = 3           # pede diagnóstico ao ver o dispositivo (a cada conexão) e a cada N min; 0 desliga
+diagnostico_minutos = 1           # pede diagnóstico ao ver o dispositivo (a cada conexão) e a cada N min; 0 desliga
 timeout_comando_segundos = 15     # sem resposta nesse tempo: "sem resposta do dispositivo"
+
+[reinicio]
+# Botão "Reiniciar" da aba Clientes: liga a saída digital do DigiRail (out1 ou out2), que aciona um relé que corta
+# a alimentação do próprio aparelho. Se ele continuar respondendo depois do pulso, a ligação do relé está errada;
+# quando ele volta (primeira mensagem), o integrador desliga a saída de novo, por segurança.
+saida = 1                        # 1 = out1, 2 = out2
+pulso_segundos = 5               # tempo para o aparelho sumir depois de ligar a saída
+timeout_volta_segundos = 180     # sem voltar nesse tempo: falha "Não voltou em 3 min" (erro "comando")
 
 [oee]
 # Cadastro dos dispositivos no portal OEE (mesmo SQL Server e mesmo login de [sqlserver], nome em 3 partes).

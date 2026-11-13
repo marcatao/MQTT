@@ -593,9 +593,10 @@ class JanelaPrincipal(QMainWindow):
                  self.painel_mosquitto.botao_procurar, self.painel_mosquitto.botao_restaurar,
                  self.painel_mosquitto.caixa,
                  self.painel_mosquitto.campo_comando, self.painel_mosquitto.botao_executar,
-                 self.painel_clientes.opcao_assinantes, self.painel_clientes.botao_diag,
+                 self.painel_clientes.botao_diag,
                  self.painel_clientes.botao_mac, self.painel_clientes.botao_colunas,
-                 self.painel_clientes.botao_exportar, self.painel_clientes.tabela]
+                 self.painel_clientes.botao_exportar, self.painel_clientes.opcao_assinantes,
+                 self.painel_clientes.opcao_oee, self.painel_clientes.tabela]
         for a, b in zip(ordem, ordem[1:]):
             QWidget.setTabOrder(a, b)
         QShortcut(QKeySequence("Ctrl+L"), self, activated=self.logs.limpar)
@@ -719,6 +720,16 @@ class JanelaPrincipal(QMainWindow):
         if self._comandos_disponiveis:
             painel.zerar_pedido.connect(lambda device, canais: self.bridge.zerar_contadores(device, list(canais)))
             painel.diagnostico_pedido.connect(self.bridge.pedir_diagnostico)
+        # Reiniciar pelo relé e cadastro do OEE (v0.1.19): opcionais, como os demais.
+        if hasattr(self.bridge, "reinicio_etapa"):
+            self.bridge.reinicio_etapa.connect(painel.ao_reinicio_etapa)
+        if hasattr(self.bridge, "dispositivos_oee"):
+            self.bridge.dispositivos_oee.connect(painel.ao_dispositivos_oee)
+        reinicio = hasattr(self.bridge, "reiniciar_dispositivo") and hasattr(self.bridge, "resposta_comando")
+        if reinicio:
+            painel.reinicio_pedido.connect(self.bridge.reiniciar_dispositivo)
+        saida = getattr(getattr(self.config, "reinicio", None), "saida", 1)
+        painel.definir_reinicio(reinicio, saida)
         painel.registrar_log.connect(self._log_local)
         # Tópicos por dispositivo (v0.1.11): o painel só usa os métodos do contrato; bridge antigo → sem botão.
         painel.definir_api_topicos(self.bridge)

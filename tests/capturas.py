@@ -190,6 +190,86 @@ def capturar_clientes(destino: Path, tema: str) -> Path:
     return caminho
 
 
+def capturar_clientes_oee(destino: Path, tema: str) -> Path:
+    """Aba Clientes (v0.1.19): 2 dispositivos ao vivo (um reiniciando, "Aguardando voltar…"), 2 do cadastro OEE
+    desconectados, coluna Máquina, botão Reiniciar e a confirmação."""
+    from app.gui.comandos import caixa_confirmar_reinicio
+
+    pasta = tempfile.mkdtemp()
+    settings = QSettings(str(Path(pasta) / "gui.ini"), QSettings.Format.IniFormat)
+    config = Config()
+    config.mosquitto.iniciar_automaticamente = False
+    config.mqtt.topico = "NOVUS/#"
+    bridge = FakePipelineBridge(config, intervalo=3600.0, responder_comandos=False)
+    janela = JanelaPrincipal(bridge, config, settings=settings, tema=tema, cofre=CofreFalso(),
+                             executor_arp=lambda: ARP_SIMULADO, enderecos_locais={"192.168.100.162"})
+    janela.resize(1440, 900)
+    janela.show()
+    _rodar(0.3)
+    agora = time.time()
+    t = int(agora)
+    linhas = [
+        f"{t - 900}: New client connected from 192.168.100.50:51544 as NOVUS_A1B2C3 (p2, c1, k60, u'novus').",
+        f"{t - 880}: New client connected from 192.168.100.57:49152 as NOVUS_D4E5F6 (p2, c1, k60, u'novus').",
+    ]
+    for k in range(80):
+        linhas.append(f"{t - 860 + k * 10}: Received PUBLISH from NOVUS_A1B2C3 (d0, q0, r0, m0, "
+                      f"'NOVUS/Teste_Alumbra/events', ... (128 bytes))")
+        linhas.append(f"{t - 855 + k * 10}: Received PUBLISH from NOVUS_D4E5F6 (d0, q0, r0, m0, "
+                      f"'NOVUS/Linha2/events', ... (131 bytes))")
+    janela.mosquitto.estado_alterado.emit("rodando", "Rodando (PID 4812)")
+    janela.mosquitto.saida.emit("saida", "\n".join(sorted(linhas, key=lambda l: int(l.split(":", 1)[0]))))
+    iso = lambda x: datetime.fromtimestamp(x).strftime("%Y-%m-%dT%H:%M:%S")  # noqa: E731
+    bridge.status_alterado.emit("conectado", "192.168.100.162:1883 · NOVUS/#")
+    bridge.emitir_dispositivo("Teste_Alumbra", "NOVUS/Teste_Alumbra/events", iso(agora - 10))
+    bridge.emitir_dispositivo("Linha2_Forno", "NOVUS/Linha2/events", iso(agora - 7))
+    for device, sn, rssi, ip in (("Teste_Alumbra", "21004417", "55", [192, 168, 100, 50]),
+                                 ("Linha2_Forno", "21004502", "-71", [192, 168, 100, 57])):
+        bridge.emitir_diag(device, {"error": 0, "curr_timestamp": int(agora), "fw_v": "1.23", "mqtt_queue": 0,
+                                    "sn": sn, "curr_rssi": rssi, "ipv4": ip})
+    local = lambda s_: iso(agora - s_)  # noqa: E731  (o core manda o ultimo_sinal_em do OEE em hora local)
+    bridge.emitir_oee([
+        {"codigo": "Teste_Alumbra", "nome": "Teste_Alumbra", "endereco": "192.168.100.50",
+         "topico": "NOVUS/Teste_Alumbra/events", "ultimo_sinal_em": local(20), "protocolo": "mqtt",
+         "maquina": "INJ01 – Injetora 01", "unidade": "manutencao"},
+        {"codigo": "Linha2_Forno", "nome": "Linha2_Forno", "endereco": "192.168.100.57",
+         "topico": "NOVUS/Linha2/events", "ultimo_sinal_em": local(15), "protocolo": "mqtt",
+         "maquina": "FOR02 – Forno 02", "unidade": "manutencao"},
+        {"codigo": "Prensa_07", "nome": "Prensa 07", "endereco": "192.168.100.64",
+         "topico": "NOVUS/Prensa_07/events", "ultimo_sinal_em": local(3 * 3600 + 600), "protocolo": "mqtt",
+         "maquina": "PRE07 – Prensa 07", "unidade": "manutencao"},
+        {"codigo": "Embaladora_02", "nome": "Embaladora 02", "endereco": "192.168.100.81",
+         "topico": "NOVUS/Embaladora_02/events", "ultimo_sinal_em": local(2 * 86400), "protocolo": "mqtt",
+         "maquina": None, "unidade": "manutencao"},
+    ])
+    bridge.contadores.emit(1284, 21, 0)
+    janela.abas.setCurrentIndex(2)
+    _rodar(0.5)
+    painel = janela.painel_clientes
+    painel.confirmar_reinicio = lambda *a: True
+    painel.reiniciar("Linha2_Forno")
+    bridge.emitir_etapa("Linha2_Forno", "Relé acionado")
+    bridge.emitir_etapa("Linha2_Forno", "Aguardando o aparelho voltar…")
+    bridge.emitir_resposta("Teste_Alumbra", "reiniciar", True, "Reiniciado: voltou em 42 s")
+    _rodar(1.2)
+    painel.tique()
+    _rodar(0.2)
+    caminho = destino / f"janela-{tema}-clientes-oee.png"
+    janela.grab().save(str(caminho))
+    # confirmação para um aparelho do cadastro OEE (desconectado): com o aviso
+    c = painel.registro.por_nome("Prensa_07")
+    from app.gui.comandos import texto_confirmar_reinicio
+
+    pergunta, explicacao = texto_confirmar_reinicio("Prensa_07", 1, painel.modelo.aparenta_desconectado(c))
+    caixa, _ = caixa_confirmar_reinicio(janela, "Prensa_07", pergunta, explicacao)
+    caixa.show()
+    _rodar(0.4)
+    caixa.grab().save(str(destino / f"confirmar-reiniciar-{tema}.png"))
+    caixa.close()
+    janela.close()
+    return caminho
+
+
 def _capturar_dialogo_topicos(janela, destino: Path, tema: str) -> None:
     """Diálogo "Tópicos" do Teste_Alumbra: o NOÏUS listado em "não ouvidos" e já usado na confirmação de comando
     (indicador vermelho "não ouvido" até salvar)."""
@@ -301,6 +381,8 @@ def main() -> None:
         capturar(destino, "escuro", mosquitto=True, tamanho=(980, 640)),
         capturar_clientes(destino, "claro"),
         capturar_clientes(destino, "escuro"),
+        capturar_clientes_oee(destino, "claro"),
+        capturar_clientes_oee(destino, "escuro"),
         capturar_erros(destino, "claro"),
         capturar_erros(destino, "escuro"),
     ):

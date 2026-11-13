@@ -25,6 +25,12 @@ O que é gravado
 - **Leituras** (``sinal``): ``UPDATE`` só de ultimo_sinal_em e atualizado_em, se o registro existir; no máx. 1 vez
   por minuto por device (o limite é aplicado antes de enfileirar).
 
+- **Lista do cadastro** (``listar``, a cada 60 s pelo pipeline e logo ao conectar): ``SELECT`` dos ativos de
+  ``dispositivos_iot`` com o código e o nome da máquina por ``LEFT JOIN`` em ``dbo.maquinas`` (só se a tabela, as
+  colunas e a permissão de SELECT existirem; senão, a lista vem sem máquina). Precisa só de SELECT; usa a mesma
+  conexão, mas detecção própria (não depende do INSERT/UPDATE do upsert). Sem banco/tabela/permissão: não chama o
+  callback e não loga nada na tela (só no arquivo). Formato de cada item em ``item_lista``.
+
 Só as colunas que existem na tabela são usadas (ex.: sem ``unidade``, não grava unidade).
 
 Detecção (na 1ª operação e a cada conexão nova): ``DB_ID(banco)``, ``OBJECT_ID('[banco].[dbo].[tabela]', 'U')``,
@@ -196,6 +202,98 @@ def detectar(cursor, oee: OeeConfig) -> tuple[set[str] | None, str]:
     return colunas, ""
 
 
+# ------------------------------------------------------------------------------------------ lista do cadastro
+
+SQL_PERMISSAO_SELECT = ("EXEC {banco}.sys.sp_executesql N'SELECT HAS_PERMS_BY_NAME(@obj, N''OBJECT'', N''SELECT'')', "
+                        "N'@obj nvarchar(400)', @obj = ?")
+CAMPOS_LISTA = ("codigo", "nome", "endereco", "topico", "ultimo_sinal_em", "protocolo", "unidade")
+TABELA_MAQUINAS = "maquinas"        # mesmo schema de ``[oee] tabela`` (dbo)
+
+
+def _pode_select(cursor, banco: str, schema: str, tabela: str) -> bool:
+    cursor.execute(SQL_PERMISSAO_SELECT.format(banco=f"[{banco}]"), f"[{schema}].[{tabela}]")
+    linha = cursor.fetchone()
+    return linha is not None and linha[0] == 1
+
+
+def detectar_lista(cursor, oee: OeeConfig) -> tuple[dict | None, str]:
+    """Esquema para ``montar_select_lista`` ou (None, motivo). Só exige SELECT em ``dispositivos_iot``; a máquina
+    entra se ``maquina_id`` existir e ``dbo.maquinas`` tiver ``id`` + ``codigo``/``nome`` e permissão de SELECT."""
+    banco = sql_conexao.validar_banco(oee.banco)
+    schema, tabela = sql_conexao.validar_tabela(oee.tabela)
+    cursor.execute("SELECT DB_ID(?)", banco)
+    if cursor.fetchone()[0] is None:
+        return None, "banco inexistente"
+    alvo = f"[{banco}].[{schema}].[{tabela}]"
+    cursor.execute("SELECT OBJECT_ID(?, 'U')", alvo)
+    if cursor.fetchone()[0] is None:
+        return None, "tabela inexistente ou sem acesso ao banco"
+    colunas = sql_conexao.colunas_da_tabela(cursor, schema, tabela, banco=banco)
+    if "codigo" not in colunas:
+        return None, "coluna codigo ausente"
+    if not _pode_select(cursor, banco, schema, tabela):
+        return None, "sem permissão de SELECT"
+    esquema = {"alvo": alvo, "colunas": colunas, "maquinas": None, "maq_colunas": set()}
+    if "maquina_id" in colunas:
+        alvo_maq = f"[{banco}].[{schema}].[{TABELA_MAQUINAS}]"
+        cursor.execute("SELECT OBJECT_ID(?, 'U')", alvo_maq)
+        if cursor.fetchone()[0] is not None:
+            maq_cols = sql_conexao.colunas_da_tabela(cursor, schema, TABELA_MAQUINAS, banco=banco)
+            if ("id" in maq_cols and maq_cols & {"codigo", "nome"}
+                    and _pode_select(cursor, banco, schema, TABELA_MAQUINAS)):
+                esquema["maquinas"], esquema["maq_colunas"] = alvo_maq, maq_cols
+    return esquema, ""
+
+
+def montar_select_lista(esquema: dict) -> str:
+    """SELECT dos ativos; colunas na ordem de ``CAMPOS_LISTA`` + maquina_codigo, maquina_nome (NULL se faltar)."""
+    cols, maq_cols = esquema["colunas"], esquema["maq_colunas"]
+    partes = [f"d.[{c}]" if c in cols else f"NULL AS [{c}]" for c in CAMPOS_LISTA]
+    juncao = ""
+    if esquema["maquinas"]:
+        partes += [f"m.[{c}] AS [maquina_{c}]" if c in maq_cols else f"NULL AS [maquina_{c}]"
+                   for c in ("codigo", "nome")]
+        juncao = f" LEFT JOIN {esquema['maquinas']} AS m ON m.[id] = d.[maquina_id]"
+    else:
+        partes += ["NULL AS [maquina_codigo]", "NULL AS [maquina_nome]"]
+    onde = " WHERE d.[ativo] = 1" if "ativo" in cols else ""
+    return f"SELECT {', '.join(partes)} FROM {esquema['alvo']} AS d{juncao}{onde} ORDER BY d.[codigo]"
+
+
+def _texto(valor: Any) -> str | None:
+    if valor is None:
+        return None
+    texto = str(valor).strip()
+    return texto or None
+
+
+def iso_local_de_utc(valor: Any) -> str | None:
+    """``datetime`` ingênuo em UTC (coluna ``datetime``) → "AAAA-MM-DDTHH:MM:SS" na hora local; texto ISO também."""
+    if valor is None:
+        return None
+    if isinstance(valor, str):
+        try:
+            valor = datetime.fromisoformat(valor.strip().replace(" ", "T").replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if not isinstance(valor, datetime):
+        return None
+    if valor.tzinfo is None:
+        valor = valor.replace(tzinfo=timezone.utc)
+    return valor.astimezone().strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def item_lista(linha) -> dict:
+    """Linha do SELECT → ``{codigo, nome, endereco, topico, ultimo_sinal_em (ISO local|None), protocolo,
+    maquina ("código – nome"|None), unidade}``."""
+    v = dict(zip(CAMPOS_LISTA + ("maquina_codigo", "maquina_nome"), tuple(linha)))
+    m_cod, m_nome = _texto(v["maquina_codigo"]), _texto(v["maquina_nome"])
+    maquina = f"{m_cod} – {m_nome}" if m_cod and m_nome else (m_cod or m_nome)
+    return {"codigo": _texto(v["codigo"]), "nome": _texto(v["nome"]), "endereco": _texto(v["endereco"]),
+            "topico": _texto(v["topico"]), "ultimo_sinal_em": iso_local_de_utc(v["ultimo_sinal_em"]),
+            "protocolo": _texto(v["protocolo"]), "maquina": maquina, "unidade": _texto(v["unidade"])}
+
+
 # ------------------------------------------------------------------------------------------------ worker
 
 
@@ -227,6 +325,9 @@ class CadastroOee:
         self._aviso_t: dict[str, float] = {}       # device → último AVISO de falha
         self._inseridos: set[str] = set()          # INFO "cadastrado" já registrado
         self._atualizados: set[str] = set()        # INFO "atualizado" já registrado nesta sessão
+        self._lista_esquema: dict | None = None    # detecção da lista (None = ainda não detectado)
+        self._lista_desligada = False              # sem tabela/permissão de SELECT: até a próxima sessão/config
+        self._lista_pendente = False               # já há um "listar" na fila (não acumula)
 
     # -- API (qualquer thread) ---------------------------------------------------------------------------
 
@@ -247,6 +348,15 @@ class CadastroOee:
                 return
             self._sinal_t[device_id] = agora
         self._enfileirar(("sinal", str(device_id), agora))
+
+    def listar(self, callback: Callable[[list[dict]], None]) -> None:
+        """Enfileira a leitura do cadastro (ativos); ``callback(lista)`` é chamado na thread do cadastro, só se
+        deu certo. Sem OEE (banco, tabela, permissão, conexão): não chama e não loga na tela."""
+        if not self._ativo_cfg() or self._lista_pendente:
+            return
+        self._lista_pendente = True
+        if not self._enfileirar(("listar", callback)):
+            self._lista_pendente = False
 
     def nova_sessao(self) -> None:
         """Nova conexão MQTT: refaz a detecção (na próxima operação) e volta a registrar o 1º "atualizado"."""
@@ -291,20 +401,21 @@ class CadastroOee:
         # sem senha salva (autenticação do SQL): o integrador está em contingência; não adianta tentar
         return bool(sql.autenticacao_windows or sql.senha)
 
-    def _enfileirar(self, item: tuple, forcar: bool = False) -> None:
+    def _enfileirar(self, item: tuple, forcar: bool = False) -> bool:
         if self._parado:
-            return
+            return False
         try:
             self._fila.put_nowait(item)
         except queue.Full:
             if not forcar:
                 logger.debug("Fila do cadastro OEE cheia; %s descartado", item[0])
-                return
+                return False
         if self._iniciar_thread:
             with self._trava:
                 if self._thread is None or not self._thread.is_alive():
                     self._thread = threading.Thread(target=self._loop, name="oee-cadastro", daemon=True)
                     self._thread.start()
+        return True
 
     def _loop(self) -> None:
         while True:
@@ -320,11 +431,16 @@ class CadastroOee:
             self._fechar_conexao()
             self._desligado = False
             self._atualizados = set()
+            self._lista_esquema, self._lista_desligada = None, False
             return
         if tipo == "sql":
             self._fechar_conexao()
             self._sql = item[1]
             self._desligado = False
+            self._lista_esquema, self._lista_desligada = None, False
+            return
+        if tipo == "listar":
+            self._listar(item[1])
             return
         if not self._ativo_cfg() or self._desligado:
             return
@@ -387,6 +503,48 @@ class CadastroOee:
             return False
         self._colunas = colunas
         return True
+
+    def _listar(self, callback) -> None:
+        self._lista_pendente = False
+        if not self._ativo_cfg() or self._lista_desligada:
+            return
+        try:
+            if self._conexao is None:
+                self._conexao = (self._conectar or sql_conexao.conectar)(self._sql)
+                self._colunas = None
+            cursor = self._conexao.cursor()
+            try:
+                if self._lista_esquema is None:
+                    try:
+                        esquema, motivo = detectar_lista(cursor, self._oee)
+                    except ValueError as exc:   # nome de banco/tabela inválido na configuração
+                        esquema, motivo = None, str(exc)
+                    if esquema is None:
+                        self._lista_desligada = True
+                        logger.info("Lista do cadastro OEE desligada: %s", motivo)
+                        return
+                    self._lista_esquema = esquema
+                cursor.execute(montar_select_lista(self._lista_esquema))
+                linhas = cursor.fetchall() or []
+            finally:
+                _fechar(cursor)
+                try:
+                    self._conexao.commit()   # encerra a transação implícita das consultas
+                except Exception:  # noqa: BLE001
+                    pass
+            lista = [item_lista(l) for l in linhas]
+        except Exception as exc:  # noqa: BLE001 - sem OEE nunca é erro nem aviso na tela
+            self._rollback()
+            if _erro_de_conexao(exc):
+                self._fechar_conexao()
+            else:
+                self._lista_desligada = True   # ex.: permissão negada; tenta de novo na próxima sessão
+            logger.info("Lista do cadastro OEE indisponível: %s", exc)
+            return
+        try:
+            callback(lista)
+        except Exception:  # noqa: BLE001
+            logger.exception("Falha no callback da lista do cadastro OEE")
 
     def _upsert(self, device: str, diag: dict, topico: str | None, t: float) -> None:
         alvo, colunas = self._alvo(), self._colunas or set()
