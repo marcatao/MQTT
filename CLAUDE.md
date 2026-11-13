@@ -444,6 +444,14 @@ Especificação completa em `docs/apontamentos_reais.md` (fonte da verdade; cód
 - **Correção**: se depois chegarem linhas na IOT001 cobrindo um trecho 97 (dados retroativos do aparelho), o trecho é
   refeito com a legenda correta (2/99/98/96), como já acontecia (até `dias_correcao` dias).
 
+### Caminho e comando do Mosquitto (decidido com o usuário em 13/11/2026)
+
+- Pasta padrão: `C:\Program Files\Mosquitto` (antes `C:\Program Files\mosquitto168`).
+- Comando padrão: `mosquitto -c "{pasta}\mosquitto.conf" -v`. `{pasta}` é a variável do **Endereço Mosquitto** da aba
+  (sem barra no fim); com a pasta padrão roda `mosquitto.exe -c "C:\Program Files\Mosquitto\mosquitto.conf" -v` e o
+  prompt mostra `C:\Program Files\Mosquitto>mosquitto -c "C:\Program Files\Mosquitto\mosquitto.conf" -v`.
+- Quem já tinha um endereço salvo (QSettings) continua com ele; "Restaurar padrão" volta ao novo padrão.
+
 ## Pendências conhecidas
 
 - Índice único `(device_id, ts_unix)` na IOT001 (opcional, decidir com o usuário).

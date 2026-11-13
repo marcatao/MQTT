@@ -90,7 +90,7 @@ SAIDA_MOSQUITTO = """1730650000: mosquitto version 2.0.18 starting
 def _simular_mosquitto(janela) -> None:
     """Saída simulada no estilo do `mosquitto -v` (o .exe real só existe no Windows do usuário)."""
     console = janela.mosquitto
-    console.config.pasta = "C:\\Program Files\\mosquitto168"
+    console.config.pasta = "C:\\Program Files\\Mosquitto"
     janela.painel_mosquitto.caixa.limpar()
     console.saida.emit("prompt", console.prompt())
     console.estado_alterado.emit("rodando", "Rodando (PID 4812)")

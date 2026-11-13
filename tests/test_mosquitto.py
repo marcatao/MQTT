@@ -111,10 +111,11 @@ def _texto(painel) -> str:
 # ---------------------------------------------------------------------- funções puras
 def test_prompt_padrao_exato():
     console = ConsoleMosquitto(MosquittoConfig())
-    assert console.prompt() == r"C:\Program Files\mosquitto168>mosquitto -v"
-    assert console.programa == r"C:\Program Files\mosquitto168\mosquitto.exe"
+    assert console.prompt() == \
+        r'C:\Program Files\Mosquitto>mosquitto -c "C:\Program Files\Mosquitto\mosquitto.conf" -v'
+    assert console.programa == r"C:\Program Files\Mosquitto\mosquitto.exe"
     assert console.prompt('mosquitto_sub -h localhost -t "#" -v') == \
-        r'C:\Program Files\mosquitto168>mosquitto_sub -h localhost -t "#" -v'
+        r'C:\Program Files\Mosquitto>mosquitto_sub -h localhost -t "#" -v'
 
 
 def test_separar_comando():
@@ -138,10 +139,17 @@ def test_decodificacao_utf8_e_codificacao_local():
     assert leitor.final() is None
 
 
+def test_comando_troca_a_variavel_pasta():
+    console = ConsoleMosquitto(MosquittoConfig(pasta="D:\\Mosq\\"))
+    assert console.comando == r'mosquitto -c "D:\Mosq\mosquitto.conf" -v'
+    nome, args = separar_comando(console.comando)
+    assert (nome, args) == ("mosquitto.exe", ["-c", r"D:\Mosq\mosquitto.conf", "-v"])
+
+
 def test_config_mosquitto(tmp_path):
     padrao = Config().mosquitto
-    assert padrao.pasta == r"C:\Program Files\mosquitto168"
-    assert padrao.comando == "mosquitto -v"
+    assert padrao.pasta == r"C:\Program Files\Mosquitto"
+    assert padrao.comando == r'mosquitto -c "{pasta}\mosquitto.conf" -v'
     assert padrao.iniciar_automaticamente is True
     arq = tmp_path / "config.toml"
     arq.write_text('[mosquitto]\npasta = "D:\\\\mqtt"\ncomando = "mosquitto -v -p 1884"\n'
@@ -216,8 +224,9 @@ def test_pasta_padrao_inexistente_no_linux_nao_quebra(qapp):  # noqa: F811
     saidas = []
     console.saida.connect(lambda t, s: saidas.append((t, s)))
     assert console.iniciar() is False
-    assert saidas[0] == ("prompt", r"C:\Program Files\mosquitto168>mosquitto -v")
-    assert saidas[1] == ("erro", "mosquitto.exe não encontrado em C:\\Program Files\\mosquitto168 — confira "
+    assert saidas[0] == ("prompt",
+                         r'C:\Program Files\Mosquitto>mosquitto -c "C:\Program Files\Mosquitto\mosquitto.conf" -v')
+    assert saidas[1] == ("erro", "mosquitto.exe não encontrado em C:\\Program Files\\Mosquitto — confira "
                                  "o Endereço Mosquitto (botão …).")
     assert console.estado == "erro"
 

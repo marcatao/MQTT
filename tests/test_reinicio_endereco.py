@@ -33,6 +33,12 @@ linux = pytest.mark.skipif(sys.platform == "win32", reason="mosquitto.exe falso 
 
 
 # ====================================================================== vigia de 1 hora
+def _cmd(pasta) -> str:
+    """Comando padrão com {pasta} trocado (como o console monta)."""
+    p = str(pasta).rstrip("\\/")
+    return f'mosquitto -c "{p}\\mosquitto.conf" -v'
+
+
 def test_vigia_padrao_60_minutos(tmp_path):
     assert Config().vigia.minutos == 60
     assert carregar(tmp_path / "nao_existe.toml").vigia.minutos == 60
@@ -272,7 +278,7 @@ def test_seletor_aceita_o_proprio_exe(abrir_janela, pastas, monkeypatch):
     painel.botao_procurar.click()
     assert painel.campo_endereco.text() == str(outra)
     assert console.pasta == str(outra)
-    assert console.prompt() == f"{outra}>mosquitto -v"
+    assert console.prompt() == f"{outra}>{_cmd(outra)}"
     assert settings.value(CHAVE_PASTA) == str(outra)
 
 
@@ -316,12 +322,12 @@ def test_iniciar_usa_pasta_do_campo(abrir_janela, pastas):
     painel.botao_iniciar.click()
     assert esperar(lambda: f"cwd={outra}" in painel.caixa.texto(), 5), painel.caixa.texto()
     linhas = painel.caixa.linhas_texto()
-    assert linhas[0] == f"{outra}>mosquitto -v"
-    assert "args=-v" in linhas
+    assert linhas[0] == f"{outra}>{_cmd(outra)}"
+    assert f"args=-c {outra}\\mosquitto.conf -v" in linhas, linhas
     assert painel.campo_endereco.text() == str(outra)
     assert console.programa == str(outra / "mosquitto.exe")
     assert settings.value(CHAVE_PASTA) == str(outra)  # salvo ao iniciar com sucesso
-    assert janela.abas.tabToolTip(1) == f"Broker Mosquitto local: {outra}>mosquitto -v"
+    assert janela.abas.tabToolTip(1) == f"Broker Mosquitto local: {outra}>{_cmd(outra)}"
 
 
 def test_pasta_invalida_nao_inicia(abrir_janela, pastas):
@@ -332,7 +338,7 @@ def test_pasta_invalida_nao_inicia(abrir_janela, pastas):
     QCoreApplication.processEvents()
     assert console.estado == "parado" and not console.rodando
     texto = painel.caixa.texto()
-    assert f"{vazia}>mosquitto -v" in texto
+    assert f"{vazia}>{_cmd(vazia)}" in texto, repr(texto[:400])
     assert f"mosquitto.exe não encontrado em {vazia}" in texto
     assert painel.campo_endereco.property("invalido") is True
     assert painel.erro_endereco.isVisibleTo(painel)
@@ -359,7 +365,7 @@ def test_persistencia_reabre_com_o_valor_salvo(abrir_janela, pastas):
     assert painel2.campo_endereco.text() == str(outra)
     assert console2.pasta == str(outra)
     assert esperar(lambda: f"cwd={outra}" in painel2.caixa.texto(), 5), painel2.caixa.texto()
-    assert painel2.caixa.linhas_texto()[0] == f"{outra}>mosquitto -v"
+    assert painel2.caixa.linhas_texto()[0] == f"{outra}>{_cmd(outra)}"
 
 
 def test_enter_com_pasta_invalida_nao_salva(abrir_janela, pastas):
@@ -384,4 +390,4 @@ def test_restaurar_padrao(abrir_janela, pastas, monkeypatch):
     assert painel.campo_endereco.text() == str(padrao)
     assert console.pasta == str(padrao)
     assert settings.value(CHAVE_PASTA) is None
-    assert console.prompt() == f"{padrao}>mosquitto -v"
+    assert console.prompt() == f"{padrao}>{_cmd(padrao)}"

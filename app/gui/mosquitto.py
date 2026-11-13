@@ -238,7 +238,12 @@ class ConsoleMosquitto(QObject):
 
     @property
     def comando(self) -> str:
-        return str(self.config.comando or "").strip()
+        """Comando do config com ``{pasta}`` trocado pelo Endereço Mosquitto (sem barra no fim)."""
+        return self.comando_para(self.pasta)
+
+    def comando_para(self, pasta: str) -> str:
+        """Comando do config com ``{pasta}`` trocado por ``pasta`` (ex.: um endereço digitado e ainda não aplicado)."""
+        return str(self.config.comando or "").strip().replace("{pasta}", str(pasta).rstrip("\\/"))
 
     def prompt(self, comando: str | None = None) -> str:
         return f"{self.pasta}>{self.comando if comando is None else comando}"
@@ -718,7 +723,7 @@ class PainelMosquitto(QWidget):
             mensagem = f"{erro}. Use o botão … para escolher a pasta do mosquitto.exe."
             self._mostrar_erro_endereco(mensagem)
             if no_console:
-                self.caixa.adicionar("prompt", f"{pasta}>{self.console.comando}")
+                self.caixa.adicionar("prompt", f"{pasta}>{self.console.comando_para(pasta)}")
                 self.caixa.adicionar("erro", mensagem)
                 self.caixa.ir_para_fim()
             log.warning("Mosquitto: endereço inválido: %s", erro)

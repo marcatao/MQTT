@@ -71,8 +71,8 @@ conectar_automaticamente = true
 # (prompt "<pasta>><comando>"). Ele para ao fechar o programa e volta junto no reinício automático.
 # Se o Mosquitto já roda como serviço do Windows, pare o serviço ou use iniciar_automaticamente = false
 # (os dois não podem ouvir a porta 1883 ao mesmo tempo).
-pasta = "C:\\Program Files\\mosquitto168"   # padrão; o campo "Endereço Mosquitto" da aba vale mais (fica salvo no programa)
-comando = "mosquitto -v"     # 1º token = programa (.exe é acrescentado se faltar); o resto são argumentos
+pasta = "C:\\Program Files\\Mosquitto"   # padrão; o campo "Endereço Mosquitto" da aba vale mais (fica salvo no programa)
+comando = 'mosquitto -c "{pasta}\mosquitto.conf" -v'   # {pasta} = Endereço Mosquitto; 1º token = programa (.exe se faltar)
 iniciar_automaticamente = true
 
 [dispositivos]

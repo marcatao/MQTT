@@ -110,8 +110,8 @@ class MosquittoConfig:
     O prompt mostrado no console é sempre ``<pasta>><comando>``. `pasta` é só o padrão: o campo "Endereço
     Mosquitto" da aba salva o valor escolhido em QSettings (``mosquitto/pasta``), que vale mais que este.
     """
-    pasta: str = "C:\\Program Files\\mosquitto168"
-    comando: str = "mosquitto -v"
+    pasta: str = "C:\\Program Files\\Mosquitto"
+    comando: str = 'mosquitto -c "{pasta}\\mosquitto.conf" -v'  # {pasta} = Endereço Mosquitto da aba
     iniciar_automaticamente: bool = True
 
 

@@ -24,7 +24,7 @@ só, que abre, conecta e começa a gravar sozinha.
 | **Banco de dados** | Conexão com o SQL Server (autenticação do Windows ou do SQL), botão **Testar conexão** e senha guardada no Gerenciador de Credenciais do Windows. |
 | **Gravação** | Cada leitura completa vai para o banco assim que chega. Rajadas, como o reenvio da memória do dispositivo depois de uma queda, viram um único lote. A mesma leitura nunca é gravada duas vezes. |
 | **Aba Atividade** | Log ao vivo do que foi recebido e gravado, a última gravação com sucesso e a contagem regressiva do reinício automático. É limpa todo dia à meia-noite. |
-| **Aba Mosquitto** | Console com o `mosquitto -v` rodando dentro do programa, campo **Endereço Mosquitto** (salvo) e linha de comando para `mosquitto_sub`, `mosquitto_pub` e outros. |
+| **Aba Mosquitto** | Console com o Mosquitto rodando dentro do programa (`mosquitto -c "<pasta>\mosquitto.conf" -v`), campo **Endereço Mosquitto** (salvo) e linha de comando para `mosquitto_sub`, `mosquitto_pub` e outros. |
 | **Aba Clientes** | Lista dos dispositivos: nome, IP, MAC, último envio, Wi-Fi, fila no aparelho, nº de série, firmware e diagnóstico. Também os botões **Zerar contadores** (por canal) e **Tópicos…** (tópicos de cada aparelho). |
 | **Erros** | O card **ERROS** abre a lista detalhada (payload, banco, broker, comandos), com filtro, busca e exportação CSV. Cada queda do broker conta um erro. |
 | **Operação contínua** | Abre já conectado. Se passar 1 hora sem gravar, o programa se reinicia e reconecta sozinho. Sem banco, as leituras ficam guardadas em `contingencia/`. |
