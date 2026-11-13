@@ -7,6 +7,7 @@ from __future__ import annotations
 import copy
 import json
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -14,9 +15,9 @@ import pytest
 
 from app.config import ApontamentosConfig, Config, OeeConfig, SqlServerConfig, carregar
 from app.core import apontamentos_oee as ap
-from app.core.apontamentos_oee import (MACRO, MICRO, PRODUZINDO, SEM_IOT, ApontamentosOee, LegendasIot, Trecho,
-                                       buracos_sem_leitura, dividir_por_dia, planejar, producoes, segmentos_continuos,
-                                       situacao_pela_legenda, status_op)
+from app.core.apontamentos_oee import (FORA_TURNO, MACRO, MICRO, PRODUZINDO, SEM_IOT, ApontamentosOee, LegendasIot,
+                                       Trecho, dividir_por_dia, marcar_sem_resposta, planejar, producoes,
+                                       segmentos_continuos, situacao_pela_legenda, status_op)
 from app.core.pipeline import Pipeline
 from tests.test_amostragem import esperar
 from tests.test_sink import ErroOdbc
@@ -109,84 +110,60 @@ def test_producao_no_futuro_relogio_adiantado_e_ignorada():
     assert seg([ini - 5, ini + 9999], ini, ini + 30) == [(ini, ini + 30, PRODUZINDO)]
 
 
-# ============================================================================================ sem leitura (97)
-
-LIM = 120
-
-
-def test_buracos_sem_leitura_no_comeco_no_meio_e_no_fim():
-    assert buracos_sem_leitura([], 0, 1000, LIM) == [(0, 1000)]
-    assert buracos_sem_leitura([10, 20, 30], 0, 40, LIM) == []
-    assert buracos_sem_leitura([200, 210, 500, 510], 0, 1000, LIM) == [(0, 200), (210, 500), (510, 1000)]
-    assert buracos_sem_leitura([100, 220], 0, 230, LIM) == []                 # exatamente 120 s: não é buraco
-    assert buracos_sem_leitura([5, 5, 5000], 0, 10, LIM) == []                 # repetidos e fora da faixa
+# ============================================================================================ 97 só pelo diagnóstico
+# Regra revista em 13/11/2026: buraco sem linhas na IOT001 é máquina parada (o contador não aumentou), não 97.
 
 
-def test_buraco_no_meio_de_producao_normal_vira_2_97_2_sem_98():
+def test_funcoes_de_buraco_sem_leitura_sairam_do_modulo():
+    assert not hasattr(ap, "buracos_sem_leitura") and not hasattr(ap, "_sem_leitura_em")
+
+
+def test_buraco_de_30_min_sem_linhas_no_meio_da_producao_e_98_sem_97():
     ini = T(8)
-    a, b = ini + 300, ini + 900                       # aparelho fora 10 min, a produção seguia normal
-    prods = list(range(ini - 10, a + 1, 30)) + list(range(b, ini + 1200, 30))
-    agora = ini + 1200
+    a, b = ini + 600, ini + 600 + 1800                # sem nenhuma linha na IOT001 por 30 min
+    prods = list(range(ini - 10, a + 1, 30)) + list(range(b, ini + 3000, 30))
+    agora = ini + 3000
     ultima_antes = max(p for p in prods if p <= a)
-    buracos = buracos_sem_leitura(prods, ini - 400, agora, LIM)
-    assert buracos == [(ini - 400, ini - 10), (ultima_antes, b)]
-    segs = segmentos_continuos(prods, ini, agora, MICRO_S, MACRO_S, buracos)
-    assert segs == [(ini, ultima_antes, PRODUZINDO), (ultima_antes, b, SEM_IOT), (b, agora, PRODUZINDO)]
-    assert MACRO not in {e for *_, e in segs}
-    # sem a legenda 97 (sem buracos): o mesmo período era macroparada
-    assert (ultima_antes, b, MACRO) in seg(prods, ini, agora)
+    segs = seg(prods, ini, agora)
+    assert segs == [(ini, ultima_antes, PRODUZINDO), (ultima_antes, b, MACRO), (b, agora, PRODUZINDO)]
+    assert SEM_IOT not in {e for *_, e in segs}
 
 
-def test_buraco_no_meio_de_parada_intervalo_observado_decide_99_ou_98():
-    ini = T(8)
-    p = ini + 100                                     # última produção
-    r = p + 50                                        # última leitura antes do aparelho cair
-    volta = r + 600                                   # aparelho volta (10 min fora)
-    # intervalo observado = (t − p) − 600 s sem leitura = 50 + depois: 100 (micro) ou 310 (macro)
-    for depois, esperado in ((50, MICRO), (260, MACRO)):
-        t = volta + depois                            # próxima produção
-        leituras = [ini - 10, ini + 50, p, p + 25, r, *range(volta, t, 30), t]   # aparelho volta e segue mandando
-        buracos = buracos_sem_leitura(leituras, ini - 400, t + 20, LIM)
-        assert (r, volta) in buracos
-        segs = segmentos_continuos([ini + 50, p, t], ini, t + 20, MICRO_S, MACRO_S, buracos)
-        assert segs == [(ini, ini + 50, MACRO), (ini + 50, p, PRODUZINDO), (p, r, esperado), (r, volta, SEM_IOT),
-                        (volta, t, esperado), (t, t + 20, PRODUZINDO)]
-
-
-def test_intervalo_observado_na_parada_que_passa_da_macro():
-    ini = T(8)
-    p, r = ini + 100, ini + 200
-    volta = r + 1000
-    t = volta + 250                                   # observado = 100 + 250 = 350 >= 300: macro
-    buracos = [(r, volta)]
-    segs = segmentos_continuos([ini + 50, p, t], ini, t + 5, MICRO_S, MACRO_S, buracos)
-    assert segs[2:5] == [(p, r, MACRO), (r, volta, SEM_IOT), (volta, t, MACRO)]
-
-
-def test_aparelho_ainda_fora_fica_97_em_aberto():
+def test_buraco_curto_entre_micro_e_macro_e_99_e_menor_que_micro_e_2():
     ini = T(8)
     p = ini + 100
-    r = p + 30                                        # última leitura
-    agora = r + 3600
-    buracos = buracos_sem_leitura([ini - 10, ini + 50, p, r], ini - 400, agora, LIM)
-    segs = segmentos_continuos([ini + 50, p], ini, agora, MICRO_S, MACRO_S, buracos)
-    assert segs[-2:] == [(ini + 50, r, PRODUZINDO), (r, agora, SEM_IOT)]   # observado até r: 30 s
-    trechos = dividir_por_dia(segs, FUSO)
-    assert trechos[-1] == Trecho(r, None, SEM_IOT)
+    assert seg([ini - 10, ini + 30, ini + 60, p, p + 120, p + 150], ini, p + 160) == [
+        (ini, p, PRODUZINDO), (p, p + 120, MICRO), (p + 120, p + 160, PRODUZINDO)]       # 2 min sem linhas
+    assert seg([ini - 10, ini + 30, ini + 60, p, p + 40, p + 70], ini, p + 80) == [(ini, p + 80, PRODUZINDO)]
 
 
-def test_sem_leitura_nenhuma_a_janela_toda_e_97():
-    ini = T(0)
-    buracos = buracos_sem_leitura([], ini - 400, T(9), LIM)
-    assert segmentos_continuos([], ini, T(9), MICRO_S, MACRO_S, buracos) == [(ini, T(9), SEM_IOT)]
+def test_buraco_no_fim_aparelho_ainda_fora_continua_parada_e_nao_97():
+    ini = T(8)
+    p = ini + 100
+    assert seg([ini - 5, p], ini, p + 3600)[-1] == (p, p + 3600, MACRO)
+    assert seg([], ini, T(9)) == [(ini, T(9), MACRO)]          # nenhuma leitura na janela: parada (98), não 97
+
+
+def test_buraco_fora_do_turno_e_96_e_dentro_do_turno_e_98():
+    from app.core.apontamentos_oee import intervalos_turno, montar_jornada, recortar_fora_turno
+    j = montar_jornada(None, "12345", "05:00", "14:48")       # 12/11/2026 é quinta-feira
+    turnos = intervalos_turno(j, HOJE, T(16), FUSO)
+    # dentro do turno: produz até 9:00, 30 min sem linhas, volta a produzir 9:30
+    prods = [HOJE - 10, *range(T(8), T(9) + 1, 30), *range(T(9, 30), T(10) + 1, 30)]
+    segs = recortar_fora_turno(seg(prods, HOJE, T(10)), turnos)
+    assert (T(9), T(9, 30), MACRO) in segs and SEM_IOT not in {e for *_, e in segs}
+    # fora do turno: produz até 15:00, 30 min sem linhas, volta 15:30
+    prods = [T(14, 50) - 10, *range(T(14, 50), T(15) + 1, 30), *range(T(15, 30), T(16) + 1, 30)]
+    segs = recortar_fora_turno(seg(prods, T(14, 50), T(16)), turnos)
+    assert (T(15), T(15, 30), FORA_TURNO) in segs and SEM_IOT not in {e for *_, e in segs}
 
 
 def test_97_atravessando_a_meia_noite_e_legenda_do_operador_continua():
     a = T(23, dia=11)
-    buracos = [(a, T(1) + 1)]
-    segs = segmentos_continuos([a - 30, a], ONTEM, T(2), MICRO_S, MACRO_S, buracos)
+    prods = [a - 30, a]
+    segs = marcar_sem_resposta(segmentos_continuos(prods, ONTEM, T(2), MICRO_S, MACRO_S), prods, ONTEM, a)
     trechos = dividir_por_dia(segs, FUSO)
-    assert Trecho(a, HOJE - 1, SEM_IOT) in trechos and Trecho(HOJE, T(1), SEM_IOT) in trechos
+    assert Trecho(a, HOJE - 1, SEM_IOT) in trechos and Trecho(HOJE, None, SEM_IOT) in trechos
     legendas = LegendasIot(2, 99, 98, 97)
     assert legendas.todas == {2, 99, 98, 97}
     existentes = [apont(1, SETUP, a, None)]          # o operador trocou o 97 por um motivo
@@ -712,39 +689,135 @@ def test_ciclo_dois_canais_de_dispositivos_diferentes():
     assert r["maquinas"][0]["canais"] == "DEV1/chd1_value, DEV2/chd3_value"
 
 
-def test_ciclo_aparelho_desligado_vira_97_em_aberto_e_maquina_parada():
+def _diag(obj, resposta):
+    obj._diagnosticar = lambda devices, timeout: {d: resposta for d in devices}
+
+
+def test_ciclo_buraco_de_30_min_sem_linhas_dentro_do_turno_e_98_sem_97():
+    b = BancoFalso()
+    _maquina_jornada(b)
+    ligado(b, "DEV1", "chd1_value", HOJE - 3600, T(8) - 20)
+    producao_continua(b, "DEV1", "chd1_value", T(8), T(9))          # produz; o aparelho some das 9:00 às 9:30
+    producao_continua(b, "DEV1", "chd1_value", T(9, 30), T(10), valor=500)
+    obj, logs, erros, res = novo(b, T(10))
+    _diag(obj, True)
+    r = obj.executar_ciclo()
+    assert r["ok"] and not erros
+    assert b.lista(1) == [(96, HOJE, T(4, 59, 59), True), (98, T(5), T(8) - 1, True), (2, T(8), T(9) - 1, True),
+                          (98, T(9), T(9, 30) - 11, True), (2, T(9, 30) - 10, None, True)]
+    assert 97 not in {x[0] for x in b.lista(1)}
+
+
+def test_ciclo_buraco_de_30_min_sem_linhas_fora_do_turno_e_96():
+    b = BancoFalso()
+    _maquina_jornada(b)                                             # turno de quinta: 05:00–14:48
+    ligado(b, "DEV1", "chd1_value", T(14) - 3600, T(15) - 20)
+    producao_continua(b, "DEV1", "chd1_value", T(15), T(15, 10))
+    producao_continua(b, "DEV1", "chd1_value", T(15, 40), T(16), valor=500)   # 30 min sem linhas, fora do turno
+    obj, *_ = novo(b, T(16))
+    _diag(obj, True)
+    obj.executar_ciclo()
+    lista = b.lista(1)
+    assert (96, T(15, 10), T(15, 40) - 11, True) in lista and 97 not in {x[0] for x in lista}
+    assert lista[-1] == (2, T(15, 40) - 10, None, True)
+
+
+def test_ciclo_buraco_curto_entre_micro_e_macro_e_99():
     b = BancoFalso()
     b.maquina(1)
     ligado(b, "DEV1", "chd1_value", HOJE - 3600, T(8) - 20)
-    producao_continua(b, "DEV1", "chd1_value", T(8), T(9))          # produzia normal e o aparelho caiu às 9h
+    producao_continua(b, "DEV1", "chd1_value", T(8), T(9))
+    producao_continua(b, "DEV1", "chd1_value", T(9, 2), T(9, 10), valor=500)   # 2 min sem nenhuma linha
+    obj, *_ = novo(b, T(9, 10))
+    obj.executar_ciclo()
+    assert (99, T(9), T(9, 2) - 11, True) in b.lista(1) and 97 not in {x[0] for x in b.lista(1)}
+
+
+def test_ciclo_aparelho_sumiu_sem_diag_e_parada_98_nao_97():
+    b = BancoFalso()
+    b.maquina(1)
+    ligado(b, "DEV1", "chd1_value", HOJE - 3600, T(8) - 20)
+    producao_continua(b, "DEV1", "chd1_value", T(8), T(9))          # produzia e o aparelho caiu às 9h
     obj, logs, erros, res = novo(b, T(9, 30))
     r = obj.executar_ciclo()
-    assert b.lista(1) == [(98, HOJE, T(8) - 1, True), (2, T(8), T(9) - 1, True), (97, T(9), None, True)]
-    m = b.dados["maquinas"][1]
-    assert (m["situacao"], m["legenda"]) == ("parada", 97)
-    linha = r["maquinas"][0]
-    assert (linha["legenda"], linha["legenda_descricao"]) == ("97", "Sem apontamento IOT")
-    # o aparelho volta (sem reenviar a memória) e a máquina produz: 97 fecha e volta o 2
-    producao_continua(b, "DEV1", "chd1_value", T(9, 40), T(9, 50), valor=500)
-    obj._relogio.t = T(9, 50, 5)
-    obj.executar_ciclo()
-    assert b.lista(1)[-2:] == [(97, T(9), T(9, 40) - 11, True), (2, T(9, 40) - 10, None, True)]
+    assert b.lista(1) == [(98, HOJE, T(8) - 1, True), (2, T(8), T(9) - 1, True), (98, T(9), None, True)]
+    assert r["maquinas"][0]["diag"] is None
 
 
-def test_ciclo_sem_leitura_nenhuma_tudo_97():
+def test_ciclo_sem_leitura_nenhuma_e_98():
     b = BancoFalso()
     b.maquina(1)
     obj, *_ = novo(b, T(9))
     r = obj.executar_ciclo()
-    assert b.lista(1) == [(97, HOJE, None, True)]
+    assert b.lista(1) == [(98, HOJE, None, True)]
     assert "Nenhuma leitura" in r["maquinas"][0]["aviso"]
 
 
-def test_ciclo_legenda_97_ausente_volta_ao_comportamento_antigo():
+def test_ciclo_diag_sem_resposta_97_desde_a_ultima_noticia_e_some_quando_ele_volta():
+    b = BancoFalso()
+    b.maquina(1)
+    ligado(b, "DEV1", "chd1_value", HOJE - 3600, T(8) - 20)
+    producao_continua(b, "DEV1", "chd1_value", T(8), T(9))          # produz até 9:00
+    ligado(b, "DEV1", "chd1_value", T(9) + 10, T(9, 20), valor=361, passo=10)   # parada; aparelho cai às 9:20
+    obj, logs, erros, res = novo(b, T(9, 30))
+    _diag(obj, False)
+    r = obj.executar_ciclo()
+    assert b.lista(1) == [(98, HOJE, T(8) - 1, True), (2, T(8), T(9) - 1, True), (98, T(9), T(9, 20) - 1, True),
+                          (97, T(9, 20), None, True)]
+    m = b.dados["maquinas"][1]
+    assert (m["situacao"], m["legenda"]) == ("parada", 97)
+    linha = r["maquinas"][0]
+    assert (linha["legenda"], linha["legenda_descricao"], linha["diag"]) == ("97", "Sem apontamento IOT",
+                                                                             "sem resposta")
+    # continua sem responder: o 97 continua do mesmo ponto
+    obj._relogio.t = T(9, 33)
+    obj.executar_ciclo()
+    assert b.lista(1)[-1] == (97, T(9, 20), None, True)
+    # volta a responder sem reenviar a memória: o buraco é parada (98), como qualquer falta de linhas
+    _diag(obj, True)
+    obj._relogio.t = T(9, 36)
+    obj.executar_ciclo()
+    assert b.lista(1)[-1] == (98, T(9), None, True) and 97 not in {x[0] for x in b.lista(1)}
+    # e volta a produzir
+    producao_continua(b, "DEV1", "chd1_value", T(9, 40), T(9, 50), valor=500)
+    obj._relogio.t = T(9, 50, 5)
+    obj.executar_ciclo()
+    assert b.lista(1)[-2:] == [(98, T(9), T(9, 40) - 11, True), (2, T(9, 40) - 10, None, True)]
+
+
+def test_ciclo_diag_sem_resposta_com_leitura_agora_97_comeca_agora():
+    b = BancoFalso()
+    b.maquina(1)
+    ligado(b, "DEV1", "chd1_value", HOJE - 3600, T(9, 30), valor=5)   # parada o dia todo, leitura até agora
+    obj, *_ = novo(b, T(9, 30))
+    _diag(obj, False)
+    obj.executar_ciclo()
+    assert b.lista(1) == [(98, HOJE, T(9, 30) - 1, True), (97, T(9, 30), None, True)]
+
+
+def test_ciclo_caso_do_print_ack_perdido_mas_dados_normais_nao_vira_97():
+    """1010 INJ33: produção até 13:30, o aparelho segue mandando leituras e só o ack do diag se perde (vai para
+    NOÏUS/.../ack/command). O pipeline devolve DIAG_RECENTE: sem 97, "ok (dados recentes)" na linha."""
+    b = BancoFalso()
+    b.maquina(1, codigo="1010", nome="INJ33")
+    ligado(b, "DEV1", "chd1_value", HOJE - 3600, T(12) - 20)
+    producao_continua(b, "DEV1", "chd1_value", T(12), T(13, 30))
+    ligado(b, "DEV1", "chd1_value", T(13, 30) + 10, T(13, 45), valor=541, passo=10)   # contador parado
+    obj, logs, erros, res = novo(b, T(13, 45))
+    _diag(obj, ap.DIAG_RECENTE)
+    r = obj.executar_ciclo()
+    assert r["ok"] and not erros
+    assert b.lista(1)[-1] == (98, T(13, 30), None, True) and 97 not in {x[0] for x in b.lista(1)}
+    assert r["maquinas"][0]["diag"] == "ok (dados recentes)"
+    assert b.dados["maquinas"][1]["legenda"] == 98
+
+
+def test_ciclo_legenda_97_ausente_diag_sem_resposta_fica_98():
     b = BancoFalso(com_97=False)
     b.maquina(1)
     producao_continua(b, "DEV1", "chd1_value", T(8), T(9))          # aparelho caiu às 9h
     obj, logs, erros, res = novo(b, T(9, 30))
+    _diag(obj, False)
     r = obj.executar_ciclo()
     obj._relogio.t = T(9, 33)
     obj.executar_ciclo()
@@ -752,12 +825,32 @@ def test_ciclo_legenda_97_ausente_volta_ao_comportamento_antigo():
     assert b.lista(1) == [(98, HOJE, T(8) - 1, True), (2, T(8), T(9) - 1, True), (98, T(9), None, True)]
     avisos = [m for n, m in logs if n == "AVISO"]
     assert len(avisos) == 1 and "97" in avisos[0] and "Sem apontamento IOT" in avisos[0]
-    # cadastrada a 97 no portal, o mesmo trecho vira 97 e o aviso pode voltar se ela sumir de novo
+    # cadastrada a 97 no portal, o mesmo trecho vira 97
     b.dados["legendas"][97] = ("97", "Sem apontamento IOT", "parada", True)
     b.commit()
     obj._relogio.t = T(9, 36)
     obj.executar_ciclo()
     assert b.lista(1)[-1] == (97, T(9), None, True)
+
+
+def test_ciclo_97_antigo_por_buraco_na_janela_e_refeito_pela_regra_nova():
+    """Trechos 97 gravados pela regra antiga (buraco sem linhas) dentro da janela (ontem 00:00 até agora) são do
+    integrador e o ciclo normal os refaz: viram 98/2 conforme o contador, sem botão Recalcular."""
+    b = BancoFalso()
+    b.maquina(1)
+    ligado(b, "DEV1", "chd1_value", ONTEM - 3600, T(4, 55) - 20)
+    producao_continua(b, "DEV1", "chd1_value", T(4, 55), T(14))
+    b.apontamento(1, 98, ONTEM, T(23, 59, 59, dia=11))
+    b.apontamento(1, 98, HOJE, T(4, 50) - 1)
+    b.apontamento(1, 97, T(4, 50), T(4, 55) - 1)                       # 97 curto perto das 05:00 (o do print)
+    b.apontamento(1, 2, T(4, 55), T(13, 33) - 1)
+    b.apontamento(1, 97, T(13, 33), None)                               # 97 em aberto desde 13:33
+    obj, logs, erros, res = novo(b, T(14))
+    _diag(obj, True)
+    obj.executar_ciclo()
+    assert 97 not in {x[0] for x in b.lista(1)}
+    assert b.lista(1) == [(98, ONTEM, T(23, 59, 59, dia=11), True), (98, HOJE, T(4, 55) - 1, True),
+                          (2, T(4, 55), None, True)]
 
 
 def _maquina_com_97_antigo(b):
@@ -805,7 +898,8 @@ def test_correcao_retroativa_sem_leitura_nova_nao_muda_a_janela():
     desde = [p for s, p in b.comandos if s.startswith("SELECT [ts_unix],")][0][1]
     assert desde == ONTEM - MACRO_S - ap.MARGEM_LEITURAS             # janela normal: ontem 00:00
     assert not [m for _, m in logs if "retroativos" in m]
-    assert [x[0] for x in b.lista(1)][-2:] == [97, 97]
+    # o 97 de antes da janela (dia 10) fica; os da janela (ontem e hoje) são refeitos pela regra nova (98)
+    assert [x[0] for x in b.lista(1)] == [98, 97, 98, 98]
 
 
 def test_correcao_retroativa_respeita_dias_correcao():
@@ -816,6 +910,35 @@ def test_correcao_retroativa_respeita_dias_correcao():
     obj.executar_ciclo()
     assert not [m for _, m in logs if "retroativos" in m]            # o 97 do dia 10 tem mais de 1 dia
     assert b.lista(1)[1] == (97, T(10, dia=10), T(23, 59, 59, dia=10), True)
+
+
+def test_correcao_retroativa_do_97_do_diagnostico():
+    """97 vindo do diagnóstico (aparelho mudo de 10/11 9:20 até 12/11): ele volta e reenvia a memória; o trecho de
+    antes da janela é refeito com os dados reais (2/98), sem sobrar 97."""
+    b = BancoFalso()
+    b.maquina(1)
+    ligado(b, "DEV1", "chd1_value", T(0, dia=10) - 3600, T(8, dia=10) - 20)
+    producao_continua(b, "DEV1", "chd1_value", T(8, dia=10), T(9, dia=10))
+    ligado(b, "DEV1", "chd1_value", T(9, dia=10) + 10, T(9, 20, dia=10), valor=361, passo=10)
+    obj, logs, erros, res = novo(b, T(9, 30, dia=10))
+    _diag(obj, False)
+    obj.executar_ciclo()
+    assert b.lista(1)[-1] == (97, T(9, 20, dia=10), None, True)
+    obj._relogio.t = T(12, dia=11)
+    obj.executar_ciclo()                                              # continua mudo no dia seguinte
+    assert [x[0] for x in b.lista(1)][-2:] == [97, 97]
+    # 12/11: voltou, responde e reenviou a memória: estava parada até 14:00 do dia 10 e produziu até 15:00
+    ligado(b, "DEV1", "chd1_value", T(9, 20, dia=10) + 10, T(14, dia=10) - 20, valor=361, passo=60)
+    producao_continua(b, "DEV1", "chd1_value", T(14, dia=10), T(15, dia=10), valor=361)
+    ligado(b, "DEV1", "chd1_value", T(15, dia=10) + 60, T(9), valor=722)
+    obj._relogio.t = T(9)
+    _diag(obj, True)
+    obj.executar_ciclo()
+    lista = b.lista(1)
+    assert 97 not in {x[0] for x in lista}
+    assert (98, T(9, dia=10), T(14, dia=10) - 1, True) in lista
+    assert (2, T(14, dia=10), T(15, dia=10) - 1, True) in lista
+    assert [m for n, m in logs if "retroativos" in m]
 
 
 def test_legenda_ausente_avisa_uma_vez_e_nao_aponta():
@@ -930,7 +1053,7 @@ def test_coluna_do_canal_ausente_na_iot001_vira_aviso():
     assert "chd5_value" in porm[1]["aviso"] and "ignorada" in porm[1]["aviso"]
     assert b.lista(1) == []                                  # sem coluna nenhuma: não aponta 98 à toa
     assert "chd5_value" in porm[2]["aviso"]                  # o outro canal basta
-    assert b.lista(2) == [(97, HOJE, None, True)]            # e sem leitura nenhuma: tudo 97
+    assert b.lista(2) == [(98, HOJE, None, True)]            # e sem leitura nenhuma: parada (98), não 97
 
 
 def test_sem_senha_nao_roda_e_responde():
@@ -1117,6 +1240,10 @@ def test_diag_sem_resposta_marca_a_parada_em_aberto_como_97():
     assert marcar_sem_resposta(segs, prods, ini)[0] == segs[0]                 # o que já passou não muda
     produzindo = segmentos_continuos(prods, ini, p + 10, MICRO_S, MACRO_S)
     assert marcar_sem_resposta(produzindo, prods, ini) == produzindo           # sem parada em aberto
+    # com a última notícia do aparelho depois da última produção: 97 só a partir dela
+    assert marcar_sem_resposta(segs, prods, ini, p + 600)[-2:] == [(p, p + 600, MACRO), (p + 600, T(9), SEM_IOT)]
+    assert marcar_sem_resposta(segs, prods, ini, T(9))[-1] == (T(9), T(9), SEM_IOT)   # leitura agora: 97 de agora
+    assert marcar_sem_resposta(segs, prods, ini, p - 100)[-1] == (p, T(9), SEM_IOT)   # leitura antiga: desde p
 
 
 def _maquina_jornada(b, **kw):
@@ -1189,12 +1316,12 @@ def _parada_em_aberto(b):
     _maquina_jornada(b)
     ligado(b, "DEV1", "chd1_value", HOJE - 3600, T(8) - 20)
     producao_continua(b, "DEV1", "chd1_value", T(8), T(9))
-    ligado(b, "DEV1", "chd1_value", T(9) + 10, T(9, 30), valor=361)   # parada, aparelho mandando leitura
+    ligado(b, "DEV1", "chd1_value", T(9) + 10, T(9, 20), valor=361, passo=10)   # parada; última leitura 9:20
 
 
-@pytest.mark.parametrize("resposta, legenda, diag", [(False, 97, "sem resposta"), (True, 98, "ok"),
-                                                      (None, 98, "sem MQTT")])
-def test_ciclo_diag_decide_a_parada_em_aberto(resposta, legenda, diag):
+@pytest.mark.parametrize("resposta, diag", [(False, "sem resposta"), (True, "ok"), (None, "sem MQTT"),
+                                             (ap.DIAG_RECENTE, "ok (dados recentes)")])
+def test_ciclo_diag_decide_a_parada_em_aberto(resposta, diag):
     b = BancoFalso()
     _parada_em_aberto(b)
     pedidos = []
@@ -1202,8 +1329,11 @@ def test_ciclo_diag_decide_a_parada_em_aberto(resposta, legenda, diag):
     obj._diagnosticar = lambda devices, timeout: pedidos.append((devices, timeout)) or {d: resposta for d in devices}
     r = obj.executar_ciclo()
     assert pedidos == [(["DEV1"], 15.0)]
-    assert b.lista(1)[-1] == (legenda, T(9), None, True)
-    assert b.lista(1)[-2] == (2, T(8), T(9) - 1, True)              # o passado não muda
+    if resposta is False:     # 97 a partir da última notícia do aparelho (9:20); antes disso continua 98
+        assert b.lista(1)[-2:] == [(98, T(9), T(9, 20) - 1, True), (97, T(9, 20), None, True)]
+    else:
+        assert b.lista(1)[-1] == (98, T(9), None, True)
+    assert (2, T(8), T(9) - 1, True) in b.lista(1)                  # o passado não muda
     linha = r["maquinas"][0]
     assert linha["diag"] == diag
     assert ("Sem MQTT" in (linha["aviso"] or "")) == (resposta is None)
@@ -1289,7 +1419,9 @@ def test_pipeline_diagnosticar_dispositivos(montar):
     cli.entregar(f"NOVUS/{DEV}/ack/command", resposta_diag(ts))
     t.join(5)
     assert resultado == {DEV: True}
-    # não responde: False, 1 erro "comando" por incidente, resposta_comando a cada vez
+    # não responde (e nenhuma mensagem dele há mais de 60 s): False, 1 erro "comando" por incidente,
+    # resposta_comando a cada vez
+    relogio.ir(relogio() + 61)
     assert p.diagnosticar_dispositivos([DEV], 0.2) == {DEV: False}
     assert p.diagnosticar_dispositivos([DEV], 0.2) == {DEV: False}
     registros = [json.loads(e) for e in col.erros]
@@ -1306,6 +1438,7 @@ def test_pipeline_diagnosticar_dispositivos(montar):
     cli.entregar(f"NOVUS/{DEV}/ack/command", resposta_diag(json.loads(cli.publicados[-1][1])["timestamp"]))
     t.join(5)
     assert resultado == {DEV: True} and col.com("voltou a responder", "INFO")
+    relogio.ir(relogio() + 61)
     assert p.diagnosticar_dispositivos([DEV], 0.1) == {DEV: False}
     assert len(col.erros) == 2
     # sem MQTT: None, sem publicar nada
@@ -1313,6 +1446,36 @@ def test_pipeline_diagnosticar_dispositivos(montar):
     n = len(cli.publicados)
     assert p.diagnosticar_dispositivos([DEV], 0.1) == {DEV: None}
     assert len(cli.publicados) == n
+
+
+def test_pipeline_diag_sem_ack_mas_com_mensagem_recente_conta_como_respondeu(montar):
+    """Caso real: o ack vai para NOÏUS/.../ack/command (não ouvido), mas as leituras chegam em NOVUS/.../events."""
+    from tests.test_amostragem import novus
+    p, cli, relogio, col, _con = montar(intervalo=0)
+    t0 = relogio()
+    # nenhuma mensagem do device ainda: sem resposta = False (97), 1 erro
+    assert p.diagnosticar_dispositivos([DEV], 0.1) == {DEV: False}
+    assert len(col.erros) == 1
+    # chega uma leitura normal; o ack do diag continua sem chegar
+    cli.entregar(f"NOVUS/{DEV}/events", novus(51584019, ts=int(t0)))
+    assert esperar(lambda: p.segundos_desde_atividade(DEV) is not None)
+    relogio.ir(t0 + 60)                                               # exatamente 60 s depois: ainda vale
+    assert p.diagnosticar_dispositivos([DEV], 0.1) == {DEV: ap.DIAG_RECENTE}
+    assert col.com("voltou a mandar mensagens", "INFO")               # fecha o incidente de device mudo
+    assert len(col.com("sem confirmação", "AVISO")) == 1
+    assert p.diagnosticar_dispositivos([DEV], 0.1) == {DEV: ap.DIAG_RECENTE}
+    assert len(col.com("sem confirmação", "AVISO")) == 1              # AVISO 1 vez (até o ack voltar)
+    assert len(col.erros) == 1                                         # nenhum erro novo
+    assert not [r for r in col.respostas if r[:3] == (DEV, "diag", False) and "Sem resposta" in r[3]][1:]
+    # mais de 60 s sem nada: volta a ser sem resposta (novo incidente, novo erro)
+    relogio.ir(t0 + 61)
+    assert p.diagnosticar_dispositivos([DEV], 0.1) == {DEV: False}
+    assert len(col.erros) == 2
+    # mensagem retida (antiga, do broker) não conta como atividade
+    relogio.ir(t0 + 200)
+    cli.entregar(f"NOVUS/{DEV}/events", novus(51584019, ts=int(t0) + 1), retida=True)
+    time.sleep(0.2)
+    assert p.diagnosticar_dispositivos([DEV], 0.1) == {DEV: False}
 
 
 def test_bridge_tem_recalcular_e_sinal():

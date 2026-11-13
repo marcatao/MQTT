@@ -42,7 +42,8 @@ class PipelineBridge(QObject):
     # {"quando", "proxima" (ISO local|null), "minutos", "ok", "mensagem", "criados", "alterados", "excluidos",
     #  "maquinas": [{"maquina_id", "codigo", "nome", "canais", "micro_s", "macro_s", "legenda", "legenda_descricao",
     #                "desde", "ultima_producao", "apontamentos_hoje", "ultima_leitura", "aviso",
-    #                "diag" ("ok"|"sem resposta"|"sem MQTT"|null), "turno" ("dentro"|"fora"|"sem jornada"),
+    #                "diag" ("ok"|"ok (dados recentes)"|"sem resposta"|"sem MQTT"|null),
+    #                "turno" ("dentro"|"fora"|"sem jornada"),
     #                "jornada" (ex. "Seg–Qui 05:00–14:48, Sex 05:00–13:48" | null)}]}
     apontamentos_atualizados = Signal(str)
     recalculo_concluido = Signal(int, str, bool, str)  # (maquina_id, dia "AAAA-MM-DD", sucesso, mensagem em português)

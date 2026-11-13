@@ -436,7 +436,8 @@ Especificação completa em `docs/apontamentos_reais.md` (fonte da verdade; cód
   integrador roda o diagnóstico dos aparelhos. Se o aparelho **não responde (sem rede)**, a parada em aberto daquela
   máquina passa a ser apontada como **97** a partir desse momento (fora do turno continua 96). Um aparelho que mandou
   qualquer mensagem MQTT há pouco (≤ 60 s) conta como respondendo, mesmo que o ack do `diag` se perca (ex.: tópico
-  `NOÏUS`).
+  `NOÏUS`); a linha da aba mostra o diag "ok (dados recentes)". O 97 começa na última notícia do aparelho (última
+  linha na IOT001, se depois da última produção; senão a última produção).
 - **Falta de linhas na IOT001 sozinha não gera mais 97**: é tratada como máquina parada (o contador não aumentou):
   **fora do turno → 96 Fora de turno**; **dentro do turno → 98 Parada sem motivo** (paradas curtas, entre micro e
   macro, continuam 99). O intervalo entre produções não desconta mais os buracos sem leitura.

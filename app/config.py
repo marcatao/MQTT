@@ -167,9 +167,9 @@ class ApontamentosConfig:
     legenda_produzindo: str = "2"           # Produção Normal
     legenda_micro: str = "99"               # Microparada
     legenda_macro: str = "98"               # Macro parada
-    legenda_sem_iot: str = "97"             # Sem apontamento IOT (aparelho sem leitura); ausente = como antes
+    legenda_sem_iot: str = "97"             # Sem apontamento IOT (aparelho sem resposta ao diag); ausente = 99/98
     legenda_fora_turno: str = "96"          # Fora de turno (parada fora da jornada da máquina); ausente = sem 96
-    sem_leitura_segundos: int = 120         # mais que isso sem nenhuma linha na IOT001 = sem leitura (97)
+    sem_leitura_segundos: int = 120         # sem uso desde 13/11/2026 (falta de linhas na IOT001 não gera mais 97)
     dias_correcao: int = 7                  # 97 com leitura nova até N dias atrás é recalculado (dados retroativos)
     fuso: str = "America/Sao_Paulo"         # dia local (um apontamento não passa da meia-noite)
 

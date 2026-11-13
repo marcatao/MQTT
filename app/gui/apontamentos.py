@@ -5,8 +5,8 @@ própria; a regra completa está em docs/apontamentos_reais.md. Esta aba só mos
 bridge por pontos do contrato (todos opcionais: um bridge sem eles deixa os controles desabilitados):
 
 * `apontamentos_atualizados(str)`: JSON de cada ciclo concluído (ou falho), ver `interpretar_ciclo`. Cada máquina
-  traz também `diag` ("ok" | "sem resposta" | "sem MQTT" | null), `turno` ("dentro" | "fora" | "sem jornada") e
-  `jornada` (texto, ex. "Seg–Sex 05:00–14:48", ou null);
+  traz também `diag` ("ok" | "ok (dados recentes)" | "sem resposta" | "sem MQTT" | null), `turno` ("dentro" |
+  "fora" | "sem jornada") e `jornada` (texto, ex. "Seg–Sex 05:00–14:48", ou null);
 * `definir_periodicidade_apontamentos(minutos)`: chamado quando o usuário muda a periodicidade e ao abrir a janela
   (o valor fica em QSettings, chave `apontamentos/minutos`, e vale mais que `[apontamentos] minutos`);
 * `executar_apontamentos_agora()`: botão "Executar agora", que fica "Executando…" até o próximo ciclo chegar (ou
@@ -88,9 +88,11 @@ ORDEM_LEGENDA = {"98": 0, "97": 1, "96": 2, "99": 3, "2": 5}
 
 TURNOS = {"dentro": "dentro", "fora": "fora", "sem jornada": "sem jornada"}
 TONS_TURNO = {"dentro": "destaque", "fora": "fora_turno", "sem jornada": "neutro"}
-TONS_DIAG = {"ok": "sucesso", "sem resposta": "erro", "sem MQTT": "neutro"}
+TONS_DIAG = {"ok": "sucesso", "ok (dados recentes)": "sucesso", "sem resposta": "erro", "sem MQTT": "neutro"}
 DICAS_DIAG = {
     "ok": "O aparelho respondeu ao diagnóstico pedido antes deste ciclo.",
+    "ok (dados recentes)": ("A confirmação do diagnóstico não chegou, mas o aparelho mandou mensagem no último minuto: "
+                            "está na rede (sem 97).\nConfira o tópico de confirmação na aba Clientes (Tópicos…)."),
     "sem resposta": ("O aparelho não respondeu ao diagnóstico antes deste ciclo: a parada em aberto virou 97 Sem "
                      "apontamento IOT.\nConfira o tópico de confirmação na aba Clientes (Tópicos…)."),
     "sem MQTT": "O integrador não está conectado ao broker: não deu para perguntar ao aparelho neste ciclo.",
@@ -475,7 +477,7 @@ class ModeloApontamentos(QAbstractTableModel):
             ordem = ORDEM_LEGENDA.get(m.legenda, 4 if m.legenda else 6)
             return f"{ordem}|{m.texto_estado}".casefold()
         if col == COL_DIAG:  # problemas primeiro
-            return {"sem resposta": 0, "sem MQTT": 1, "ok": 2}.get(m.diag, 3)
+            return {"sem resposta": 0, "sem MQTT": 1, "ok (dados recentes)": 2, "ok": 2}.get(m.diag, 3)
         if col == COL_TURNO:
             return {"fora": 0, "dentro": 1, "sem jornada": 2}.get(m.turno, 3)
         return self.texto(m, col).casefold()

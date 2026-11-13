@@ -16,7 +16,7 @@ O objetivo é dizer **se a máquina trabalhou ou parou**. Depois, o operador vai
 - `OEE.dbo.legendas`: `id`, `codigo` (varchar 12), `descricao`, `tipo` (`produzindo` | `parada` | `planejada` |
   `desligada`), `ativo`. Usadas pelo integrador: **`'2'` Produção Normal**, **`'99'` Microparada**, **`'98'` Macro
   parada** (já cadastradas no portal; se faltar alguma, o ciclo não aponta e avisa no log); **`'97'` Sem
-  apontamento IOT** para os períodos sem leitura (ver abaixo); **`'96'` Fora de turno** para parada fora do horário
+  apontamento IOT** quando o aparelho não responde ao diagnóstico (ver "Diagnóstico antes de apontar"); **`'96'` Fora de turno** para parada fora do horário
   de trabalho.
 - `OEE.dbo.apontamentos_estado`: `id` (identity), `maquina_id`, `legenda_id`, `ordem_producao_id` (NULL ok),
   `inicio` (datetime, UTC), `fim` (NULL = ainda neste estado; CHECK `fim IS NULL OR fim > inicio`), `referencia`
@@ -47,7 +47,22 @@ A parada começa na última produção `p` e termina na produção seguinte `t` 
 "produzindo"). Se até agora não houve nova produção, o intervalo em aberto é `agora − p` e a mesma tabela vale: o
 apontamento em aberto vira 99 quando passa da micro e 98 quando passa da macro (o início continua em `p`).
 
-## Sem leitura do aparelho: 97 Sem apontamento IOT (decidido em 12/11/2026)
+**Falta de linhas na IOT001** (aparelho sem mandar nada por um tempo) **não é tratada à parte** (regra revista em
+13/11/2026): o intervalo é só o tempo sem o contador do canal aumentar, então um buraco sem linhas é máquina parada
+como qualquer outra — `< micro` continua 2, entre micro e macro 99, `≥ macro` 98 e, fora do turno, 96. Máquina sem
+nenhuma leitura na janela: parada (98/96) desde o início da janela. O único jeito de aparecer 97 é o diagnóstico
+sem resposta (seção "Diagnóstico antes de apontar").
+
+## Histórico — substituída em 13/11/2026: "Sem leitura do aparelho: 97" (regra de 12/11/2026, v0.1.17–v0.1.19)
+
+> **Não vale mais.** O usuário viu na timeline da 1010 INJ33 um 97 curto perto das 05:00 e a máquina "PARADA 97 ·
+> Sem apontamento IOT desde 13:33" com o aparelho mandando dados normalmente, e revisou a regra: falta de linhas na
+> IOT001 é máquina parada (ver "Regra do estado"), e o 97 só vem do diagnóstico sem resposta. O código não tem mais
+> `buracos_sem_leitura` nem o desconto do tempo sem leitura no intervalo; `[apontamentos] sem_leitura_segundos`
+> continua aceito no `config.toml`, mas não é usado. Os trechos 97 antigos que ficaram no banco dentro da janela do
+> ciclo (de ontem 00:00 até agora) são refeitos pela regra nova no ciclo normal; mais antigos que isso, só com o
+> botão **Recalcular** da máquina (ou se chegarem leituras dentro deles: correção retroativa). Texto antigo, só
+> para referência:
 
 - **Sem leitura** = nenhuma linha na IOT001 de nenhum dos dispositivos da máquina por mais de
   `[apontamentos] sem_leitura_segundos` (padrão **120 s**; o DigiRail manda a cada ~10 s). O trecho vai da última
@@ -92,15 +107,35 @@ fica 99/98).
 - Legenda 96 ausente no portal: AVISO (1 vez até resolver) e segue sem 96.
 - Código em `[apontamentos] legenda_fora_turno = "96"`. Situação da máquina com 96 = parada.
 
-## Diagnóstico antes de apontar: 97 se o aparelho não responde (decidido em 13/11/2026)
+## Diagnóstico antes de apontar: a única origem do 97 (decidido em 13/11/2026, revisto no mesmo dia)
 
 Antes de calcular os apontamentos, o ciclo manda o **diagnóstico** (`diag`, o mesmo da aba Clientes) a cada
 dispositivo das máquinas elegíveis e espera as respostas (até `[dispositivos] timeout_comando_segundos`, 15 s, todos
-em paralelo). Se um dispositivo **não responde**, a parada **em aberto** (o último trecho, da última produção até
-agora) das máquinas dele vira **97 Sem apontamento IOT** (fora do turno continua 96). Quando ele voltar a responder,
-o trecho volta a ser calculado normalmente (reconciliação). Sem MQTT conectado não há como perguntar: o ciclo segue
-sem essa regra (aviso na linha da máquina). Diagnóstico que responde não muda nada. Atenção: o tópico de confirmação
-precisa estar certo na aba Clientes ("Tópicos…"), senão o aparelho parece não responder.
+em paralelo).
+
+- **Respondeu** (chegou o ack do `diag`) → "ok": nada muda.
+- **Sem o ack, mas com mensagem recente**: se o aparelho mandou **qualquer mensagem MQTT** (leitura, evento,
+  resposta; mensagem retida não conta) nos últimos **60 s**, ele está na rede e conta como respondendo → "ok (dados
+  recentes)" na linha da máquina, sem 97 e sem erro. É o caso do ack que vai para um tópico que o integrador não ouve
+  (ex.: `NOÏUS/Teste_Alumbra/ack/command` sem o tópico salvo em "Tópicos…"). O log ganha 1 AVISO por aparelho (até
+  um ack voltar a chegar) sugerindo conferir o tópico de confirmação.
+- **Não responde** (sem ack e sem nenhuma mensagem há mais de 60 s) → "sem resposta": a parada **em aberto** das
+  máquinas dele (99/98, o último trecho, depois da última produção) passa a ser **97 Sem apontamento IOT a partir da
+  última notícia do aparelho** — a última linha dele na IOT001, se for depois da última produção; senão desde a
+  última produção (se a última linha é de agora, o 97 começa agora). O trecho antes disso continua 99/98. Fora do
+  turno continua **96**. Se a máquina está produzindo (último trecho 2), nada muda. 1 AVISO e 1 erro categoria
+  `comando` por incidente (até ele voltar a responder).
+- Quando o aparelho **volta a responder**, o próximo ciclo recalcula a janela normalmente: o trecho volta a ser
+  calculado pelo contador (sem leitura nova = parada 98/99/96; com a memória reenviada = os dados reais).
+- **Sem MQTT** conectado não há como perguntar: o ciclo segue sem essa regra ("sem MQTT", aviso na linha da máquina).
+- Sem a legenda 97 no portal: AVISO (1 vez até resolver) e o aparelho sem resposta fica como parada (99/98).
+
+**Correção retroativa** (continua valendo, agora para os 97 do diagnóstico): se depois chegam leituras na IOT001 com
+`ts_unix` dentro de um apontamento 97 do integrador (o aparelho reenvia a memória quando volta), o trecho é
+recalculado com os dados reais. Os 97 dentro da janela do ciclo (ontem 00:00 até agora) já são refeitos a cada ciclo;
+para os mais antigos, a cada ciclo, para cada máquina, procura o apontamento 97 do integrador mais antigo dos últimos
+`[apontamentos] dias_correcao` (padrão **7**) dias que tem leitura dentro dele (`ts_unix > inicio` e `<= fim`); se
+houver, a janela daquele ciclo começa às 00:00 local do dia dele. Sem leitura nova, a janela não muda.
 
 ## Recalcular o dia de uma máquina (decidido em 13/11/2026)
 

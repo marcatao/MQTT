@@ -8,15 +8,18 @@ Especificação: ``docs/apontamentos_reais.md`` (fonte da verdade). Resumo:
   contador zerado = nova base). Com vários canais, vale a produção de qualquer um.
 - Intervalo entre produções ``gap``: ``< micro`` → 2 Produção Normal; ``micro ≤ gap < macro`` → 99 Microparada;
   ``≥ macro`` → 98 Macro parada. A parada começa na última produção; o trecho em aberto usa ``agora − p``.
-- **Sem leitura** (nenhuma linha na IOT001 de nenhum device da máquina por mais de ``sem_leitura_segundos``): o trecho
-  vira 97 Sem apontamento IOT e o intervalo entre produções desconta esse tempo. Leituras que chegam depois dentro de
-  um 97 do integrador (até ``dias_correcao`` dias) fazem a janela recomeçar no dia dele (correção retroativa). Sem a
-  legenda 97 no portal: AVISO e tudo como antes (2/99/98).
+- **Falta de linhas na IOT001** (regra revista em 13/11/2026): não gera 97 nem desconta nada do intervalo; é máquina
+  parada como qualquer outra (99/98; fora do turno, 96).
+- **97 Sem apontamento IOT só vem do diagnóstico** (abaixo). Leituras que chegam depois dentro de um 97 do integrador
+  (até ``dias_correcao`` dias) fazem a janela recomeçar no dia dele (correção retroativa). Sem a legenda 97 no
+  portal: AVISO e o aparelho mudo não muda nada (99/98).
 - **Fora de turno**: pela jornada da máquina (``horarios_semana`` ou ``dias_semana`` + ``jornada_*``) e as exceções
   do calendário (``calendario_dias``), as paradas (99/98/97) fora do turno viram 96; produção continua 2. Sem
   jornada, colunas/tabelas ou legenda 96: sem 96 (legenda ausente = 1 AVISO).
 - **Diagnóstico**: antes de apontar, o ciclo pergunta aos devices (callback ``diagnosticar`` do pipeline); quem não
-  responde tem a parada em aberto (99/98, da última produção até agora) apontada como 97 (fora do turno, 96).
+  responde tem a parada em aberto (99/98) apontada como 97 a partir da última notícia dele (última linha na IOT001,
+  se depois da última produção) até agora; fora do turno, 96. Quem não mandou o ack mas mandou qualquer mensagem MQTT
+  nos últimos 60 s (``DIAG_RECENTE``) conta como respondendo: "ok (dados recentes)".
 - **Recalcular** (``recalcular``): refaz uma máquina desde 00:00 local de um dia (até ``dias_correcao`` atrás), na
   thread do ciclo; responde em ``ao_recalculo`` e reemite o último resultado com a linha dela atualizada.
 
@@ -25,7 +28,8 @@ JSON de cada ciclo (``ao_resultado``)::
     {"quando", "proxima" (ISO local | null), "minutos", "ok", "mensagem", "criados", "alterados", "excluidos",
      "maquinas": [{"maquina_id", "codigo", "nome", "canais", "micro_s", "macro_s", "legenda", "legenda_descricao",
                    "desde", "ultima_producao", "apontamentos_hoje", "ultima_leitura", "aviso",
-                   "diag": "ok" | "sem resposta" | "sem MQTT" | null, "turno": "dentro" | "fora" | "sem jornada",
+                   "diag": "ok" | "ok (dados recentes)" | "sem resposta" | "sem MQTT" | null,
+                   "turno": "dentro" | "fora" | "sem jornada",
                    "jornada": "Seg–Qui 05:00–14:48, Sex 05:00–13:48" | null}]}
 - Trechos iguais seguidos = um apontamento; nenhum passa da meia-noite local (``[apontamentos] fuso``); encadeados
   (``fim = próximo início − 1 s``); trecho < 2 s é absorvido; o último fica em aberto (``fim`` NULL).
@@ -64,8 +68,11 @@ Logar = Callable[[str, str], None]
 AoErro = Callable[[str, str | None], None]          # (mensagem, detalhe)
 AoResultado = Callable[[str], None]                 # JSON do ciclo
 AoRecalculo = Callable[[int, str, bool, str], None]  # (maquina_id, dia, sucesso, mensagem)
-# (devices, timeout) → {device: True respondeu | False sem resposta | None não deu para perguntar (sem MQTT)}
+# (devices, timeout) → {device: True respondeu | DIAG_RECENTE sem ack, mas mandou mensagem MQTT há ≤ 60 s (conta como
+# respondeu) | False sem resposta | None não deu para perguntar (sem MQTT)}
 Diagnosticar = Callable[[list, float], dict]
+DIAG_RECENTE = "recente"
+DIAG_OK, DIAG_OK_RECENTE, DIAG_SEM_RESPOSTA, DIAG_SEM_MQTT = "ok", "ok (dados recentes)", "sem resposta", "sem MQTT"
 Relogio = Callable[[], float]
 
 PRODUZINDO, MICRO, MACRO, SEM_IOT, FORA_TURNO = "produzindo", "micro", "macro", "sem_iot", "fora_turno"
@@ -147,45 +154,8 @@ def classificar(gap: float, micro: int, macro: int) -> str:
     return MACRO
 
 
-def buracos_sem_leitura(ts_leituras: Iterable[int], desde: int, agora: int, limite: int) -> list[tuple[int, int]]:
-    """Períodos ``(a, b)`` sem nenhuma leitura por mais de ``limite`` segundos dentro de ``[desde, agora]``.
-
-    ``ts_leituras``: ``ts_unix`` de TODAS as linhas da IOT001 dos dispositivos da máquina (união, inclusive as com
-    valores NULL). Vale também para o começo (``desde`` → 1ª leitura) e o fim (última leitura → ``agora``, aparelho
-    ainda fora). Sem leitura nenhuma: ``[(desde, agora)]``. O buraco vai da última leitura antes dele até a primeira
-    depois dele.
-    """
-    tss = sorted({int(t) for t in ts_leituras if desde <= int(t) <= agora})
-    if not tss:
-        return [(desde, agora)] if agora > desde else []
-    pontos = [desde, *tss, agora]
-    return [(a, b) for a, b in zip(pontos, pontos[1:]) if b - a > limite]
-
-
-def _sem_leitura_em(buracos: list[tuple[int, int]], a: int, b: int) -> int:
-    """Segundos de ``[a, b)`` que caem em buracos sem leitura."""
-    return sum(max(0, min(hb, b) - max(ha, a)) for ha, hb in buracos)
-
-
-def _recortar(a: int, b: int, estado: str, buracos: list[tuple[int, int]]) -> list[list]:
-    """``[a, b)`` com ``estado``, trocando as partes dentro dos buracos por ``SEM_IOT``."""
-    saida: list[list] = []
-    cursor = a
-    for ha, hb in buracos:
-        if hb <= cursor or ha >= b:
-            continue
-        s, e = max(ha, cursor), min(hb, b)
-        if s > cursor:
-            saida.append([cursor, s, estado])
-        saida.append([s, e, SEM_IOT])
-        cursor = e
-    if cursor < b:
-        saida.append([cursor, b, estado])
-    return saida
-
-
-def segmentos_continuos(prods: Iterable[int], ini: int, agora: int, micro: int, macro: int,
-                        buracos: Iterable[tuple[int, int]] = ()) -> list[tuple[int, int, str]]:
+def segmentos_continuos(prods: Iterable[int], ini: int, agora: int, micro: int, macro: int
+                        ) -> list[tuple[int, int, str]]:
     """Trechos ``(inicio, fim_exclusivo, estado)`` que cobrem ``[ini, agora]`` sem buracos, já mesclados.
 
     ``prods``: produções (ts_unix), podendo incluir as anteriores a ``ini`` (a última delas define o 1º intervalo).
@@ -193,11 +163,9 @@ def segmentos_continuos(prods: Iterable[int], ini: int, agora: int, micro: int, 
     do aparelho adiantado) são ignoradas. O último trecho termina em ``agora`` (em aberto) e pode ter duração zero
     (produção exatamente em ``agora``).
 
-    ``buracos`` (de ``buracos_sem_leitura``): as partes sem leitura viram ``SEM_IOT`` e o intervalo de cada
-    ``[p, t)`` (e o em aberto) desconta o tempo sem leitura; as partes com leitura são classificadas por esse
-    intervalo observado. Sem buracos, o resultado é o de sempre (2/99/98).
+    O intervalo é só o tempo sem o contador subir (regra revista em 13/11/2026): falta de linhas na IOT001 não
+    desconta nada nem gera 97 — é máquina parada como qualquer outra (99/98; fora do turno, 96).
     """
-    buracos = sorted((int(a), int(b)) for a, b in buracos if int(b) > int(a))
     ordenadas = sorted({int(p) for p in prods if int(p) <= agora})
     antes = [p for p in ordenadas if p < ini]
     dentro = [p for p in ordenadas if p >= ini]
@@ -205,20 +173,14 @@ def segmentos_continuos(prods: Iterable[int], ini: int, agora: int, micro: int, 
     cursor = ini
     brutos: list[list] = []
 
-    def gap_observado(t: int) -> float:
-        if anterior is None:
-            return float("inf")
-        return (t - anterior) - _sem_leitura_em(buracos, anterior, t)
+    def gap(t: int) -> float:
+        return float("inf") if anterior is None else float(t - anterior)
 
     for t in dentro:
         if t > cursor:
-            brutos.extend(_recortar(cursor, t, classificar(gap_observado(t), micro, macro), buracos))
+            brutos.append([cursor, t, classificar(gap(t), micro, macro)])
         anterior, cursor = t, t
-    estado_final = classificar(gap_observado(agora), micro, macro)
-    if agora > cursor:
-        brutos.extend(_recortar(cursor, agora, estado_final, buracos))
-    else:
-        brutos.append([cursor, agora, estado_final])
+    brutos.append([cursor, agora, classificar(gap(agora), micro, macro)])
     mesclados: list[list] = []
     for seg in brutos:
         if mesclados and mesclados[-1][2] == seg[2] and mesclados[-1][1] == seg[0]:
@@ -393,18 +355,30 @@ def recortar_fora_turno(segmentos: list[tuple[int, int, str]], turnos: list[tupl
     return [(a, b, e) for a, b, e in mesclados]
 
 
-def marcar_sem_resposta(segmentos: list[tuple[int, int, str]], prods: Iterable[int], ini: int
-                        ) -> list[tuple[int, int, str]]:
-    """Aparelho não respondeu ao diagnóstico: a parada em aberto (da última produção até agora; sem produção na
-    janela, desde ``ini``) que for 99/98 vira 97. Produção e os outros estados ficam como estão."""
+def marcar_sem_resposta(segmentos: list[tuple[int, int, str]], prods: Iterable[int], ini: int,
+                        ultima_leitura: int | None = None) -> list[tuple[int, int, str]]:
+    """Aparelho não respondeu ao diagnóstico (única origem do 97 desde 13/11/2026): a parada em aberto (99/98, da
+    última produção até agora) vira 97 **a partir do momento em que o aparelho ficou mudo** = a última notícia dele
+    (``ultima_leitura``, último ``ts_unix`` na IOT001) se for depois da última produção; senão desde a última
+    produção (sem produção na janela, desde ``ini``). O que vem antes desse momento continua 99/98. Produção e os
+    outros estados ficam como estão; fora do turno o ``recortar_fora_turno`` (depois) troca por 96."""
     if not segmentos:
         return segmentos
     fim = segmentos[-1][1]
-    ultimas = [int(p) for p in prods if ini <= int(p) <= fim]
-    desde = max(ultimas) if ultimas else ini
     if segmentos[-1][2] == PRODUZINDO:
         return segmentos         # está produzindo: não há parada em aberto
-    saida = [(a, b, SEM_IOT if a >= desde and e in (MICRO, MACRO) else e) for a, b, e in segmentos]
+    ultimas = [int(p) for p in prods if ini <= int(p) <= fim]
+    desde = max(ultimas) if ultimas else ini
+    if ultima_leitura is not None and desde < int(ultima_leitura) <= fim:
+        desde = int(ultima_leitura)
+    # depois da última produção só existe o último trecho (a parada em aberto); os anteriores terminam antes dela
+    *saida, (a, b, e) = segmentos
+    if e not in (MICRO, MACRO):
+        saida.append((a, b, e))
+    elif a < desde:
+        saida += [(a, desde, e), (desde, b, SEM_IOT)]   # 97 desde a última notícia (pode ser agora: duração zero)
+    else:
+        saida.append((a, b, SEM_IOT))
     mesclados: list[list] = []
     for a, b, e in saida:
         if mesclados and mesclados[-1][2] == e and mesclados[-1][1] == a:
@@ -1064,10 +1038,12 @@ class ApontamentosOee:
             return None
         valores = [diag.get(d) for d, _c in dict.fromkeys(m.canais)]
         if any(v is False for v in valores):
-            return "sem resposta"
+            return DIAG_SEM_RESPOSTA
         if all(v is None for v in valores):
-            return "sem MQTT"
-        return "ok"
+            return DIAG_SEM_MQTT
+        if any(v == DIAG_RECENTE for v in valores):
+            return DIAG_OK_RECENTE       # sem o ack do diag, mas mandou mensagem há pouco: está na rede
+        return DIAG_OK
 
     def _jornada(self, m: Maquina, excecoes: dict[int, dict[date, bool]]) -> Jornada:
         return montar_jornada(m.horarios_semana, m.dias_semana, m.jornada_inicio, m.jornada_fim,
@@ -1113,7 +1089,7 @@ class ApontamentosOee:
         else:
             linha["turno"] = "dentro" if intervalos_turno(jornada, agora, agora, self._fuso) else "fora"
             linha["jornada"] = texto_jornada(jornada.horarios)
-        if diag == "sem MQTT":
+        if diag == DIAG_SEM_MQTT:
             extra = "Sem MQTT conectado: diagnóstico do aparelho não enviado."
             linha["aviso"] = f"{linha['aviso']} {extra}" if linha.get("aviso") else extra
 
@@ -1150,7 +1126,7 @@ class ApontamentosOee:
             processadas += 1
             try:
                 contagem, avisos = self._processar(m, linha, legendas, todas, agora, jornada,
-                                                   mudo=estado_diag == "sem resposta")
+                                                   mudo=estado_diag == DIAG_SEM_RESPOSTA)
             except Exception as exc:  # noqa: BLE001
                 self._rollback()
                 falhas += 1
@@ -1249,7 +1225,7 @@ class ApontamentosOee:
             jornada = self._jornada(m, self._ler_excecoes([m], agora))
             try:
                 contagem, avisos = self._processar(m, linha, legendas, todas, agora, jornada,
-                                                   mudo=estado_diag == "sem resposta", ini_forcado=ini)
+                                                   mudo=estado_diag == DIAG_SEM_RESPOSTA, ini_forcado=ini)
             finally:
                 self._completar_linha(linha, m, jornada, estado_diag, agora)
         except Exception as exc:  # noqa: BLE001
@@ -1351,8 +1327,8 @@ class ApontamentosOee:
             if not self._aviso_sem_iot:
                 self._aviso_sem_iot = True
                 self._logar("AVISO", f"Apontamentos reais: legenda {codigo_97 or '(sem código)'} (Sem apontamento "
-                                     "IOT) não cadastrada ou inativa no portal OEE; períodos sem leitura do aparelho "
-                                     "serão tratados como parada (99/98) até ela ser cadastrada.")
+                                     "IOT) não cadastrada ou inativa no portal OEE; aparelho sem resposta ao "
+                                     "diagnóstico continua como parada (99/98) até ela ser cadastrada.")
         else:
             self._aviso_sem_iot = False
         codigo_96 = str(self._cfg.legenda_fora_turno or "").strip()
@@ -1443,11 +1419,10 @@ class ApontamentosOee:
                                          f"máquina {self._nome(m)} desde "
                                          f"{datetime.fromtimestamp(ini, self._fuso):%d/%m}."))
 
-            # leituras: por dispositivo, só as colunas dos canais da máquina (todas as linhas: os ts de todas
-            # contam para os buracos sem leitura, mesmo com valores NULL)
+            # leituras: por dispositivo, só as colunas dos canais da máquina (a última linha, mesmo com valores
+            # NULL, é a última notícia do aparelho: início do 97 quando ele não responde ao diagnóstico)
             desde = ini - m.macro - MARGEM_LEITURAS
             listas: list[list[int]] = []
-            ts_todas: list[int] = []
             ultima_leitura: int | None = None
             for device, canais in por_device.items():
                 cols = ", ".join(f"[{c}]" for c in canais)
@@ -1456,7 +1431,6 @@ class ApontamentosOee:
                 leituras = cur.fetchall() or []
                 for i in range(len(canais)):
                     listas.append(producoes((l[0], l[1 + i]) for l in leituras))
-                ts_todas.extend(int(l[0]) for l in leituras)
                 if leituras:
                     ultima_leitura = max(ultima_leitura or 0, int(leituras[-1][0]))
             if ultima_leitura is None:
@@ -1469,13 +1443,10 @@ class ApontamentosOee:
             prods = juntar_producoes(*listas)
             prods = [p for p in prods if p <= agora]
 
-            buracos: list[tuple[int, int]] = []
-            if legendas.sem_iot is not None:
-                limite = max(1, int(self._cfg.sem_leitura_segundos or 120))
-                buracos = buracos_sem_leitura(ts_todas, desde, agora, limite)
-            segs = segmentos_continuos(prods, ini, agora, m.micro, m.macro, buracos)
+            # falta de linhas na IOT001 não gera 97 (regra revista em 13/11/2026): só o diagnóstico sem resposta
+            segs = segmentos_continuos(prods, ini, agora, m.micro, m.macro)
             if mudo and legendas.sem_iot is not None:
-                segs = marcar_sem_resposta(segs, prods, ini)
+                segs = marcar_sem_resposta(segs, prods, ini, ultima_leitura)
             if legendas.fora_turno is not None and not jornada.vazia:
                 segs = recortar_fora_turno(segs, intervalos_turno(jornada, ini, agora, self._fuso))
             desejados = dividir_por_dia(segs, self._fuso)

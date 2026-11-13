@@ -76,7 +76,8 @@ Diagnóstico automático não é pedido a device em reinício.
 Diagnóstico sem duplicar (``JANELA_DIAG``): o automático (1ª vez e periódico) não sai se outro ``diag`` foi enviado
 ao device (por qualquer origem) ou respondido por ele há menos de 20 s; o diag dos apontamentos reais
 (``diagnosticar_dispositivos``) não publica de novo se há um ``diag`` pendente enviado há menos de 20 s: espera a
-resposta dele.
+resposta dele. Sem o ack, mas com qualquer mensagem (não retida) do device há ≤ ``JANELA_ATIVIDADE`` (60 s), o
+device conta como respondendo (``DIAG_RECENTE``): é o caso do ack que vai para um tópico não ouvido (``NOÏUS``).
 
 Cadastro OEE na aba Clientes (``ao_dispositivos_oee``): logo ao conectar e a cada ``INTERVALO_LISTA_OEE`` s, a
 thread de processamento pede ``CadastroOee.listar`` (thread/conexão do cadastro, não atrasa a IOT001); se o OEE
@@ -117,7 +118,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterable
 
 import paho.mqtt.client as _paho
 
@@ -126,7 +127,7 @@ from app.core import digirail
 from app.core import erros as _erros
 from app.core import topicos as _topicos
 from app.core.mqtt_client import ClienteMqtt, validar_parametros
-from app.core.apontamentos_oee import ApontamentosOee
+from app.core.apontamentos_oee import DIAG_RECENTE, ApontamentosOee
 from app.core.oee_dispositivos import CadastroOee
 from app.core.mapeamento import EVENTO, RESPOSTA, LinhaIot, ResultadoMapa, _device_da_mensagem, mapear
 from app.core.parser import trecho
@@ -396,6 +397,7 @@ class Pipeline:
     INTERVALO_ULTIMA_LEITURA = 5.0  # s: no máx. 1 aviso de "última leitura" a cada 5 s
     INTERVALO_DISPOSITIVO = 5.0     # s: no máx. 1 aviso de "dispositivo visto" a cada 5 s por device_id
     JANELA_DIAG = 20.0              # s: diag automático não repete um diag enviado/respondido há menos que isso
+    JANELA_ATIVIDADE = 60.0         # s: mensagem MQTT do device há menos que isso = está na rede (diag dos apontamentos)
     INTERVALO_LISTA_OEE = 60.0      # s: lista do cadastro OEE para a aba Clientes
     ATRASO_ONLINE = 1.0             # s: mensagem do device a partir disso depois do outN = 1 prova que ele não caiu
 
@@ -485,6 +487,8 @@ class Pipeline:
         self._mudos: set[str] = set()                # devices sem resposta ao diag do ciclo (1 erro por incidente)
         self._diag_enviado_t: dict[str, float] = {}  # device_id → último diag publicado (qualquer origem)
         self._diag_resposta_t: dict[str, float] = {}  # device_id → último reported.diag recebido
+        self._atividade_t: dict[str, float] = {}     # device_id → última mensagem MQTT dele (qualquer tipo)
+        self._ack_perdido: set[str] = set()          # devices com AVISO "sem ack, mas mandando dados" (até o ack voltar)
         self._reinicios: dict[str, _Reinicio] = {}   # device_id → reinício pelo relé (protegido por _trava_cmd)
         self._oee_lista_t: float | None = None       # último pedido da lista do cadastro OEE (None = pedir já)
 
@@ -1053,6 +1057,8 @@ class Pipeline:
                      device_topico=dev_dono, resposta=eh_ack)
         if eh_ack:
             res.device_id = dev_dono    # resposta no ack daquele device é dele, diga o payload o que disser
+        if not retida:
+            self._marcar_atividade((res.device_id, dev_dono, *(l.device_id for l in res.linhas)), t_receb)
         extra = " (retida)" if retida else ""
         if res.tipo == EVENTO:
             # evento não é leitura de contagem: não mexe no "Último envio" (dispositivo_visto)
@@ -1351,14 +1357,31 @@ class Pipeline:
 
     # -- diagnóstico do ciclo de apontamentos reais --------------------------------------------------------
 
-    def diagnosticar_dispositivos(self, devices: list[str], timeout: float) -> dict[str, bool | None]:
+    def _marcar_atividade(self, devices: Iterable[str | None], t_receb: float) -> None:
+        """Thread de processamento: o device mandou uma mensagem (leitura, evento, resposta…) recebida em
+        ``t_receb`` (relógio do pipeline). Usado pelo diagnóstico dos apontamentos (``JANELA_ATIVIDADE``)."""
+        for device in devices:
+            if device:
+                anterior = self._atividade_t.get(device)
+                if anterior is None or t_receb > anterior:
+                    self._atividade_t[device] = t_receb
+
+    def segundos_desde_atividade(self, device: str) -> float | None:
+        """Segundos desde a última mensagem MQTT (não retida) do device; None se nunca chegou nenhuma."""
+        t = self._atividade_t.get(device)
+        return None if t is None else max(0.0, self._relogio() - t)
+
+    def diagnosticar_dispositivos(self, devices: list[str], timeout: float) -> dict[str, bool | str | None]:
         """Bloqueante (chamado pela thread dos apontamentos): manda ``diag`` a cada device, com os tópicos efetivos
         dele, e espera as respostas em paralelo até ``timeout`` s.
 
-        Devolve ``{device: True}`` (respondeu), ``False`` (sem resposta) ou ``None`` (não deu para perguntar: MQTT
-        desconectado, device inválido ou falha ao publicar). Sem resposta: ``resposta_comando(device, "diag",
-        False, msg)`` a cada vez (coluna Diagnóstico da aba Clientes), mas AVISO e erro "comando" só 1 vez por
-        incidente de device mudo; o incidente fecha (INFO) quando ele volta a responder.
+        Devolve ``{device: True}`` (respondeu), ``DIAG_RECENTE`` (o ack não chegou, mas o device mandou qualquer
+        mensagem MQTT nos últimos ``JANELA_ATIVIDADE`` s: está na rede e conta como respondeu; o ack provavelmente
+        vai para um tópico que o integrador não ouve, ex. ``NOÏUS/...``; 1 AVISO até o ack voltar, sem erro),
+        ``False`` (sem resposta) ou ``None`` (não deu para perguntar: MQTT desconectado, device inválido ou falha ao
+        publicar). Sem resposta: ``resposta_comando(device, "diag", False, msg)`` a cada vez (coluna Diagnóstico da
+        aba Clientes), mas AVISO e erro "comando" só 1 vez por incidente de device mudo; o incidente fecha (INFO)
+        quando ele volta a responder (ack ou mensagem recente).
         """
         resultado: dict[str, bool | None] = {}
         cliente = self._cliente
@@ -1392,9 +1415,32 @@ class Pipeline:
             elif cmd.cancelado:
                 resultado[device] = None
             else:
-                resultado[device] = False
-                self._device_mudo(cmd, timeout)
+                idade = self.segundos_desde_atividade(cmd.device_id)
+                if idade is not None and idade <= self.JANELA_ATIVIDADE:
+                    resultado[device] = DIAG_RECENTE
+                    self._ack_ausente_mas_online(cmd, idade)
+                else:
+                    resultado[device] = False
+                    self._device_mudo(cmd, timeout)
         return resultado
+
+    def _ack_ausente_mas_online(self, cmd: _Comando, idade: float) -> None:
+        """O ack do diag não chegou, mas o device mandou mensagem há ``idade`` s: está na rede (não é 97 nem erro).
+        Fecha o incidente de device mudo, se havia; AVISO 1 vez até um ack voltar a chegar."""
+        with self._trava_cmd:
+            voltou = cmd.device_id in self._mudos
+            self._mudos.discard(cmd.device_id)
+            novo = cmd.device_id not in self._ack_perdido
+            self._ack_perdido.add(cmd.device_id)
+        if voltou:
+            self._log("INFO", f"Dispositivo {cmd.device_id} voltou a mandar mensagens (o diagnóstico continua sem "
+                              "confirmação).")
+        if novo:
+            self._log("AVISO", f"Diagnóstico de {cmd.device_id}: sem confirmação em '{cmd.topico_resposta}', mas o "
+                               f"aparelho mandou mensagem há {idade:.0f} s; considerado online (apontamentos reais "
+                               "sem 97). Confira o tópico de confirmação de comando (aba Clientes, \"Tópicos…\").")
+        else:
+            logger.info("Diagnóstico de %s sem confirmação, mas com mensagem há %.0f s", cmd.device_id, idade)
 
     def _esperar_diag_pendente(self, device: str) -> _Comando | None:
         """Se há um ``diag`` (automático/manual) pendente para o device enviado há menos de ``JANELA_DIAG`` s, não
@@ -1430,6 +1476,8 @@ class Pipeline:
             voltou = bool(device) and device in self._mudos
             if voltou:
                 self._mudos.discard(device)
+            if device:
+                self._ack_perdido.discard(device)
         for c in acordar:
             c.respondeu = True
             if c.evento is not None:
