@@ -430,6 +430,19 @@ Especificação completa em `docs/apontamentos_reais.md` (fonte da verdade; cód
   último sinal do OEE, endereço, tópico e máquina. Lidos a cada 1 min, se o OEE existir (sem OEE, nada muda).
 - **Diagnóstico a cada 1 min**: `[dispositivos] diagnostico_minutos = 1` (era 3), para todos os dispositivos.
 
+### Regra do 97 revista (decidido com o usuário em 13/11/2026 — substitui as regras anteriores de "sem leitura")
+
+- **97 Sem apontamento IOT só vem do diagnóstico**: ao fechar cada ciclo da aba Apontamentos reais, antes de gravar, o
+  integrador roda o diagnóstico dos aparelhos. Se o aparelho **não responde (sem rede)**, a parada em aberto daquela
+  máquina passa a ser apontada como **97** a partir desse momento (fora do turno continua 96). Um aparelho que mandou
+  qualquer mensagem MQTT há pouco (≤ 60 s) conta como respondendo, mesmo que o ack do `diag` se perca (ex.: tópico
+  `NOÏUS`).
+- **Falta de linhas na IOT001 sozinha não gera mais 97**: é tratada como máquina parada (o contador não aumentou):
+  **fora do turno → 96 Fora de turno**; **dentro do turno → 98 Parada sem motivo** (paradas curtas, entre micro e
+  macro, continuam 99). O intervalo entre produções não desconta mais os buracos sem leitura.
+- **Correção**: se depois chegarem linhas na IOT001 cobrindo um trecho 97 (dados retroativos do aparelho), o trecho é
+  refeito com a legenda correta (2/99/98/96), como já acontecia (até `dias_correcao` dias).
+
 ## Pendências conhecidas
 
 - Índice único `(device_id, ts_unix)` na IOT001 (opcional, decidir com o usuário).
