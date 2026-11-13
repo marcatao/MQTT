@@ -193,7 +193,9 @@ class PipelineBridge(QObject):
     erro_registrado = Signal(str)           # JSON de UM erro (ver "Erros detalhados"); 1 sinal para cada +1 no contador de erros
     canais_vistos = Signal(str, str)        # (device_id, JSON lista ["chd1","chd2","chd3"]) quando o conjunto de canais muda
     diagnostico_dispositivo = Signal(str, str)  # (device_id, JSON do objeto "diag" do DigiRail: sn, fw_v, curr/avg_rssi, mqtt_queue, ipv4...)
-    resposta_comando = Signal(str, str, bool, str)  # (device_id, comando "reset_counters"|"diag", sucesso, mensagem em português)
+    resposta_comando = Signal(str, str, bool, str)  # (device_id, comando "reset_counters"|"diag"|"reiniciar", sucesso, mensagem em português)
+    reinicio_etapa = Signal(str, str)       # (device_id, texto da etapa: "Relé acionado", "Aguardando o aparelho voltar…")
+    dispositivos_oee = Signal(str)          # JSON lista do cadastro OEE.dbo.dispositivos_iot (a cada 1 min, se o OEE existir)
     apontamentos_atualizados = Signal(str)  # JSON de cada ciclo dos apontamentos reais (formato em app/core/apontamentos_oee.py)
     recalculo_concluido = Signal(int, str, bool, str)  # (maquina_id, dia "AAAA-MM-DD", sucesso, mensagem em português)
 
@@ -205,6 +207,7 @@ class PipelineBridge(QObject):
     def encerrar(self, timeout: float = 5.0) -> None: ...  # ao fechar a janela: para, grava o último lote, desconecta
     def zerar_contadores(self, device_id: str, canais: list[int]) -> None: ...  # publica reset_counters; não bloqueia
     def pedir_diagnostico(self, device_id: str) -> None: ...                   # publica diag; não bloqueia
+    def reiniciar_dispositivo(self, device_id: str) -> None: ...  # pulso na saída digital do relé (v0.1.19); não bloqueia
     # Tópicos por dispositivo (v0.1.11): chaves "events", "config", "ack_config", "command", "ack_command"
     def topicos_do_dispositivo(self, device_id: str) -> dict[str, str]: ...    # efetivos: salvos ou padrão do modelo
     def salvar_topicos_dispositivo(self, device_id: str, topicos: dict[str, str]) -> None: ...  # grava e aplica já
@@ -406,6 +409,26 @@ Especificação completa em `docs/apontamentos_reais.md` (fonte da verdade; cód
 - Primeira execução: a partir de **hoje 00:00** (hora de Brasília); depois reconcilia de ontem 00:00 até agora.
 - Atualiza a máquina como o portal (`SituacaoMaquina`: situação, desde, legenda, OP) e o status das OPs afetadas
   (`StatusOrdemProducao`). Permissões em `sql/permissoes_oee.sql`.
+
+### Reiniciar pelo relé, clientes do OEE e diagnóstico de 1 min (decidido com o usuário em 13/11/2026)
+
+- **Hardware (manual p. 6 e 45)**: o DigiRail tem **6 entradas digitais** (chd1–chd6), 2 entradas analógicas e **2 saídas
+  digitais NPN** (`out1`, `out2`). Não se "envia sinal" para uma entrada; o integrador **liga a saída 1 (`out1`)**, que
+  aciona o relé ligado pelo usuário e corta brevemente a alimentação do próprio aparelho. O manual **não tem comando de
+  reiniciar** (nem MQTT nem Modbus).
+- **Comando** (manual 6.5.1 OUTPUT): no tópico de comando do device, QoS 1:
+  `{"timestamp": T, "desired": {"output": {"out1": 1}}}`; resposta em `ack/command` com `reported.output.error`.
+  `[reinicio] saida = 1` (1 ou 2), `pulso_segundos = 5`, `timeout_volta_segundos = 180`.
+- **Fluxo do botão Reiniciar** (aba Clientes, no fim de cada linha, com confirmação): publica `outN = 1` → etapa "Relé
+  acionado"; o aparelho perde a energia (normal não responder). Se em `pulso_segundos` o aparelho **continua online**
+  (respondeu o ack ou mandou dados), publica `outN = 0` e falha "A saída ligou mas o aparelho não reiniciou: confira a
+  ligação do relé". Se sumiu, etapa "Aguardando o aparelho voltar…"; quando ele voltar (primeira mensagem dele), o
+  integrador **publica `outN = 0` por segurança** e conclui com sucesso "Reiniciado: voltou em 42 s". Sem voltar em
+  `timeout_volta_segundos` → falha "Não voltou em 3 min" (erro categoria `comando`). Um reinício por device por vez.
+- **Clientes do OEE**: a aba Clientes continua mostrando os dispositivos ao vivo como hoje e **também lista os do
+  cadastro `OEE.dbo.dispositivos_iot`** (ativos) que não estão conectados, com status "Desconectado (cadastro OEE)",
+  último sinal do OEE, endereço, tópico e máquina. Lidos a cada 1 min, se o OEE existir (sem OEE, nada muda).
+- **Diagnóstico a cada 1 min**: `[dispositivos] diagnostico_minutos = 1` (era 3), para todos os dispositivos.
 
 ## Pendências conhecidas
 
