@@ -16,7 +16,8 @@ O objetivo é dizer **se a máquina trabalhou ou parou**. Depois, o operador vai
 - `OEE.dbo.legendas`: `id`, `codigo` (varchar 12), `descricao`, `tipo` (`produzindo` | `parada` | `planejada` |
   `desligada`), `ativo`. Usadas pelo integrador: **`'2'` Produção Normal**, **`'99'` Microparada**, **`'98'` Macro
   parada** (já cadastradas no portal; se faltar alguma, o ciclo não aponta e avisa no log); **`'97'` Sem
-  apontamento IOT** para os períodos sem leitura (ver abaixo).
+  apontamento IOT** para os períodos sem leitura (ver abaixo); **`'96'` Fora de turno** para parada fora do horário
+  de trabalho.
 - `OEE.dbo.apontamentos_estado`: `id` (identity), `maquina_id`, `legenda_id`, `ordem_producao_id` (NULL ok),
   `inicio` (datetime, UTC), `fim` (NULL = ainda neste estado; CHECK `fim IS NULL OR fim > inicio`), `referencia`
   (40), `observacao` (500), `criado_em`, `criado_por_id`, `atualizado_em`, `atualizado_por_id` (usuários; o integrador
@@ -64,6 +65,49 @@ apontamento em aberto vira 99 quando passa da micro e 98 quando passa da macro (
   às 00:00 local do dia dele (em vez de ontem/hoje). Sem leitura nova, a janela não muda (não relê 7 dias à toa).
 - Legenda 97 ausente no portal: AVISO (1 vez até resolver) e os trechos sem leitura voltam a ser tratados como antes
   (sem leitura = sem produção → 99/98), para não parar a timeline.
+
+## Fora de turno: 96 (decidido em 13/11/2026)
+
+A máquina tem no portal um **calendário** e um **horário de trabalho**:
+
+- `maquinas.calendario_id` → `calendarios` (`id`, `ano`, `ativo`) e `calendario_dias` (`calendario_id`, `data` date,
+  `tipo`: `feriado` | `ponte` | `folga` = não útil; `compensacao` | `util` = útil). Padrão: dia útil se o dia da
+  semana está nos dias de trabalho da máquina; uma exceção em `calendario_dias` para a data **manda no dia**
+  (regra do portal em `App\Services\Calendario\DiasUteis::trabalha`). Sem calendário: só pelos dias da semana.
+- `maquinas.horarios_semana` (varchar 200, JSON `{"1":["05:00","14:48"],…}`, dia ISO 1 = segunda … 7 = domingo,
+  HH:MM local; fim antes do início = vira o dia). Sem `horarios_semana` (ou coluna ausente): `dias_semana`
+  (ex.: `"12345"`) + `jornada_inicio`/`jornada_fim` para todos esses dias (regra de `App\Support\JornadaSemanal::de`).
+  Dia útil por exceção (compensação/dia útil extra) que não tem horário próprio usa `jornada_inicio`/`jornada_fim`
+  (ou o horário do primeiro dia de trabalho).
+- **Dentro do turno** = dentro de `[início, fim)` de um dia de trabalho útil pelo calendário (o turno pertence ao dia
+  em que começa; turno que vira o dia termina no dia seguinte).
+
+Regra: todo trecho **parado** (98, 99 e 97) que cair **fora do turno** vira **96 Fora de turno**; dentro do turno
+continua como está. Produção (2) fora do turno continua 2. Os trechos são cortados nas bordas do turno. Exemplo do
+usuário: turno começa 05:00, máquina parada das 00:00 às 05:22 e depois produzindo → **96** 00:00–04:59:59, **98**
+05:00–05:22, depois **2**. A classificação 99/98 continua pelo intervalo inteiro da parada (só a parte dentro do turno
+fica 99/98).
+
+- Máquina sem horário de trabalho cadastrado: não há 96 (tudo como antes) e a tela mostra "sem jornada".
+- Legenda 96 ausente no portal: AVISO (1 vez até resolver) e segue sem 96.
+- Código em `[apontamentos] legenda_fora_turno = "96"`. Situação da máquina com 96 = parada.
+
+## Diagnóstico antes de apontar: 97 se o aparelho não responde (decidido em 13/11/2026)
+
+Antes de calcular os apontamentos, o ciclo manda o **diagnóstico** (`diag`, o mesmo da aba Clientes) a cada
+dispositivo das máquinas elegíveis e espera as respostas (até `[dispositivos] timeout_comando_segundos`, 15 s, todos
+em paralelo). Se um dispositivo **não responde**, a parada **em aberto** (o último trecho, da última produção até
+agora) das máquinas dele vira **97 Sem apontamento IOT** (fora do turno continua 96). Quando ele voltar a responder,
+o trecho volta a ser calculado normalmente (reconciliação). Sem MQTT conectado não há como perguntar: o ciclo segue
+sem essa regra (aviso na linha da máquina). Diagnóstico que responde não muda nada. Atenção: o tópico de confirmação
+precisa estar certo na aba Clientes ("Tópicos…"), senão o aparelho parece não responder.
+
+## Recalcular o dia de uma máquina (decidido em 13/11/2026)
+
+Na aba, cada máquina tem o botão **Recalcular…**: escolhe o dia (de hoje até `dias_correcao` dias atrás), mostra a
+confirmação "Os apontamentos MANUAIS desta máquina a partir de dd/mm serão apagados e a timeline será refeita pelo
+IoT" e, confirmado, o integrador refaz a máquina desde 00:00 local daquele dia até agora (mesma reconciliação, com
+`ini` = esse dia), sem esperar o ciclo. Resposta no sinal `recalculo_concluido` e no log.
 
 ## Apontamentos únicos e encadeados (regras do portal, `HorarioApontamento`)
 

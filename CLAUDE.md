@@ -195,6 +195,7 @@ class PipelineBridge(QObject):
     diagnostico_dispositivo = Signal(str, str)  # (device_id, JSON do objeto "diag" do DigiRail: sn, fw_v, curr/avg_rssi, mqtt_queue, ipv4...)
     resposta_comando = Signal(str, str, bool, str)  # (device_id, comando "reset_counters"|"diag", sucesso, mensagem em português)
     apontamentos_atualizados = Signal(str)  # JSON de cada ciclo dos apontamentos reais (formato em app/core/apontamentos_oee.py)
+    recalculo_concluido = Signal(int, str, bool, str)  # (maquina_id, dia "AAAA-MM-DD", sucesso, mensagem em português)
 
     def __init__(self, config: Config, parent=None): ...
     def definir_sql(self, sql: SqlServerConfig) -> None: ...   # a GUI chama antes de conectar e quando o usuário altera
@@ -212,6 +213,7 @@ class PipelineBridge(QObject):
     def topico_coberto(self, topico: str) -> bool: ...  # o integrador recebe mensagens desse tópico?
     def definir_periodicidade_apontamentos(self, minutos: float) -> None: ...  # apontamentos reais; não bloqueia
     def executar_apontamentos_agora(self) -> None: ...                       # não bloqueia
+    def recalcular_dia_apontamentos(self, maquina_id: int, dia: str) -> None: ...  # dia "AAAA-MM-DD"; não bloqueia
 ```
 
 Os sinais são emitidos de outras threads; o Qt entrega na thread da GUI (conexão enfileirada). A GUI só usa isso.
@@ -394,6 +396,13 @@ Especificação completa em `docs/apontamentos_reais.md` (fonte da verdade; cód
 - **Sem leitura do aparelho** (desligado/fora da rede, nenhuma linha na IOT001 por mais de 120 s): legenda **97 Sem
   apontamento IOT** (decidido em 12/11/2026). O intervalo entre produções conta só o tempo com leitura. Se o aparelho
   voltar e mandar dados retroativos para a IOT001, o trecho 97 é **corrigido** com os dados reais (até 7 dias atrás).
+- **Fora de turno** (13/11/2026): pelo calendário (`calendarios`/`calendario_dias`) e horário de trabalho da máquina
+  (`horarios_semana` ou `dias_semana` + `jornada_*`), parada (98/99/97) fora do turno vira **96 Fora de turno**; dentro
+  continua 98. Ex.: turno 05:00, parada 00:00–05:22 → 96 00:00–04:59:59 + 98 05:00–05:22.
+- **Diagnóstico antes de apontar** (13/11/2026): cada ciclo manda `diag` aos dispositivos; sem resposta, a parada em
+  aberto da máquina vira **97**.
+- **Recalcular** (13/11/2026): botão por máquina na aba, refaz a timeline desde o dia escolhido (até 7 dias), avisando
+  que os apontamentos manuais desse período serão apagados.
 - Primeira execução: a partir de **hoje 00:00** (hora de Brasília); depois reconcilia de ontem 00:00 até agora.
 - Atualiza a máquina como o portal (`SituacaoMaquina`: situação, desde, legenda, OP) e o status das OPs afetadas
   (`StatusOrdemProducao`). Permissões em `sql/permissoes_oee.sql`.
