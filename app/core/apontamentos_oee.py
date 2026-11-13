@@ -12,6 +12,21 @@ Especificação: ``docs/apontamentos_reais.md`` (fonte da verdade). Resumo:
   vira 97 Sem apontamento IOT e o intervalo entre produções desconta esse tempo. Leituras que chegam depois dentro de
   um 97 do integrador (até ``dias_correcao`` dias) fazem a janela recomeçar no dia dele (correção retroativa). Sem a
   legenda 97 no portal: AVISO e tudo como antes (2/99/98).
+- **Fora de turno**: pela jornada da máquina (``horarios_semana`` ou ``dias_semana`` + ``jornada_*``) e as exceções
+  do calendário (``calendario_dias``), as paradas (99/98/97) fora do turno viram 96; produção continua 2. Sem
+  jornada, colunas/tabelas ou legenda 96: sem 96 (legenda ausente = 1 AVISO).
+- **Diagnóstico**: antes de apontar, o ciclo pergunta aos devices (callback ``diagnosticar`` do pipeline); quem não
+  responde tem a parada em aberto (99/98, da última produção até agora) apontada como 97 (fora do turno, 96).
+- **Recalcular** (``recalcular``): refaz uma máquina desde 00:00 local de um dia (até ``dias_correcao`` atrás), na
+  thread do ciclo; responde em ``ao_recalculo`` e reemite o último resultado com a linha dela atualizada.
+
+JSON de cada ciclo (``ao_resultado``)::
+
+    {"quando", "proxima" (ISO local | null), "minutos", "ok", "mensagem", "criados", "alterados", "excluidos",
+     "maquinas": [{"maquina_id", "codigo", "nome", "canais", "micro_s", "macro_s", "legenda", "legenda_descricao",
+                   "desde", "ultima_producao", "apontamentos_hoje", "ultima_leitura", "aviso",
+                   "diag": "ok" | "sem resposta" | "sem MQTT" | null, "turno": "dentro" | "fora" | "sem jornada",
+                   "jornada": "Seg–Qui 05:00–14:48, Sex 05:00–13:48" | null}]}
 - Trechos iguais seguidos = um apontamento; nenhum passa da meia-noite local (``[apontamentos] fuso``); encadeados
   (``fim = próximo início − 1 s``); trecho < 2 s é absorvido; o último fica em aberto (``fim`` NULL).
 - Reconciliação por máquina, numa transação: os do integrador (``observacao`` começando por ``[IoT]``) são
@@ -48,9 +63,13 @@ logger = logging.getLogger("app.core.apontamentos")
 Logar = Callable[[str, str], None]
 AoErro = Callable[[str, str | None], None]          # (mensagem, detalhe)
 AoResultado = Callable[[str], None]                 # JSON do ciclo
+AoRecalculo = Callable[[int, str, bool, str], None]  # (maquina_id, dia, sucesso, mensagem)
+# (devices, timeout) → {device: True respondeu | False sem resposta | None não deu para perguntar (sem MQTT)}
+Diagnosticar = Callable[[list, float], dict]
 Relogio = Callable[[], float]
 
-PRODUZINDO, MICRO, MACRO, SEM_IOT = "produzindo", "micro", "macro", "sem_iot"
+PRODUZINDO, MICRO, MACRO, SEM_IOT, FORA_TURNO = "produzindo", "micro", "macro", "sem_iot", "fora_turno"
+PARADAS_TURNO = (MICRO, MACRO, SEM_IOT)     # paradas que viram 96 fora do turno (produção continua 2)
 MARCA = "[IoT]"
 OBSERVACAO = "[IoT] Apontamento automático do integrador MQTT"
 CANAIS = tuple(f"chd{n}_value" for n in range(1, 7))
@@ -209,6 +228,192 @@ def segmentos_continuos(prods: Iterable[int], ini: int, agora: int, micro: int, 
     return [(a, b, e) for a, b, e in mesclados]
 
 
+# ---------------------------------------------------------------------------- turno (calendário + jornada)
+
+DIAS_CURTOS = {1: "Seg", 2: "Ter", 3: "Qua", 4: "Qui", 5: "Sex", 6: "Sáb", 7: "Dom"}
+TIPOS_UTEIS = {"compensacao": True, "util": True, "feriado": False, "ponte": False, "folga": False}
+
+
+def _hora_valida(texto: Any) -> str | None:
+    t = str(texto or "").strip()[:5]
+    try:
+        h, m = int(t[:2]), int(t[3:5])
+    except ValueError:
+        return None
+    if len(t) != 5 or t[2] != ":" or not (0 <= h <= 23 and 0 <= m <= 59):
+        return None
+    return t
+
+
+def jornada_de(horarios_semana: Any, dias_semana: Any, jornada_inicio: Any, jornada_fim: Any
+               ) -> dict[int, tuple[str, str]]:
+    """``JornadaSemanal::de`` do portal: dia ISO (1 = segunda … 7 = domingo) → (início, fim) "HH:MM" local.
+
+    ``horarios_semana`` (JSON ``{"1": ["05:00", "14:48"], …}``) manda quando existe; senão ``dias_semana``
+    ("12345") + ``jornada_inicio``/``jornada_fim`` para todos esses dias. Horário inválido ou início = fim é ignorado.
+    """
+    horarios: dict[int, tuple[str, str]] = {}
+    lido = None
+    if isinstance(horarios_semana, str) and horarios_semana.strip():
+        try:
+            lido = json.loads(horarios_semana)
+        except ValueError:
+            lido = None
+    if isinstance(lido, dict):
+        for dia, h in lido.items():
+            try:
+                n = int(dia)
+            except (TypeError, ValueError):
+                continue
+            if n in DIAS_CURTOS and isinstance(h, (list, tuple)) and len(h) >= 2:
+                ini, fim = _hora_valida(h[0]), _hora_valida(h[1])
+                if ini and fim and ini != fim:
+                    horarios[n] = (ini, fim)
+        return dict(sorted(horarios.items()))
+    ini, fim = _hora_valida(jornada_inicio), _hora_valida(jornada_fim)
+    if not ini or not fim or ini == fim:
+        return {}
+    for c in str(dias_semana or ""):
+        if c.isdigit() and int(c) in DIAS_CURTOS:
+            horarios[int(c)] = (ini, fim)
+    return dict(sorted(horarios.items()))
+
+
+def texto_jornada(horarios: dict[int, tuple[str, str]]) -> str | None:
+    """Resumo como no portal (``JornadaSemanal::texto``), separado por vírgula: dias seguidos com o mesmo horário
+    ficam juntos ("Seg–Qui 05:00–14:48, Sex 05:00–13:48"). Sem jornada: None."""
+    grupos: list[list] = []
+    for dia, h in sorted(horarios.items()):
+        if grupos and grupos[-1][2] == h and grupos[-1][1] == dia - 1:
+            grupos[-1][1] = dia
+        else:
+            grupos.append([dia, dia, h])
+    partes = [f"{DIAS_CURTOS[de]}{'' if ate == de else '–' + DIAS_CURTOS[ate]} {h[0]}–{h[1]}"
+              for de, ate, h in grupos]
+    return ", ".join(partes) or None
+
+
+@dataclass(frozen=True)
+class Jornada:
+    """Horário de trabalho da máquina + exceções do calendário (``DiasUteis::trabalha`` do portal)."""
+    horarios: dict[int, tuple[str, str]]
+    dias_semana: str = ""                       # dias de trabalho (padrão: os dias com horário; senão "12345")
+    padrao: tuple[str, str] | None = None       # horário de dia útil por exceção sem horário próprio
+    excecoes: dict[date, bool] = field(default_factory=dict)   # data → útil? (só com calendário)
+
+    @property
+    def vazia(self) -> bool:
+        return not self.horarios
+
+    def trabalha(self, dia: date) -> bool:
+        if dia in self.excecoes:
+            return self.excecoes[dia]
+        dias = self.dias_semana or "".join(str(d) for d in self.horarios) or "12345"
+        return str(dia.isoweekday()) in dias
+
+    def horario(self, dia: date) -> tuple[str, str] | None:
+        return self.horarios.get(dia.isoweekday()) or self.padrao or next(iter(self.horarios.values()), None)
+
+
+def montar_jornada(horarios_semana: Any, dias_semana: Any, jornada_inicio: Any, jornada_fim: Any,
+                   excecoes: dict[date, bool] | None = None) -> Jornada:
+    horarios = jornada_de(horarios_semana, dias_semana, jornada_inicio, jornada_fim)
+    ini, fim = _hora_valida(jornada_inicio), _hora_valida(jornada_fim)
+    padrao = (ini, fim) if ini and fim and ini != fim else None
+    dias = "".join(c for c in str(dias_semana or "") if c.isdigit())
+    return Jornada(horarios, dias, padrao, dict(excecoes or {}))
+
+
+def _instante(dia: date, hhmm: str, fuso: tzinfo) -> int:
+    return int(datetime(dia.year, dia.month, dia.day, int(hhmm[:2]), int(hhmm[3:5]), tzinfo=fuso).timestamp())
+
+
+def intervalos_turno(jornada: Jornada, ini: int, agora: int, fuso: tzinfo) -> list[tuple[int, int]]:
+    """Turnos ``[início, fim)`` (epoch) que cruzam ``[ini, agora]``, sem cortar nas bordas da janela.
+
+    O turno pertence ao dia em que começa (útil pelo calendário); fim antes do início = termina no dia seguinte.
+    Sem jornada: lista vazia.
+    """
+    if jornada.vazia:
+        return []
+    saida: list[tuple[int, int]] = []
+    dia = dia_local(ini, fuso) - timedelta(days=1)       # turno de ontem que vira o dia
+    ultimo = dia_local(agora, fuso)
+    while dia <= ultimo:
+        h = jornada.horario(dia) if jornada.trabalha(dia) else None
+        if h is not None:
+            a = _instante(dia, h[0], fuso)
+            b = _instante(dia + timedelta(days=1) if h[1] <= h[0] else dia, h[1], fuso)
+            if b > ini and a <= agora:
+                saida.append((a, b))
+        dia += timedelta(days=1)
+    mesclados: list[list[int]] = []
+    for a, b in sorted(saida):
+        if mesclados and a <= mesclados[-1][1]:
+            mesclados[-1][1] = max(mesclados[-1][1], b)
+        else:
+            mesclados.append([a, b])
+    return [(a, b) for a, b in mesclados]
+
+
+def dentro_do_turno(t: int, turnos: list[tuple[int, int]]) -> bool:
+    return any(a <= t < b for a, b in turnos)
+
+
+def recortar_fora_turno(segmentos: list[tuple[int, int, str]], turnos: list[tuple[int, int]]
+                        ) -> list[tuple[int, int, str]]:
+    """Paradas (99/98/97) fora do turno viram ``FORA_TURNO``, cortadas nas bordas do turno; produção fica como
+    está. A classificação 99/98 já veio do intervalo inteiro. O trecho de duração zero (em aberto em ``agora``)
+    segue o instante dele. Mescla vizinhos iguais no fim."""
+    saida: list[list] = []
+    for a, b, estado in segmentos:
+        if estado not in PARADAS_TURNO:
+            saida.append([a, b, estado])
+            continue
+        if a == b:
+            saida.append([a, b, estado if dentro_do_turno(a, turnos) else FORA_TURNO])
+            continue
+        cursor = a
+        for ta, tb in turnos:
+            if tb <= cursor or ta >= b:
+                continue
+            s, e = max(ta, cursor), min(tb, b)
+            if s > cursor:
+                saida.append([cursor, s, FORA_TURNO])
+            saida.append([s, e, estado])
+            cursor = e
+        if cursor < b:
+            saida.append([cursor, b, FORA_TURNO])
+    mesclados: list[list] = []
+    for seg in saida:
+        if mesclados and mesclados[-1][2] == seg[2] and mesclados[-1][1] == seg[0]:
+            mesclados[-1][1] = seg[1]
+        else:
+            mesclados.append(seg)
+    return [(a, b, e) for a, b, e in mesclados]
+
+
+def marcar_sem_resposta(segmentos: list[tuple[int, int, str]], prods: Iterable[int], ini: int
+                        ) -> list[tuple[int, int, str]]:
+    """Aparelho não respondeu ao diagnóstico: a parada em aberto (da última produção até agora; sem produção na
+    janela, desde ``ini``) que for 99/98 vira 97. Produção e os outros estados ficam como estão."""
+    if not segmentos:
+        return segmentos
+    fim = segmentos[-1][1]
+    ultimas = [int(p) for p in prods if ini <= int(p) <= fim]
+    desde = max(ultimas) if ultimas else ini
+    if segmentos[-1][2] == PRODUZINDO:
+        return segmentos         # está produzindo: não há parada em aberto
+    saida = [(a, b, SEM_IOT if a >= desde and e in (MICRO, MACRO) else e) for a, b, e in segmentos]
+    mesclados: list[list] = []
+    for a, b, e in saida:
+        if mesclados and mesclados[-1][2] == e and mesclados[-1][1] == a:
+            mesclados[-1][1] = b
+        else:
+            mesclados.append([a, b, e])
+    return [(a, b, e) for a, b, e in mesclados]
+
+
 @dataclass(frozen=True)
 class Trecho:
     """Apontamento desejado: ``fim`` inclusivo (= próximo início − 1 s) ou ``None`` (em aberto)."""
@@ -280,19 +485,25 @@ class LegendasIot:
     micro: int
     macro: int
     sem_iot: int | None = None      # None: legenda 97 ausente; o estado SEM_IOT não é gerado
+    fora_turno: int | None = None   # None: legenda 96 ausente; o estado FORA_TURNO não é gerado
 
     def de(self, estado: str) -> int:
         if estado == SEM_IOT:
             if self.sem_iot is None:
                 raise ValueError("legenda de sem leitura (97) ausente")
             return self.sem_iot
+        if estado == FORA_TURNO:
+            if self.fora_turno is None:
+                raise ValueError("legenda de fora de turno (96) ausente")
+            return self.fora_turno
         return {PRODUZINDO: self.produzindo, MICRO: self.micro, MACRO: self.macro}[estado]
 
     @property
     def todas(self) -> set[int]:
         ids = {self.produzindo, self.micro, self.macro}
-        if self.sem_iot is not None:
-            ids.add(self.sem_iot)
+        for opcional in (self.sem_iot, self.fora_turno):
+            if opcional is not None:
+                ids.add(opcional)
         return ids
 
 
@@ -475,6 +686,7 @@ def sql_permissoes_oee(banco: str) -> str:
     return f"EXEC [{sql_conexao.validar_banco(banco)}].sys.sp_executesql N'SELECT {itens}'"
 
 
+COLUNAS_JORNADA = ("calendario_id", "horarios_semana", "dias_semana", "jornada_inicio", "jornada_fim")
 SQL_PERM_IOT = ("EXEC {banco}.sys.sp_executesql N'SELECT HAS_PERMS_BY_NAME(@obj, N''OBJECT'', N''SELECT'')', "
                 "N'@obj nvarchar(400)', @obj = ?")
 
@@ -488,6 +700,8 @@ class Esquema:
     maquinas_atualizado_em: bool
     op_status_em: bool
     apont_atualizado_por: bool = False
+    jornada_cols: frozenset = frozenset()     # colunas de jornada/calendário existentes em maquinas
+    calendario_dias: bool = False             # [banco].[dbo].[calendario_dias] legível (exceções do calendário)
 
 
 def detectar(cursor, oee: OeeConfig, sql: SqlServerConfig) -> tuple[Esquema | None, str]:
@@ -521,9 +735,21 @@ def detectar(cursor, oee: OeeConfig, sql: SqlServerConfig) -> tuple[Esquema | No
     col_iot = sql_conexao.colunas_da_tabela(cursor, schema_iot, tabela_iot, banco=banco_iot)
     if not {"device_id", "ts_unix"} <= col_iot:
         return None, f"tabela {banco_iot}.{schema_iot}.{tabela_iot} inexistente ou sem device_id/ts_unix"
+    # fora de turno (96): colunas de jornada e o calendário são opcionais (sem eles, não há 96)
+    jornada_cols = frozenset(COLUNAS_JORNADA) & colunas["maquinas"]
+    calendario = False
+    t["calendario_dias"] = f"[{banco}].[dbo].[calendario_dias]"
+    if "calendario_id" in jornada_cols:
+        cursor.execute("SELECT OBJECT_ID(?, 'U')", t["calendario_dias"])
+        if cursor.fetchone()[0] is not None:
+            cursor.execute(SQL_PERM_IOT.format(banco=f"[{banco}]"), "[dbo].[calendario_dias]")
+            if cursor.fetchone()[0] == 1:
+                cols_cal = sql_conexao.colunas_da_tabela(cursor, "dbo", "calendario_dias", banco=banco)
+                calendario = {"calendario_id", "data", "tipo"} <= cols_cal
     return Esquema(t=t, iot=iot, canais_iot={c for c in CANAIS if c in col_iot},
                    maquinas_atualizado_em="atualizado_em" in colunas["maquinas"],
-                   op_status_em="status_em" in colunas["ordens_producao"]), ""
+                   op_status_em="status_em" in colunas["ordens_producao"],
+                   jornada_cols=jornada_cols, calendario_dias=calendario), ""
 
 
 def sql_maquinas(e: Esquema) -> str:
@@ -531,8 +757,9 @@ def sql_maquinas(e: Esquema) -> str:
     joins = " ".join(f"LEFT JOIN {e.t['dispositivos_iot']} d{n} ON d{n}.[id] = m.[iot{n}_dispositivo_id]"
                      for n in SLOTS)
     algum = " OR ".join(f"m.[iot{n}_dispositivo_id] IS NOT NULL" for n in SLOTS)
+    jornada = ", ".join(f"m.[{c}]" if c in e.jornada_cols else "NULL" for c in COLUNAS_JORNADA)
     return (f"SELECT m.[id], m.[codigo], m.[nome], m.[micro_parada_s], m.[macro_parada_s], m.[situacao], "
-            f"m.[situacao_desde], m.[situacao_legenda_id], m.[ordem_producao_id], {sel} "
+            f"m.[situacao_desde], m.[situacao_legenda_id], m.[ordem_producao_id], {sel}, {jornada} "
             f"FROM {e.t['maquinas']} m {joins} "
             f"WHERE m.[ativo] = 1 AND m.[d_e_l_e_t_] <> '*' AND ({algum}) ORDER BY m.[nome], m.[id]")
 
@@ -549,6 +776,11 @@ class Maquina:
     situacao_legenda_id: int | None
     ordem_producao_id: int | None
     canais: list[tuple[str, str]]          # (device_id, chdN_value), sem repetição
+    calendario_id: int | None = None
+    horarios_semana: str | None = None
+    dias_semana: str | None = None
+    jornada_inicio: str | None = None
+    jornada_fim: str | None = None
 
 
 def maquina_da_linha(linha) -> Maquina:
@@ -567,7 +799,20 @@ def maquina_da_linha(linha) -> Maquina:
     return Maquina(id=int(linha[0]), codigo=str(linha[1] or ""), nome=str(linha[2] or ""),
                    micro=inteiro(linha[3]), macro=inteiro(linha[4]), situacao=linha[5],
                    situacao_desde=epoch_de(linha[6]), situacao_legenda_id=inteiro(linha[7]),
-                   ordem_producao_id=inteiro(linha[8]), canais=canais)
+                   ordem_producao_id=inteiro(linha[8]), canais=canais,
+                   **dict(zip(("calendario_id", "horarios_semana", "dias_semana", "jornada_inicio", "jornada_fim"),
+                              _jornada_da_linha(linha))))
+
+
+def _jornada_da_linha(linha) -> tuple:
+    extra = list(linha[9 + 4 * len(SLOTS): 9 + 4 * len(SLOTS) + len(COLUNAS_JORNADA)])
+    extra += [None] * (len(COLUNAS_JORNADA) - len(extra))
+    cal = extra[0]
+    try:
+        cal = None if cal is None else int(cal)
+    except (TypeError, ValueError):
+        cal = None
+    return (cal, *(None if v is None else str(v) for v in extra[1:]))
 
 
 @dataclass
@@ -591,7 +836,9 @@ class ApontamentosOee:
 
     def __init__(self, sql: SqlServerConfig | None, oee_cfg: OeeConfig | None, apont_cfg: ApontamentosConfig | None,
                  logar: Logar = _sem_log, ao_erro: AoErro = _nada, ao_resultado: AoResultado = _nada,
-                 relogio: Relogio = time.time, conectar: Callable[[SqlServerConfig], object] | None = None) -> None:
+                 relogio: Relogio = time.time, conectar: Callable[[SqlServerConfig], object] | None = None,
+                 diagnosticar: Diagnosticar | None = None, timeout_diag: float = 15.0,
+                 ao_recalculo: AoRecalculo = _nada) -> None:
         self._sql = replace(sql) if sql is not None else None
         self._oee = replace(oee_cfg) if oee_cfg is not None else OeeConfig()
         self._cfg = replace(apont_cfg) if apont_cfg is not None else ApontamentosConfig()
@@ -600,6 +847,11 @@ class ApontamentosOee:
         self._ao_resultado = ao_resultado
         self._relogio = relogio
         self._conectar = conectar
+        self._diagnosticar = diagnosticar
+        self._timeout_diag = float(timeout_diag) if timeout_diag and timeout_diag > 0 else 15.0
+        self._ao_recalculo = ao_recalculo
+        self._recalculos: list[tuple[int, str, int]] = []   # (maquina_id, dia, epoch 00:00 local) na fila
+        self._ultimo_resultado: dict | None = None
         self._fuso = fuso_de(self._cfg.fuso)
         self._minutos = self._normalizar_minutos(self._cfg.minutos)
         self._trava = threading.Lock()
@@ -616,6 +868,7 @@ class ApontamentosOee:
         self._infos: set[tuple] = set()             # INFO "portal não encontrado" já dado (até funcionar)
         self._aviso_legendas = False
         self._aviso_sem_iot = False                 # AVISO da legenda 97 ausente já dado (até resolver)
+        self._aviso_fora_turno = False              # AVISO da legenda 96 ausente já dado (até resolver)
         self._sem_parametros: set[int] = set()      # máquinas sem micro/macro já avisadas (sessão)
         self._erro_conexao = False                  # incidente de conexão aberto (1 erro por incidente)
         self._trocou_sql = False                    # definir_sql: a próxima execução reconecta
@@ -696,6 +949,11 @@ class ApontamentosOee:
     def _loop(self) -> None:
         while not self._parado:
             with self._trava:
+                recalculo = self._recalculos.pop(0) if self._recalculos else None
+            if recalculo is not None:
+                self.executar_recalculo(*recalculo)
+                continue
+            with self._trava:
                 agora = self._relogio()
                 devido = self._pedido or (self._sql_ativo() and self._proxima is not None
                                           and agora >= self._proxima)
@@ -731,6 +989,7 @@ class ApontamentosOee:
             resultado["quando"] = iso_local(inicio)
             resultado["proxima"] = iso_local(proxima)
             resultado["minutos"] = self._minutos
+            self._ultimo_resultado = resultado
             self._emitir(resultado)
             return resultado
 
@@ -744,14 +1003,13 @@ class ApontamentosOee:
         except Exception:  # noqa: BLE001
             logger.exception("Falha no callback de resultado dos apontamentos")
 
-    def _ciclo(self, inicio: float) -> dict:
+    def _preparar(self) -> tuple[dict | None, tuple | None]:
+        """Conexão, detecção, legendas e máquinas. (resultado de falha, None) ou (None, (legendas, todas, máquinas))."""
         if not self._cfg.habilitado:
-            return self._resultado_vazio(False, "Apontamentos reais desligados no config.toml.")
+            return self._resultado_vazio(False, "Apontamentos reais desligados no config.toml."), None
         if not self._sql_ativo():
             return self._resultado_vazio(False, "SQL Server não configurado (falta a senha): apontamentos reais "
-                                                "parados.")
-        agora = int(inicio)
-        # conexão + detecção
+                                                "parados."), None
         try:
             if self._conexao is None:
                 self._conexao = (self._conectar or sql_conexao.conectar)(self._sql)
@@ -762,42 +1020,137 @@ class ApontamentosOee:
                     self._fechar_conexao()
                     self._info_portal_ausente(motivo)
                     return self._resultado_vazio(False, f"Portal OEE não disponível para os apontamentos reais: "
-                                                        f"{motivo}.")
+                                                        f"{motivo}."), None
                 self._esquema = esquema
             legendas, todas = self._ler_legendas()
             if legendas is None:
-                return self._resultado_vazio(False, todas)
+                return self._resultado_vazio(False, todas), None
             maquinas = self._ler_maquinas()
         except Exception as exc:  # noqa: BLE001
             self._rollback()
             self._fechar_conexao()
-            return self._falha_geral(exc)
+            return self._falha_geral(exc), None
         self._infos.clear()
         self._erro_conexao = False
+        return None, (legendas, todas, maquinas)
 
+    def _elegivel(self, m: Maquina, linha: dict) -> bool:
+        """Tem canal e micro/macro válidos? Sem micro/macro: aviso na linha e 1 INFO por sessão."""
+        if not m.canais:
+            return False
+        if not m.micro or not m.macro or m.micro <= 0 or m.macro <= m.micro:
+            linha["aviso"] = "Micro/macro parada não cadastrados (ou macro ≤ micro): máquina ignorada."
+            if m.id not in self._sem_parametros:
+                self._sem_parametros.add(m.id)
+                self._logar("INFO", f"Apontamentos reais: máquina {self._nome(m)} sem micro/macro parada "
+                                    "válidos no portal OEE; ignorada.")
+            return False
+        return True
+
+    def _diagnostico(self, maquinas: list[Maquina]) -> dict[str, bool | None]:
+        """Diag de todos os devices das máquinas (em paralelo, pelo pipeline). Sem callback: {}."""
+        if self._diagnosticar is None or not maquinas:
+            return {}
+        devices = list(dict.fromkeys(d for m in maquinas for d, _c in m.canais))
+        try:
+            resposta = self._diagnosticar(devices, self._timeout_diag) or {}
+        except Exception:  # noqa: BLE001 - sem diagnóstico, segue sem a regra
+            logger.exception("Falha no diagnóstico dos dispositivos (apontamentos)")
+            resposta = {}
+        return {d: resposta.get(d) for d in devices}
+
+    def _estado_diag(self, m: Maquina, diag: dict[str, bool | None]) -> str | None:
+        if self._diagnosticar is None:
+            return None
+        valores = [diag.get(d) for d, _c in dict.fromkeys(m.canais)]
+        if any(v is False for v in valores):
+            return "sem resposta"
+        if all(v is None for v in valores):
+            return "sem MQTT"
+        return "ok"
+
+    def _jornada(self, m: Maquina, excecoes: dict[int, dict[date, bool]]) -> Jornada:
+        return montar_jornada(m.horarios_semana, m.dias_semana, m.jornada_inicio, m.jornada_fim,
+                              excecoes.get(m.calendario_id, {}) if m.calendario_id is not None else {})
+
+    def _ler_excecoes(self, maquinas: list[Maquina], agora: int) -> dict[int, dict[date, bool]]:
+        """Exceções de ``calendario_dias`` dos calendários das máquinas, de ``dias_correcao`` + 2 dias atrás até
+        amanhã. Sem a tabela (ou erro que não seja de conexão): {} (só os dias da semana)."""
+        e = self._esquema
+        ids = sorted({m.calendario_id for m in maquinas if m.calendario_id is not None})
+        if not ids or e is None or not e.calendario_dias:
+            return {}
+        hoje = dia_local(agora, self._fuso)
+        de = hoje - timedelta(days=max(0, int(self._cfg.dias_correcao or 0)) + 2)
+        ate = hoje + timedelta(days=1)
+        saida: dict[int, dict[date, bool]] = {}
+        cursor = self._conexao.cursor()
+        try:
+            marcas = ", ".join("?" for _ in ids)
+            cursor.execute(f"SELECT [calendario_id], [data], [tipo] FROM {e.t['calendario_dias']} "
+                           f"WHERE [calendario_id] IN ({marcas}) AND [data] >= ? AND [data] <= ?", *ids, de, ate)
+            for cal, data, tipo in cursor.fetchall() or []:
+                util = TIPOS_UTEIS.get(str(tipo or "").strip().lower())
+                if util is None or data is None:
+                    continue
+                dia = data.date() if isinstance(data, datetime) else (
+                    data if isinstance(data, date) else date.fromisoformat(str(data)[:10]))
+                saida.setdefault(int(cal), {})[dia] = util
+        except Exception as exc:  # noqa: BLE001
+            if _erro_de_conexao(exc):
+                raise
+            logger.info("Exceções do calendário indisponíveis: %s", exc)
+            return {}
+        finally:
+            _fechar(cursor)
+            self._commit_silencioso()
+        return saida
+
+    def _completar_linha(self, linha: dict, m: Maquina, jornada: Jornada, diag: str | None, agora: int) -> None:
+        linha["diag"] = diag
+        if jornada.vazia:
+            linha["turno"], linha["jornada"] = "sem jornada", None
+        else:
+            linha["turno"] = "dentro" if intervalos_turno(jornada, agora, agora, self._fuso) else "fora"
+            linha["jornada"] = texto_jornada(jornada.horarios)
+        if diag == "sem MQTT":
+            extra = "Sem MQTT conectado: diagnóstico do aparelho não enviado."
+            linha["aviso"] = f"{linha['aviso']} {extra}" if linha.get("aviso") else extra
+
+    def _ciclo(self, inicio: float) -> dict:
+        agora = int(inicio)
+        falha, dados = self._preparar()
+        if falha is not None:
+            return falha
+        legendas, todas, maquinas = dados
         total = {"criados": 0, "alterados": 0, "excluidos": 0}
         linhas: list[dict] = []
         falhas = 0
         processadas = 0
         conexao_caiu = False
+        elegiveis: list[tuple[Maquina, dict]] = []
         for m in maquinas:
             linha = self._linha_maquina(m)
             linhas.append(linha)
-            if not m.canais:
-                continue
-            if not m.micro or not m.macro or m.micro <= 0 or m.macro <= m.micro:
-                linha["aviso"] = "Micro/macro parada não cadastrados (ou macro ≤ micro): máquina ignorada."
-                if m.id not in self._sem_parametros:
-                    self._sem_parametros.add(m.id)
-                    self._logar("INFO", f"Apontamentos reais: máquina {self._nome(m)} sem micro/macro parada "
-                                        "válidos no portal OEE; ignorada.")
-                continue
+            if self._elegivel(m, linha):
+                elegiveis.append((m, linha))
+        diag = self._diagnostico([m for m, _l in elegiveis])
+        try:
+            excecoes = self._ler_excecoes([m for m, _l in elegiveis], agora)
+        except Exception as exc:  # noqa: BLE001 - conexão caiu
+            self._rollback()
+            self._fechar_conexao()
+            return self._falha_geral(exc)
+        for m, linha in elegiveis:
+            jornada = self._jornada(m, excecoes)
+            estado_diag = self._estado_diag(m, diag)
             if conexao_caiu:
                 linha["aviso"] = "Não processada: conexão com o SQL Server perdida neste ciclo."
                 continue
             processadas += 1
             try:
-                contagem, avisos = self._processar(m, linha, legendas, todas, agora)
+                contagem, avisos = self._processar(m, linha, legendas, todas, agora, jornada,
+                                                   mudo=estado_diag == "sem resposta")
             except Exception as exc:  # noqa: BLE001
                 self._rollback()
                 falhas += 1
@@ -809,6 +1162,8 @@ class ApontamentosOee:
                     self._fechar_conexao()
                     conexao_caiu = True
                 continue
+            finally:
+                self._completar_linha(linha, m, jornada, estado_diag, agora)
             for k in total:
                 total[k] += contagem[k]
             for nivel, aviso in avisos:
@@ -824,6 +1179,108 @@ class ApontamentosOee:
         else:
             mensagem = resumo
         return {"ok": falhas == 0, "mensagem": mensagem, **total, "maquinas": linhas}
+
+    # -- recalcular o dia de uma máquina -------------------------------------------------------------------
+
+    def recalcular(self, maquina_id: int, dia: str) -> None:
+        """Não bloqueia: põe na fila da thread do ciclo. Dia inválido ou fora do limite: responde falha já."""
+        try:
+            alvo = date.fromisoformat(str(dia).strip())
+            if len(str(dia).strip()) != 10:
+                raise ValueError
+        except ValueError:
+            self._responder_recalculo(maquina_id, dia, False, f"Dia inválido: {dia!r} (use AAAA-MM-DD).")
+            return
+        hoje = dia_local(int(self._relogio()), self._fuso)
+        dias = max(0, int(self._cfg.dias_correcao or 0))
+        limite = hoje - timedelta(days=dias)
+        if alvo > hoje or alvo < limite:
+            self._responder_recalculo(maquina_id, dia, False, f"Escolha um dia de {limite:%d/%m} a {hoje:%d/%m} "
+                                                              f"(até {dias} dias atrás).")
+            return
+        if not self._cfg.habilitado or self._parado:
+            self._responder_recalculo(maquina_id, dia, False, "Apontamentos reais desligados.")
+            return
+        ini = int(datetime(alvo.year, alvo.month, alvo.day, tzinfo=self._fuso).timestamp())
+        with self._trava:
+            self._recalculos.append((int(maquina_id), str(dia).strip(), ini))
+        self.iniciar()
+        self._evento.set()
+
+    def _responder_recalculo(self, maquina_id: int, dia: str, ok: bool, mensagem: str) -> None:
+        try:
+            self._ao_recalculo(int(maquina_id), str(dia), bool(ok), mensagem)
+        except Exception:  # noqa: BLE001
+            logger.exception("Falha no callback de recálculo")
+
+    def executar_recalculo(self, maquina_id: int, dia: str, ini: int) -> bool:
+        """Bloqueante (thread do ciclo ou testes): refaz a máquina desde ``ini`` (00:00 local de ``dia``)."""
+        with self._ciclo_trava:
+            with self._trava:
+                trocar, self._trocou_sql = self._trocou_sql, False
+            if trocar:
+                self._fechar_conexao()
+            try:
+                ok, mensagem = self._recalcular(int(maquina_id), ini)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("Falha inesperada no recálculo")
+                ok, mensagem = False, f"Falha inesperada: {exc}"
+            nivel = "INFO" if ok else "AVISO"
+            self._logar(nivel, f"Apontamentos reais: recálculo da máquina {maquina_id} desde "
+                               f"{datetime.fromtimestamp(ini, self._fuso):%d/%m} — {mensagem}")
+            self._responder_recalculo(maquina_id, dia, ok, mensagem)
+            return ok
+
+    def _recalcular(self, maquina_id: int, ini: int) -> tuple[bool, str]:
+        agora = int(self._relogio())
+        falha, dados = self._preparar()
+        if falha is not None:
+            return False, falha["mensagem"]
+        legendas, todas, maquinas = dados
+        m = next((x for x in maquinas if x.id == maquina_id), None)
+        if m is None:
+            return False, "Máquina não encontrada entre as máquinas ativas com dispositivo IoT de produção."
+        linha = self._linha_maquina(m)
+        if not self._elegivel(m, linha):
+            return False, linha.get("aviso") or "Máquina sem canal IoT de produção com dispositivo ativo."
+        diag = self._diagnostico([m])
+        estado_diag = self._estado_diag(m, diag)
+        try:
+            jornada = self._jornada(m, self._ler_excecoes([m], agora))
+            try:
+                contagem, avisos = self._processar(m, linha, legendas, todas, agora, jornada,
+                                                   mudo=estado_diag == "sem resposta", ini_forcado=ini)
+            finally:
+                self._completar_linha(linha, m, jornada, estado_diag, agora)
+        except Exception as exc:  # noqa: BLE001
+            self._rollback()
+            resumo = sql_conexao.traduzir_erro(exc).replace("\n", " ")
+            self._ao_erro(f"Falha no recálculo dos apontamentos reais da máquina {self._nome(m)}; nada foi "
+                          "gravado.", resumo)
+            if _erro_de_conexao(exc):
+                self._fechar_conexao()
+            return False, f"Falha: {resumo}"
+        for nivel, aviso in avisos:
+            self._logar(nivel, aviso)
+        self._mesclar_resultado(linha, agora)
+        manuais = contagem.get("manuais", 0)
+        return True, (f"Recalculado desde {datetime.fromtimestamp(ini, self._fuso):%d/%m}: {contagem['criados']} "
+                      f"criados, {contagem['alterados']} atualizados, {contagem['excluidos']} excluídos "
+                      f"({manuais} {'manual apagado' if manuais == 1 else 'manuais apagados'}).")
+
+    def _mesclar_resultado(self, linha: dict, agora: int) -> None:
+        """Emite o último resultado do ciclo com a linha desta máquina atualizada (ou só ela, sem ciclo antes)."""
+        base = dict(self._ultimo_resultado) if self._ultimo_resultado else {
+            **self._resultado_vazio(True, "Recálculo de uma máquina."), "quando": iso_local(agora)}
+        maquinas = [x for x in base.get("maquinas", []) if x.get("maquina_id") != linha["maquina_id"]]
+        base["maquinas"] = sorted(maquinas + [linha], key=lambda x: (str(x.get("nome") or ""), x.get("maquina_id")))
+        if self._ultimo_resultado:
+            ordem = [x.get("maquina_id") for x in self._ultimo_resultado.get("maquinas", [])]
+            if linha["maquina_id"] in ordem:
+                base["maquinas"] = [linha if x.get("maquina_id") == linha["maquina_id"] else x
+                                    for x in self._ultimo_resultado.get("maquinas", [])]
+        self._ultimo_resultado = base
+        self._emitir(base)
 
     # -- partes do ciclo ------------------------------------------------------------------------------------
 
@@ -898,7 +1355,18 @@ class ApontamentosOee:
                                      "serão tratados como parada (99/98) até ela ser cadastrada.")
         else:
             self._aviso_sem_iot = False
-        return LegendasIot(achadas["produzindo"], achadas["micro"], achadas["macro"], sem_iot), todas
+        codigo_96 = str(self._cfg.legenda_fora_turno or "").strip()
+        ids_96 = [l.id for l in todas.values() if l.ativo and codigo_96 and l.codigo == codigo_96]
+        fora_turno = min(ids_96) if ids_96 else None
+        if fora_turno is None:
+            if not self._aviso_fora_turno:
+                self._aviso_fora_turno = True
+                self._logar("AVISO", f"Apontamentos reais: legenda {codigo_96 or '(sem código)'} (Fora de turno) não "
+                                     "cadastrada ou inativa no portal OEE; paradas fora do horário de trabalho "
+                                     "continuam 99/98/97 até ela ser cadastrada.")
+        else:
+            self._aviso_fora_turno = False
+        return LegendasIot(achadas["produzindo"], achadas["micro"], achadas["macro"], sem_iot, fora_turno), todas
 
     def _ler_maquinas(self) -> list[Maquina]:
         cursor = self._conexao.cursor()
@@ -919,20 +1387,39 @@ class ApontamentosOee:
                 "macro_s": int(m.macro or 0), "legenda": "", "legenda_descricao": "",
                 "desde": iso_local(m.situacao_desde), "ultima_producao": None, "apontamentos_hoje": 0,
                 "ultima_leitura": None,
-                "aviso": None if m.canais else "Sem canal IoT de produção com dispositivo ativo."}
+                "aviso": None if m.canais else "Sem canal IoT de produção com dispositivo ativo.",
+                **self._turno_sem_calendario(m)}
 
-    def _processar(self, m: Maquina, linha: dict, legendas: LegendasIot, todas: dict[int, Legenda], agora: int
+    def _turno_sem_calendario(self, m: Maquina) -> dict:
+        """diag/turno/jornada iniciais da linha (só pelos dias da semana); o ciclo refaz com o calendário."""
+        jornada = montar_jornada(m.horarios_semana, m.dias_semana, m.jornada_inicio, m.jornada_fim)
+        agora = int(self._relogio())
+        if jornada.vazia:
+            return {"diag": None, "turno": "sem jornada", "jornada": None}
+        dentro = intervalos_turno(jornada, agora, agora, self._fuso)
+        return {"diag": None, "turno": "dentro" if dentro else "fora", "jornada": texto_jornada(jornada.horarios)}
+
+    def _processar(self, m: Maquina, linha: dict, legendas: LegendasIot, todas: dict[int, Legenda], agora: int,
+                   jornada: Jornada | None = None, mudo: bool = False, ini_forcado: int | None = None
                    ) -> tuple[dict, list[tuple[str, str]]]:
-        """Uma máquina, numa transação. Devolve (contagem, [(nível, mensagem)] para o log depois do commit)."""
+        """Uma máquina, numa transação. Devolve (contagem, [(nível, mensagem)] para o log depois do commit).
+
+        ``jornada``: horário de trabalho + calendário (96 fora do turno); ``mudo``: o aparelho não respondeu ao
+        diagnóstico (parada em aberto vira 97); ``ini_forcado``: recálculo desde 00:00 local de um dia.
+        """
         e = self._esquema
         A = e.t["apontamentos_estado"]
         hoje = inicio_do_dia(agora, self._fuso)
         ontem = inicio_do_dia(agora, self._fuso, -1)
+        jornada = jornada or Jornada({})
         cur = self._conexao.cursor()
         try:
-            cur.execute(f"SELECT TOP 1 1 FROM {A} WHERE [maquina_id] = ? AND [inicio] >= ? AND [inicio] < ? "
-                        "AND LEFT([observacao], 5) = ?", m.id, utc_sql(ontem), utc_sql(hoje), MARCA)
-            ini = ontem if cur.fetchone() is not None else hoje
+            if ini_forcado is not None:
+                ini = int(ini_forcado)
+            else:
+                cur.execute(f"SELECT TOP 1 1 FROM {A} WHERE [maquina_id] = ? AND [inicio] >= ? AND [inicio] < ? "
+                            "AND LEFT([observacao], 5) = ?", m.id, utc_sql(ontem), utc_sql(hoje), MARCA)
+                ini = ontem if cur.fetchone() is not None else hoje
 
             por_device: dict[str, list[str]] = {}
             ausentes: list[str] = []
@@ -945,9 +1432,9 @@ class ApontamentosOee:
                 # nenhum canal tem coluna na IOT001: não dá para saber se produziu (não aponta 98 por isso)
                 linha["aviso"] = (f"Canal sem coluna na IOT001: {', '.join(ausentes)} "
                                   "(rode sql/canais_4_a_6_iot001.sql); máquina ignorada.")
-                return {"criados": 0, "alterados": 0, "excluidos": 0}, []
+                return {"criados": 0, "alterados": 0, "excluidos": 0, "manuais": 0}, []
             logs: list[tuple[str, str]] = []
-            if legendas.sem_iot is not None:
+            if legendas.sem_iot is not None and ini_forcado is None:
                 retro = self._correcao_retroativa(cur, m, legendas.sem_iot, list(por_device), ini, agora)
                 if retro is not None:
                     inicio_97, device = retro
@@ -986,8 +1473,12 @@ class ApontamentosOee:
             if legendas.sem_iot is not None:
                 limite = max(1, int(self._cfg.sem_leitura_segundos or 120))
                 buracos = buracos_sem_leitura(ts_todas, desde, agora, limite)
-            desejados = dividir_por_dia(segmentos_continuos(prods, ini, agora, m.micro, m.macro, buracos),
-                                        self._fuso)
+            segs = segmentos_continuos(prods, ini, agora, m.micro, m.macro, buracos)
+            if mudo and legendas.sem_iot is not None:
+                segs = marcar_sem_resposta(segs, prods, ini)
+            if legendas.fora_turno is not None and not jornada.vazia:
+                segs = recortar_fora_turno(segs, intervalos_turno(jornada, ini, agora, self._fuso))
+            desejados = dividir_por_dia(segs, self._fuso)
             cur.execute(f"SELECT [id], [legenda_id], [inicio], [fim], [observacao], [ordem_producao_id] "
                         f"FROM {A} WITH (UPDLOCK) WHERE [maquina_id] = ? AND [inicio] <= ? "
                         "AND ([fim] IS NULL OR [fim] >= ?) ORDER BY [inicio], [id]",
@@ -1082,7 +1573,7 @@ class ApontamentosOee:
                  ) -> tuple[dict, list[str]]:
         A = self._esquema.t["apontamentos_estado"]
         agora_sql = utc_sql(agora)
-        contagem = {"criados": 0, "alterados": 0, "excluidos": 0}
+        contagem = {"criados": 0, "alterados": 0, "excluidos": 0, "manuais": 0}
         avisos: list[str] = []
         for x in plano.excluir:
             try:
@@ -1097,6 +1588,7 @@ class ApontamentosOee:
                 continue
             contagem["excluidos"] += 1
             if x["manual"]:
+                contagem["manuais"] += 1
                 avisos.append(f"Apontamentos reais: apontamento manual {self._descrever(x, todas)} da máquina "
                               f"{self._nome(m)} excluído (coberto pelo IoT).")
         for x in plano.atualizar:

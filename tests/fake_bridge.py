@@ -43,6 +43,7 @@ class FakePipelineBridge(QObject):
     diagnostico_dispositivo = Signal(str, str)  # (device_id, JSON do objeto "diag" do DigiRail)
     resposta_comando = Signal(str, str, bool, str)  # (device_id, "reset_counters"|"diag", sucesso, mensagem)
     apontamentos_atualizados = Signal(str)  # JSON do ciclo dos apontamentos reais (ver app/bridge.py)
+    recalculo_concluido = Signal(int, str, bool, str)  # (maquina_id, dia, sucesso, mensagem)
 
     def __init__(self, config: Config, parent=None, *, atraso_conexao: float = 0.2,
                  intervalo: float = 0.05, falhar_conexao: bool = False, sql_ok: bool = True,
@@ -122,6 +123,21 @@ class FakePipelineBridge(QObject):
 
         def trabalho():
             time.sleep(self.atraso_resposta)
+            self.emitir_apontamentos()
+
+        threading.Thread(target=trabalho, daemon=True).start()
+
+    def recalcular_dia_apontamentos(self, maquina_id: int, dia: str) -> None:
+        self.chamadas.append(("recalcular_dia_apontamentos", int(maquina_id), str(dia)))
+        if not self.responder_comandos:
+            return
+
+        def trabalho():
+            time.sleep(self.atraso_resposta)
+            d = datetime.strptime(dia, "%Y-%m-%d")
+            self.recalculo_concluido.emit(int(maquina_id), dia, True,
+                                          f"Recalculado desde {d:%d/%m}: 2 criados, 3 atualizados, 1 excluídos "
+                                          "(1 manual apagado).")
             self.emitir_apontamentos()
 
         threading.Thread(target=trabalho, daemon=True).start()
@@ -347,12 +363,14 @@ def apontamentos_exemplo(minutos: float = 3.0) -> dict:
             {"maquina_id": 1, "codigo": "INJ01", "nome": "Injetora 01", "canais": "Teste_Alumbra/chd1_value",
              "micro_s": 60, "macro_s": 300, "legenda": "2", "legenda_descricao": "Produção Normal",
              "desde": _iso(agora - 1800), "ultima_producao": _iso(agora - 12), "apontamentos_hoje": 7,
-             "ultima_leitura": _iso(agora - 5), "aviso": None},
+             "ultima_leitura": _iso(agora - 5), "aviso": None, "diag": "ok", "turno": "dentro",
+             "jornada": "Seg–Sex 05:00–14:48"},
             {"maquina_id": 2, "codigo": "INJ02", "nome": "Injetora 02",
              "canais": "Teste_Alumbra/chd2_value, Teste_Alumbra/chd3_value", "micro_s": 60, "macro_s": 300,
              "legenda": "98", "legenda_descricao": "Macro parada", "desde": _iso(agora - 3600),
              "ultima_producao": _iso(agora - 3600), "apontamentos_hoje": 4, "ultima_leitura": _iso(agora - 5),
-             "aviso": None},
+             "aviso": None, "diag": "ok", "turno": "dentro",
+             "jornada": "Seg–Qui 05:00–14:48, Sex 05:00–13:48"},
         ],
     }
 

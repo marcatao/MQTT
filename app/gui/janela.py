@@ -12,7 +12,8 @@ local) e o vigia, que reinicia o programa se faltar gravação (ou leitura, sem 
 O cartão da direita tem quatro abas: "Atividade" (a caixa de logs), "Mosquitto" (console do broker local, processo
 filho do app; ver app/gui/mosquitto.py), "Clientes" (quem envia dados, com IP e MAC; ver app/gui/clientes.py) e
 "Apontamentos reais" (timeline das máquinas no portal OEE gerada pelo core; ver app/gui/apontamentos.py, sinal
-opcional `apontamentos_atualizados` e métodos `definir_periodicidade_apontamentos`/`executar_apontamentos_agora`).
+opcional `apontamentos_atualizados` e métodos `definir_periodicidade_apontamentos`/`executar_apontamentos_agora`;
+Recalcular… por máquina com `recalcular_dia_apontamentos` e o sinal `recalculo_concluido`).
 Os processos filhos param ao fechar a janela e antes do reinício do vigia.
 
 O card ERROS é clicável e abre a janela "Erros registrados" (app/gui/erros.py), alimentada por
@@ -361,11 +362,13 @@ class JanelaPrincipal(QMainWindow):
         self.abas.setTabToolTip(2, "Dispositivos que enviam dados ao broker: nome, IP, MAC e último envio.")
         self.mosquitto.saida.connect(self.painel_clientes.ao_saida_mosquitto)
 
-        minutos_apont = getattr(getattr(self.config, "apontamentos", None), "minutos", None)
-        self.painel_apontamentos = PainelApontamentos(self.abas, relogio=self._relogio, settings=self.settings,
-                                                      minutos_padrao=minutos_apont)
+        cfg_apont = getattr(self.config, "apontamentos", None)
+        self.painel_apontamentos = PainelApontamentos(
+            self.abas, relogio=self._relogio, settings=self.settings,
+            minutos_padrao=getattr(cfg_apont, "minutos", None),
+            dias_correcao=getattr(cfg_apont, "dias_correcao", 7))
         self.abas.addTab(self.painel_apontamentos, "Apontamentos reais")
-        self.abas.setTabToolTip(3, "Timeline das máquinas no portal OEE (produção, microparada e macro parada) "
+        self.abas.setTabToolTip(3, "Timeline das máquinas no portal OEE (produção, paradas, sem leitura e fora de turno) "
                                    "gerada a partir das contagens da IOT001.")
 
         cartao.corpo.addWidget(self.abas, 1)
@@ -732,6 +735,12 @@ class JanelaPrincipal(QMainWindow):
             aba.periodicidade_alterada.connect(self.bridge.definir_periodicidade_apontamentos)
         if tem_executar:
             aba.executar_pedido.connect(self.bridge.executar_apontamentos_agora)
+        tem_recalculo = (hasattr(self.bridge, "recalcular_dia_apontamentos")
+                         and hasattr(self.bridge, "recalculo_concluido"))
+        if tem_recalculo:
+            aba.recalculo_pedido.connect(self.bridge.recalcular_dia_apontamentos)
+            self.bridge.recalculo_concluido.connect(aba.ao_recalculo_concluido)
+        aba.definir_recalculo_disponivel(tem_recalculo)
         aba.definir_disponivel(tem_periodo and tem_executar)
         if tem_periodo:
             aba.aplicar_periodicidade(forcar=True)

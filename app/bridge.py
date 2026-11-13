@@ -34,8 +34,11 @@ class PipelineBridge(QObject):
     # JSON do ciclo dos apontamentos reais (app.core.apontamentos_oee), 1 por ciclo concluído (ou falho):
     # {"quando", "proxima" (ISO local|null), "minutos", "ok", "mensagem", "criados", "alterados", "excluidos",
     #  "maquinas": [{"maquina_id", "codigo", "nome", "canais", "micro_s", "macro_s", "legenda", "legenda_descricao",
-    #                "desde", "ultima_producao", "apontamentos_hoje", "ultima_leitura", "aviso"}]}
+    #                "desde", "ultima_producao", "apontamentos_hoje", "ultima_leitura", "aviso",
+    #                "diag" ("ok"|"sem resposta"|"sem MQTT"|null), "turno" ("dentro"|"fora"|"sem jornada"),
+    #                "jornada" (ex. "Seg–Qui 05:00–14:48, Sex 05:00–13:48" | null)}]}
     apontamentos_atualizados = Signal(str)
+    recalculo_concluido = Signal(int, str, bool, str)  # (maquina_id, dia "AAAA-MM-DD", sucesso, mensagem em português)
 
     def __init__(self, config: Config, parent=None) -> None:
         super().__init__(parent)
@@ -54,6 +57,7 @@ class PipelineBridge(QObject):
             ao_diagnostico=self.diagnostico_dispositivo.emit,
             ao_resposta_comando=self.resposta_comando.emit,
             ao_apontamentos=self.apontamentos_atualizados.emit,
+            ao_recalculo=self.recalculo_concluido.emit,
         )
 
     def _emitir_log(self, nivel: str, mensagem: str) -> None:
@@ -92,6 +96,12 @@ class PipelineBridge(QObject):
     def executar_apontamentos_agora(self) -> None:
         """Não bloqueia: roda um ciclo de apontamentos reais já; responde em ``apontamentos_atualizados``."""
         self._pipeline.executar_apontamentos_agora()
+
+    def recalcular_dia_apontamentos(self, maquina_id: int, dia: str) -> None:
+        """Não bloqueia: refaz a timeline da máquina desde 00:00 local de ``dia`` ("AAAA-MM-DD", de hoje até
+        ``[apontamentos] dias_correcao`` dias atrás; fora disso responde falha). Os apontamentos manuais da máquina
+        nesse período são apagados. Responde em ``recalculo_concluido`` e em ``apontamentos_atualizados``."""
+        self._pipeline.recalcular_dia_apontamentos(int(maquina_id), str(dia))
 
     def zerar_contadores(self, device_id: str, canais: list[int]) -> None:
         """Não bloqueia: publica ``reset_counters`` (canais 1–6) e responde em ``resposta_comando``."""

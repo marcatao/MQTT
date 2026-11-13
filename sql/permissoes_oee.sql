@@ -4,8 +4,8 @@
     1) dbo.dispositivos_iot: cadastro dos dispositivos (SELECT, INSERT, UPDATE).
     2) Apontamentos reais pelo IoT (docs/apontamentos_reais.md, app/core/apontamentos_oee.py): SELECT em maquinas,
        dispositivos_iot, legendas e ordens_producao; SELECT, INSERT, UPDATE e DELETE em apontamentos_estado; UPDATE
-       em maquinas (situação e OP atual) e ordens_producao (status). O SELECT na IOT001 vem de
-       sql/permissoes_iot001.sql.
+       em maquinas (situação e OP atual) e ordens_producao (status); SELECT em calendarios e calendario_dias
+       (fora de turno, 96; só se as tabelas existirem). O SELECT na IOT001 vem de sql/permissoes_iot001.sql.
 
     O integrador cadastra/atualiza os dispositivos (codigo = device_id) a cada diagnóstico recebido e renova
     ultimo_sinal_em com as leituras (ver app/core/oee_dispositivos.py). Ele usa o MESMO login do SQL Server da
@@ -82,6 +82,21 @@ BEGIN
         PRINT 'GRANT SELECT, INSERT, UPDATE, DELETE em dbo.apontamentos_estado para [mqtt].';
     END
     ELSE PRINT 'AVISO: tabela dbo.apontamentos_estado ausente; nada foi concedido nela.';
+
+    -- Fora de turno (96): calendário da máquina (opcional; sem ele o integrador usa só os dias da semana)
+    IF OBJECT_ID(N'dbo.calendarios', N'U') IS NOT NULL
+    BEGIN
+        GRANT SELECT ON OBJECT::dbo.calendarios TO [mqtt];
+        PRINT 'GRANT SELECT em dbo.calendarios para [mqtt].';
+    END
+    ELSE PRINT 'AVISO: tabela dbo.calendarios ausente (portal sem calendários); nada foi concedido nela.';
+
+    IF OBJECT_ID(N'dbo.calendario_dias', N'U') IS NOT NULL
+    BEGIN
+        GRANT SELECT ON OBJECT::dbo.calendario_dias TO [mqtt];
+        PRINT 'GRANT SELECT em dbo.calendario_dias para [mqtt].';
+    END
+    ELSE PRINT 'AVISO: tabela dbo.calendario_dias ausente (portal sem calendários); nada foi concedido nela.';
 END
 ELSE
     PRINT 'AVISO: usuário [mqtt] ausente no banco do OEE; nada foi concedido para os apontamentos reais.';
@@ -101,6 +116,7 @@ FROM sys.database_permissions AS pe
 JOIN sys.database_principals AS pr ON pr.principal_id = pe.grantee_principal_id
 WHERE pr.name = N'mqtt'
   AND pe.major_id IN (OBJECT_ID(N'dbo.maquinas'), OBJECT_ID(N'dbo.dispositivos_iot'), OBJECT_ID(N'dbo.legendas'),
-                      OBJECT_ID(N'dbo.ordens_producao'), OBJECT_ID(N'dbo.apontamentos_estado'))
+                      OBJECT_ID(N'dbo.ordens_producao'), OBJECT_ID(N'dbo.apontamentos_estado'),
+                      OBJECT_ID(N'dbo.calendarios'), OBJECT_ID(N'dbo.calendario_dias'))
 ORDER BY tabela, pe.permission_name;
 GO

@@ -69,7 +69,9 @@ def test_script_permissoes_oee():
         assert proibida not in sem_grant, proibida
     for grant in ("GRANT SELECT, UPDATE ON OBJECT::DBO.MAQUINAS TO [MQTT]",
                   "GRANT SELECT ON OBJECT::DBO.LEGENDAS TO [MQTT]",
-                  "GRANT SELECT, UPDATE ON OBJECT::DBO.ORDENS_PRODUCAO TO [MQTT]"):
+                  "GRANT SELECT, UPDATE ON OBJECT::DBO.ORDENS_PRODUCAO TO [MQTT]",
+                  "GRANT SELECT ON OBJECT::DBO.CALENDARIOS TO [MQTT]",
+                  "GRANT SELECT ON OBJECT::DBO.CALENDARIO_DIAS TO [MQTT]"):
         assert grant in codigo, grant
     assert "USE [OEE]" in codigo
     assert "CREATE USER [MQTT] FOR LOGIN [MQTT]" in codigo and "DATABASE_PRINCIPAL_ID(N'MQTT') IS NULL" in codigo

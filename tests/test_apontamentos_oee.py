@@ -402,19 +402,23 @@ def _ep(v):
 class BancoFalso:
     """SQL Server de mentira: guarda as tabelas em memória e responde às consultas do módulo pelo texto."""
 
-    def __init__(self, com_97: bool = True) -> None:
+    def __init__(self, com_97: bool = True, com_96: bool = True, jornada: bool = True) -> None:
         legendas = {2: ("2", "Produção Normal", "produzindo", True),
                     99: ("99", "Microparada", "parada", True),
                     98: ("98", "Macro parada", "parada", True),
                     SETUP: ("10", "Setup", "planejada", True)}
         if com_97:
             legendas[97] = ("97", "Sem apontamento IOT", "parada", True)
+        if com_96:
+            legendas[96] = ("96", "Fora de turno", "planejada", True)
+        self.jornada = jornada        # colunas de jornada em maquinas + tabela calendario_dias
         self.dados = {
             "legendas": legendas,
             "dispositivos": {1: ("DEV1", True), 2: ("DEV2", True)},
             "maquinas": {},
             "apont": {},
             "ops": {},
+            "calendario": [],   # (calendario_id, date, tipo)
             "iot": [],          # (device, ts, {canal: valor})
         }
         self.proximo_id = 1000
@@ -430,11 +434,13 @@ class BancoFalso:
 
     # -- montagem dos dados --
     def maquina(self, id_, codigo="INJ01", nome="Injetora 01", micro=MICRO_S, macro=MACRO_S, canais=((1, "chd1_value"),),
-                op=None, situacao=None):
+                op=None, situacao=None, calendario_id=None, horarios_semana=None, dias_semana=None,
+                jornada_inicio=None, jornada_fim=None):
         slots = list(canais) + [(None, None)] * (3 - len(canais))
         self.dados["maquinas"][id_] = {
             "codigo": codigo, "nome": nome, "micro": micro, "macro": macro, "situacao": situacao, "desde": None,
-            "legenda": None, "op": op, "slots": [(d, c, "producao" if d else None) for d, c in slots]}
+            "legenda": None, "op": op, "slots": [(d, c, "producao" if d else None) for d, c in slots],
+            "jornada": (calendario_id, horarios_semana, dias_semana, jornada_inicio, jornada_fim)}
         self._salvo = copy.deepcopy(self.dados)
 
     def apontamento(self, maquina, legenda, inicio, fim, iot=True, op=None):
@@ -485,7 +491,10 @@ class BancoFalso:
             tabela = p[1]
             if tabela == "IOT001":
                 return [(c,) for c in self.colunas_iot]
-            extras = {"maquinas": {"atualizado_em"}, "ordens_producao": {"status_em"}}.get(tabela, set())
+            if tabela == "calendario_dias":
+                return [(c,) for c in ("id", "calendario_id", "data", "tipo", "descricao")]
+            extras = {"maquinas": {"atualizado_em", *(ap.COLUNAS_JORNADA if self.jornada else ())},
+                      "ordens_producao": {"status_em"}}.get(tabela, set())
             return [(c,) for c in ap.TABELAS_OEE[tabela] | extras]
         if "FROM [OEE].[dbo].[legendas]" in sql and sql.startswith("SELECT [id], [codigo]"):
             return [(i, c, desc, tipo, at) for i, (c, desc, tipo, at) in d["legendas"].items()]
@@ -497,8 +506,12 @@ class BancoFalso:
                 for dev, canal, tipo in m["slots"]:
                     disp = d["dispositivos"].get(dev)
                     linha += [canal, tipo, disp[0] if disp else None, disp[1] if disp else None]
+                linha += list(m["jornada"]) if self.jornada else [None] * 5
                 linhas.append(tuple(linha))
             return linhas
+        if sql.startswith("SELECT [calendario_id], [data], [tipo]"):
+            *ids, de, ate = p
+            return [(c, dt, tp) for c, dt, tp in d["calendario"] if c in ids and de <= dt <= ate]
         if sql.startswith("SELECT [inicio], [fim] FROM"):          # candidatos da correção retroativa (97)
             maq, leg, marca, de, ate = p
             return sorted((a["inicio"], a["fim"]) for a in d["apont"].values()
@@ -1003,3 +1016,311 @@ def test_bridge_real_tem_o_contrato_novo():
         assert hasattr(cls, "apontamentos_atualizados")
         assert callable(getattr(cls, "definir_periodicidade_apontamentos"))
         assert callable(getattr(cls, "executar_apontamentos_agora"))
+
+
+# ============================================================================================ fora de turno (96)
+
+from datetime import date as _date  # noqa: E402
+
+from app.core.apontamentos_oee import (FORA_TURNO, Jornada, intervalos_turno, jornada_de,  # noqa: E402
+                                       marcar_sem_resposta, montar_jornada, recortar_fora_turno, texto_jornada)
+
+HORARIOS = '{"1":["05:00","14:48"],"2":["05:00","14:48"],"3":["05:00","14:48"],"4":["05:00","14:48"],' \
+           '"5":["05:00","13:48"]}'
+
+
+def turnos_e_trechos(segs, jornada, ini, agora):
+    turnos = intervalos_turno(jornada, ini, agora, FUSO)
+    return dividir_por_dia(recortar_fora_turno(segs, turnos), FUSO)
+
+
+def test_jornada_do_cadastro_e_texto_como_no_portal():
+    h = jornada_de(HORARIOS, "12345", "05:00", "14:48")
+    assert h[4] == ("05:00", "14:48") and h[5] == ("05:00", "13:48") and 6 not in h
+    assert texto_jornada(h) == "Seg–Qui 05:00–14:48, Sex 05:00–13:48"
+    # sem horarios_semana: dias_semana + jornada_inicio/fim
+    assert jornada_de(None, "12345", "07:00", "17:00") == {d: ("07:00", "17:00") for d in range(1, 6)}
+    assert texto_jornada(jornada_de("", "12345", "07:00", "17:00")) == "Seg–Sex 07:00–17:00"
+    assert jornada_de(None, "12345", None, None) == {} and texto_jornada({}) is None
+    assert jornada_de("{lixo", "1", "25:00", "07:00") == {}
+
+
+def test_exemplo_do_usuario_96_ate_o_turno_98_ate_produzir_e_2_depois():
+    j = montar_jornada(HORARIOS, "12345", "05:00", "14:48")      # 12/11 é quinta
+    agora = T(6)
+    prods = list(range(T(5, 22), agora + 1, 30))
+    segs = segmentos_continuos(prods, HOJE, agora, MICRO_S, MACRO_S)
+    assert segs[0] == (HOJE, T(5, 22), MACRO)                     # classificada pelo intervalo inteiro
+    assert turnos_e_trechos(segs, j, HOJE, agora) == [
+        Trecho(HOJE, T(4, 59, 59), FORA_TURNO), Trecho(T(5), T(5, 22) - 1, MACRO), Trecho(T(5, 22), None, PRODUZINDO)]
+
+
+def test_feriado_no_calendario_tudo_parado_e_96():
+    j = montar_jornada(HORARIOS, "12345", "05:00", "14:48", {_date(2026, 11, 12): False})
+    assert intervalos_turno(j, HOJE, T(12), FUSO) == []
+    segs = segmentos_continuos([], HOJE, T(12), MICRO_S, MACRO_S)
+    assert turnos_e_trechos(segs, j, HOJE, T(12)) == [Trecho(HOJE, None, FORA_TURNO)]
+
+
+def test_compensacao_no_sabado_e_dia_util_com_o_horario_padrao():
+    sab = T(0, dia=14)
+    sem = montar_jornada(HORARIOS, "12345", "05:00", "14:48")
+    com = montar_jornada(HORARIOS, "12345", "05:00", "14:48", {_date(2026, 11, 14): True})
+    assert intervalos_turno(sem, sab, T(12, dia=14), FUSO) == []
+    assert intervalos_turno(com, sab, T(12, dia=14), FUSO) == [(T(5, dia=14), T(14, 48, dia=14))]
+    # dia útil normal virando folga pelo calendário
+    folga = montar_jornada(HORARIOS, "12345", "05:00", "14:48", {_date(2026, 11, 13): False})
+    assert intervalos_turno(folga, T(0, dia=13), T(20, dia=13), FUSO) == []
+
+
+def test_turno_que_vira_o_dia():
+    j = montar_jornada(None, "1234", "22:00", "06:00")               # seg–qui, das 22h às 6h do dia seguinte
+    turnos = intervalos_turno(j, HOJE, T(23), FUSO)                    # 12/11 quinta
+    assert turnos == [(T(22, dia=11), T(6)), (T(22), T(6, dia=13))]   # o de quarta termina hoje às 6h
+    segs = [(HOJE, T(23), MACRO)]
+    assert turnos_e_trechos(segs, j, HOJE, T(23)) == [
+        Trecho(HOJE, T(5, 59, 59), MACRO), Trecho(T(6), T(21, 59, 59), FORA_TURNO), Trecho(T(22), None, MACRO)]
+    # sexta 13/11 às 03h ainda é o turno de quinta (pertence ao dia em que começa)
+    assert intervalos_turno(j, T(3, dia=13), T(3, dia=13), FUSO) == [(T(22), T(6, dia=13))]
+
+
+def test_parada_que_atravessa_o_fim_do_turno_98_vira_96():
+    j = montar_jornada(HORARIOS, "12345", "05:00", "14:48")
+    prods = [T(14), T(14) + 30]
+    segs = segmentos_continuos(prods, T(13), T(16), MICRO_S, MACRO_S)
+    trechos = turnos_e_trechos(segs, j, T(13), T(16))
+    assert trechos[-2:] == [Trecho(T(14) + 30, T(14, 47, 59), MACRO), Trecho(T(14, 48), None, FORA_TURNO)]
+
+
+def test_microparada_fora_do_turno_e_96_e_producao_fora_do_turno_continua_2():
+    j = montar_jornada(HORARIOS, "12345", "05:00", "14:48")
+    ini, agora = T(16), T(16, 30)                                      # depois do turno
+    prods = [ini - 10, ini + 30, ini + 130, ini + 160, *range(ini + 190, agora - 300, 30)]
+    segs = segmentos_continuos(prods, ini, agora, MICRO_S, MACRO_S)
+    assert (ini + 30, ini + 130, MICRO) in segs
+    estados = [t.estado for t in turnos_e_trechos(segs, j, ini, agora)]
+    assert estados == [PRODUZINDO, FORA_TURNO, PRODUZINDO, FORA_TURNO]
+    assert MICRO not in estados and MACRO not in estados
+
+
+def test_sem_jornada_nao_ha_turno_nem_96():
+    j = montar_jornada(None, "12345", None, None)
+    assert j.vazia and intervalos_turno(j, HOJE, T(9), FUSO) == []
+
+
+def test_diag_sem_resposta_marca_a_parada_em_aberto_como_97():
+    ini, p = T(8), T(8, 30)
+    prods = [ini - 10, *range(ini, p + 1, 30)]
+    segs = segmentos_continuos(prods, ini, T(9), MICRO_S, MACRO_S)
+    assert segs[-1] == (p, T(9), MACRO)
+    assert marcar_sem_resposta(segs, prods, ini)[-1] == (p, T(9), SEM_IOT)
+    assert marcar_sem_resposta(segs, prods, ini)[0] == segs[0]                 # o que já passou não muda
+    produzindo = segmentos_continuos(prods, ini, p + 10, MICRO_S, MACRO_S)
+    assert marcar_sem_resposta(produzindo, prods, ini) == produzindo           # sem parada em aberto
+
+
+def _maquina_jornada(b, **kw):
+    b.maquina(1, horarios_semana=HORARIOS, dias_semana="12345", jornada_inicio="05:00", jornada_fim="14:48", **kw)
+
+
+def test_ciclo_exemplo_do_usuario_e_json_novo():
+    b = BancoFalso()
+    _maquina_jornada(b, calendario_id=3)
+    agora = T(6)
+    ligado(b, "DEV1", "chd1_value", HOJE - 3600, T(5, 22) - 20)
+    producao_continua(b, "DEV1", "chd1_value", T(5, 22), agora)
+    obj, logs, erros, res = novo(b, agora)
+    obj._diagnosticar = lambda devices, timeout: {d: True for d in devices}
+    r = obj.executar_ciclo()
+    assert r["ok"] and not erros
+    assert b.lista(1) == [(96, HOJE, T(4, 59, 59), True), (98, T(5), T(5, 22) - 1, True), (2, T(5, 22), None, True)]
+    linha = r["maquinas"][0]
+    assert (linha["diag"], linha["turno"], linha["jornada"]) == ("ok", "dentro", "Seg–Qui 05:00–14:48, Sex 05:00–13:48")
+
+
+def test_ciclo_feriado_pelo_calendario_tudo_96_e_turno_fora():
+    b = BancoFalso()
+    _maquina_jornada(b, calendario_id=3)
+    b.dados["calendario"].append((3, _date(2026, 11, 12), "feriado"))
+    ligado(b, "DEV1", "chd1_value", HOJE - 3600, T(9))
+    obj, *_ = novo(b, T(9))
+    r = obj.executar_ciclo()
+    assert b.lista(1) == [(96, HOJE, None, True)]
+    assert r["maquinas"][0]["turno"] == "fora" and r["maquinas"][0]["diag"] is None   # sem callback de diag
+    assert b.dados["maquinas"][1]["situacao"] == "parada"
+
+
+def test_ciclo_sem_jornada_sem_96():
+    b = BancoFalso()
+    b.maquina(1)
+    ligado(b, "DEV1", "chd1_value", HOJE - 3600, T(3))
+    obj, *_ = novo(b, T(3))
+    r = obj.executar_ciclo()
+    assert b.lista(1) == [(98, HOJE, None, True)]
+    assert (r["maquinas"][0]["turno"], r["maquinas"][0]["jornada"]) == ("sem jornada", None)
+
+
+def test_ciclo_portal_sem_colunas_de_jornada_sem_96():
+    b = BancoFalso(jornada=False)
+    _maquina_jornada(b)
+    ligado(b, "DEV1", "chd1_value", HOJE - 3600, T(3))
+    obj, *_ = novo(b, T(3))
+    r = obj.executar_ciclo()
+    assert b.lista(1) == [(98, HOJE, None, True)] and r["maquinas"][0]["turno"] == "sem jornada"
+
+
+def test_ciclo_legenda_96_ausente_avisa_uma_vez_e_segue_sem_96():
+    b = BancoFalso(com_96=False)
+    _maquina_jornada(b)
+    ligado(b, "DEV1", "chd1_value", HOJE - 3600, T(3))
+    obj, logs, erros, _ = novo(b, T(3))
+    r = obj.executar_ciclo()
+    obj.executar_ciclo()
+    assert r["ok"] and b.lista(1) == [(98, HOJE, None, True)]
+    avisos = [m for n, m in logs if n == "AVISO"]
+    assert len(avisos) == 1 and "96" in avisos[0] and "Fora de turno" in avisos[0]
+    assert r["maquinas"][0]["turno"] == "fora"                 # a tela ainda mostra o turno
+
+
+# ============================================================================================ diagnóstico
+
+
+def _parada_em_aberto(b):
+    _maquina_jornada(b)
+    ligado(b, "DEV1", "chd1_value", HOJE - 3600, T(8) - 20)
+    producao_continua(b, "DEV1", "chd1_value", T(8), T(9))
+    ligado(b, "DEV1", "chd1_value", T(9) + 10, T(9, 30), valor=361)   # parada, aparelho mandando leitura
+
+
+@pytest.mark.parametrize("resposta, legenda, diag", [(False, 97, "sem resposta"), (True, 98, "ok"),
+                                                      (None, 98, "sem MQTT")])
+def test_ciclo_diag_decide_a_parada_em_aberto(resposta, legenda, diag):
+    b = BancoFalso()
+    _parada_em_aberto(b)
+    pedidos = []
+    obj, logs, erros, res = novo(b, T(9, 30))
+    obj._diagnosticar = lambda devices, timeout: pedidos.append((devices, timeout)) or {d: resposta for d in devices}
+    r = obj.executar_ciclo()
+    assert pedidos == [(["DEV1"], 15.0)]
+    assert b.lista(1)[-1] == (legenda, T(9), None, True)
+    assert b.lista(1)[-2] == (2, T(8), T(9) - 1, True)              # o passado não muda
+    linha = r["maquinas"][0]
+    assert linha["diag"] == diag
+    assert ("Sem MQTT" in (linha["aviso"] or "")) == (resposta is None)
+
+
+def test_ciclo_diag_sem_resposta_fora_do_turno_continua_96():
+    b = BancoFalso()
+    _maquina_jornada(b)
+    ligado(b, "DEV1", "chd1_value", HOJE - 3600, T(15))
+    obj, *_ = novo(b, T(15))
+    obj._diagnosticar = lambda devices, timeout: {d: False for d in devices}
+    obj.executar_ciclo()
+    assert b.lista(1)[-1] == (96, T(14, 48), None, True)
+
+
+# ============================================================================================ recalcular
+
+
+def test_recalcular_dia_comeca_no_dia_escolhido_e_apaga_os_manuais():
+    b = BancoFalso()
+    b.maquina(1)
+    ligado(b, "DEV1", "chd1_value", T(0, dia=10) - 3600, T(9))
+    manual = b.apontamento(1, SETUP, T(10, dia=10), T(11, dia=10), iot=False)
+    fora = b.apontamento(1, SETUP, T(10, dia=9), T(11, dia=9), iot=False)      # antes do dia escolhido
+    obj, logs, erros, res = novo(b, T(9))
+    respostas = []
+    obj._ao_recalculo = lambda *a: respostas.append(a)
+    obj.executar_ciclo()
+    assert manual in b.dados["apont"]                                # o ciclo normal só olha de hoje
+    ini = T(0, dia=10)
+    assert obj.executar_recalculo(1, "2026-11-10", ini)
+    assert manual not in b.dados["apont"] and fora in b.dados["apont"]
+    assert [x[0] for x in b.lista(1) if x[3]] == [98, 98, 98]
+    mid, dia, ok, msg = respostas[-1]
+    assert (mid, dia, ok) == (1, "2026-11-10", True)
+    assert msg.startswith("Recalculado desde 10/11:") and "(1 manual apagado)" in msg
+    desde = [p for s, p in b.comandos if s.startswith("SELECT [ts_unix],")][-1][1]
+    assert desde == ini - MACRO_S - ap.MARGEM_LEITURAS
+    assert res[-1]["maquinas"][0]["maquina_id"] == 1 and res[-1]["maquinas"][0]["legenda"] == "98"
+
+
+def test_recalcular_dia_fora_do_limite_ou_invalido_responde_falha():
+    b = BancoFalso()
+    b.maquina(1)
+    obj, logs, erros, res = novo(b, T(9))
+    respostas = []
+    obj._ao_recalculo = lambda *a: respostas.append(a)
+    obj.recalcular(1, "2026-11-04")                                   # 8 dias atrás (limite: 7)
+    obj.recalcular(1, "2026-11-13")                                   # amanhã
+    obj.recalcular(1, "12/11/2026")
+    assert [r[2] for r in respostas] == [False, False, False]
+    assert "05/11 a 12/11" in respostas[0][3] and "AAAA-MM-DD" in respostas[2][3]
+    assert not b.comandos
+    assert obj.executar_recalculo(99, "2026-11-12", HOJE) is False
+    assert "não encontrada" in respostas[-1][3]
+
+
+def test_recalcular_pela_fila_da_thread():
+    b = BancoFalso()
+    b.maquina(1)
+    obj, logs, erros, res = novo(b, T(9))
+    respostas = []
+    obj._ao_recalculo = lambda *a: respostas.append(a)
+    obj.recalcular(1, "2026-11-12")
+    assert esperar(lambda: respostas)
+    assert respostas[0][:3] == (1, "2026-11-12", True)
+    obj.parar(2)
+
+
+# ============================================================================================ pipeline: diag do ciclo
+
+from tests.test_digirail import DEV, inicio, montar, resposta_diag  # noqa: E402,F401
+
+
+def test_pipeline_diagnosticar_dispositivos(montar):
+    p, cli, relogio, col, _con = montar(intervalo=0)
+    # responde
+    resultado = {}
+    t = threading.Thread(target=lambda: resultado.update(p.diagnosticar_dispositivos([DEV], 5)))
+    t.start()
+    assert esperar(lambda: cli.publicados)
+    ts = json.loads(cli.publicados[-1][1])["timestamp"]
+    cli.entregar(f"NOVUS/{DEV}/ack/command", resposta_diag(ts))
+    t.join(5)
+    assert resultado == {DEV: True}
+    # não responde: False, 1 erro "comando" por incidente, resposta_comando a cada vez
+    assert p.diagnosticar_dispositivos([DEV], 0.2) == {DEV: False}
+    assert p.diagnosticar_dispositivos([DEV], 0.2) == {DEV: False}
+    registros = [json.loads(e) for e in col.erros]
+    assert [r["categoria"] for r in registros] == ["comando"] and DEV in registros[0]["mensagem"]
+    assert sum(1 for r in col.respostas if r[:3] == (DEV, "diag", False)) == 2
+    assert len(col.com("não responde", "AVISO") + col.com("A parada em aberto", "AVISO")) >= 1
+    assert not p._comandos                                            # nada pendente sobrou
+    # volta a responder: fecha o incidente; a próxima queda soma outro erro
+    resultado.clear()
+    t = threading.Thread(target=lambda: resultado.update(p.diagnosticar_dispositivos([DEV], 5)))
+    n = len(cli.publicados)
+    t.start()
+    assert esperar(lambda: len(cli.publicados) > n)
+    cli.entregar(f"NOVUS/{DEV}/ack/command", resposta_diag(json.loads(cli.publicados[-1][1])["timestamp"]))
+    t.join(5)
+    assert resultado == {DEV: True} and col.com("voltou a responder", "INFO")
+    assert p.diagnosticar_dispositivos([DEV], 0.1) == {DEV: False}
+    assert len(col.erros) == 2
+    # sem MQTT: None, sem publicar nada
+    p.desconectar().result(5)
+    n = len(cli.publicados)
+    assert p.diagnosticar_dispositivos([DEV], 0.1) == {DEV: None}
+    assert len(cli.publicados) == n
+
+
+def test_bridge_tem_recalcular_e_sinal():
+    from app.bridge import PipelineBridge
+    from tests.fake_bridge import FakePipelineBridge
+    for cls in (PipelineBridge, FakePipelineBridge):
+        assert hasattr(cls, "recalculo_concluido") and callable(getattr(cls, "recalcular_dia_apontamentos"))
+
+
+def test_config_legenda_fora_turno():
+    assert Config().apontamentos.legenda_fora_turno == "96"

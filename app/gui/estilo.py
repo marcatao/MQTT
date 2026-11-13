@@ -59,6 +59,10 @@ class Paleta:
     # Categoria "comando" (comandos enviados ao dispositivo): 5ª cor de categoria. #0A6B7C sobre #E0F2F7: 5,6:1.
     ciano: str = "#0A6B7C"
     ciano_suave: str = "#E0F2F7"
+    # Legenda 96 "Fora de turno" (aba Apontamentos reais): índigo suave, distinto do destaque azul e do roxo.
+    # #3F4A9E sobre #E8EAF7: 6,4:1.
+    indigo: str = "#3F4A9E"
+    indigo_suave: str = "#E8EAF7"
 
 
 # Contraste conferido para WCAG AA (texto normal >= 4,5:1 sobre a superfície correspondente).
@@ -116,6 +120,8 @@ ESCURA = Paleta(
     roxo_suave="#261E3E",
     ciano="#67E8F9",
     ciano_suave="#0E2A31",
+    indigo="#A5B4FC",       # sobre #1F2342: 7,6:1
+    indigo_suave="#1F2342",
 )
 
 _QSS = Template(
@@ -423,6 +429,27 @@ QPushButton#botaoPerigo {
 QPushButton#botaoPerigo:hover { border: 2px solid $texto; padding: 0 17px; }
 QPushButton#botaoPerigo:focus { border: 2px solid $texto; padding: 0 17px; }
 QPushButton#botaoPerigo:disabled { background: $neutro_suave; color: $texto_fraco; border-color: $neutro_suave; }
+
+/* ---------- Diálogo Recalcular (aba Apontamentos reais) ---------- */
+QDialog#dialogoRecalcular { background: $fundo; }
+QFrame#avisoRecalcular { background: $erro_suave; border: 1px solid $erro; border-radius: 8px; }
+QLabel#avisoRecalcularTexto { color: $texto; background: transparent; }
+QLabel#avisoRecalcularIcone { color: $erro; background: transparent; font-weight: 700; font-size: 12pt; }
+QDateEdit {
+    background: $superficie; color: $texto; border: 1px solid $borda_forte; border-radius: 8px;
+    padding: 0 10px; min-height: 34px;
+    selection-background-color: $selecao; selection-color: $texto;
+}
+QDateEdit:hover { border-color: $texto_fraco; }
+QDateEdit:focus { border: 2px solid $destaque; padding: 0 9px; }
+QDateEdit::drop-down { border: none; width: 26px; }
+QDateEdit::down-arrow { image: url("$seta"); width: 10px; height: 10px; }
+QCalendarWidget QWidget { alternate-background-color: $superficie_alt; }
+QCalendarWidget QToolButton { color: $texto; background: transparent; border: none; padding: 4px 8px; }
+QCalendarWidget QAbstractItemView:enabled {
+    background: $superficie; color: $texto; selection-background-color: $destaque; selection-color: $texto_sobre_destaque;
+}
+QCalendarWidget QAbstractItemView:disabled { color: $texto_fraco; }
 
 /* ---------- Diálogo Tópicos (aba Clientes) ---------- */
 QDialog#dialogoTopicos { background: $fundo; }

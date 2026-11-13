@@ -310,6 +310,11 @@ class _Comando:
     manual: bool = True     # diag automático só responde em ao_resposta_comando quando falha por falta de resposta
     canais: list[int] = field(default_factory=list)
     topico_resposta: str = ""   # ack_command efetivo do device (para a mensagem de "sem resposta")
+    # diag dos apontamentos reais (``diagnosticar_dispositivos``): quem espera é o ciclo, não o timeout do pipeline
+    externo: bool = False
+    evento: threading.Event | None = None
+    respondeu: bool = False
+    cancelado: bool = False
 
 
 class _Limitador:
@@ -368,6 +373,7 @@ class Pipeline:
         cadastro_oee: CadastroOee | None = None,
         ao_apontamentos: Callable[[str], None] = _nada,
         apontamentos_oee: ApontamentosOee | None = None,
+        ao_recalculo: Callable[[int, str, bool, str], None] = _nada,
     ) -> None:
         """``relogio``, ``intervalo_gravacao`` (sobrepõe a config), ``fabrica_cliente`` e ``cadastro_oee`` existem
         para os testes."""
@@ -423,6 +429,7 @@ class Pipeline:
         self._comandos: dict[tuple[str, int], _Comando] = {}   # (device_id, timestamp) → pendente
         self._diag_t: dict[str, float] = {}          # device_id → último diag automático (por conexão)
         self._topicos_publicados: set[str] = set()   # eco dos nossos comandos é ignorado
+        self._mudos: set[str] = set()                # devices sem resposta ao diag do ciclo (1 erro por incidente)
 
         # tópicos por dispositivo (dispositivos.json) e as assinaturas extras que eles exigem
         self._topicos = _topicos.TopicosDispositivos(self._caminho_topicos(), self._cfg_dispositivos(),
@@ -438,6 +445,7 @@ class Pipeline:
         # apontamentos reais no portal OEE (docs/apontamentos_reais.md): thread/conexão próprias, roda mesmo sem
         # MQTT. Só começa sozinho com o SQL real (sem fabrica_sink de teste) ou quando os testes passam um pronto.
         self._ao_apontamentos = ao_apontamentos
+        self._ao_recalculo = ao_recalculo
         if apontamentos_oee is not None:
             self._apontamentos = apontamentos_oee
             iniciar_apontamentos = True
@@ -445,7 +453,9 @@ class Pipeline:
             self._apontamentos = ApontamentosOee(
                 config.sqlserver, getattr(config, "oee", None), getattr(config, "apontamentos", None), self._log,
                 ao_erro=lambda msg, detalhe=None: self._erro("apontamentos", msg, detalhe=detalhe),
-                ao_resultado=lambda texto: self._avisar(self._ao_apontamentos, texto), relogio=relogio)
+                ao_resultado=lambda texto: self._avisar(self._ao_apontamentos, texto), relogio=relogio,
+                diagnosticar=self.diagnosticar_dispositivos, timeout_diag=self._timeout_comando(),
+                ao_recalculo=lambda *a: self._avisar(self._ao_recalculo, *a))
             iniciar_apontamentos = fabrica_sink is None
         if iniciar_apontamentos:
             self._apontamentos.iniciar()
@@ -475,6 +485,11 @@ class Pipeline:
     def executar_apontamentos_agora(self) -> None:
         """Não bloqueia: pede um ciclo de apontamentos reais já; o resultado vem em ``ao_apontamentos``."""
         self._apontamentos.executar_agora()
+
+    def recalcular_dia_apontamentos(self, maquina_id: int, dia: str) -> None:
+        """Não bloqueia: refaz a timeline da máquina desde 00:00 local de ``dia`` ("AAAA-MM-DD"); responde em
+        ``ao_recalculo`` (e um ``ao_apontamentos`` com a linha dela atualizada)."""
+        self._apontamentos.recalcular(maquina_id, dia)
 
     def encerrar(self, timeout: float = 5.0) -> bool:
         """Bloqueia até ``timeout`` segundos. Devolve True se terminou limpo."""
@@ -1155,7 +1170,7 @@ class Pipeline:
             self._log("INFO", f"Pedido de diagnóstico enviado a {device} ({'manual' if manual else 'automático'}).")
 
     def _enviar(self, device: str, comando: str, desejado: dict, manual: bool,
-                canais: list[int] | None = None) -> _Comando | None:
+                canais: list[int] | None = None, externo: bool = False) -> _Comando | None:
         """Publica o comando e registra como pendente. Em falha, avisa e devolve None."""
         efetivos = self._topicos.efetivos(device)
         topico, ack = efetivos["command"], efetivos["ack_command"]
@@ -1171,6 +1186,8 @@ class Pipeline:
             while (device, ts) in self._comandos:   # o timestamp é o id de correlação: único por device
                 ts += 1
             cmd = _Comando(device, comando, ts, agora, topico, manual, canais or [], ack)
+            if externo:
+                cmd.externo, cmd.evento = True, threading.Event()
             self._comandos[(device, ts)] = cmd
         self._garantir_resposta(cliente, device)
         self._topicos_publicados.add(topico)
@@ -1193,6 +1210,8 @@ class Pipeline:
         ``diag`` manual sempre responde em ``ao_resposta_comando``; o automático só quando ``sem_resposta`` (timeout),
         com a mensagem citando os tópicos do pedido e da resposta esperada (dica na aba Clientes).
         """
+        if cmd.externo:
+            return   # diagnóstico do ciclo de apontamentos: quem trata é diagnosticar_dispositivos
         if cmd.comando == "reset_counters":
             self._log("ERRO", f"Zerar contadores em {cmd.device_id} falhou: {mensagem}")
             if registrar:
@@ -1216,7 +1235,7 @@ class Pipeline:
         agora = self._relogio()
         limite = self._timeout_comando()
         with self._trava_cmd:
-            vencidos = [c for c in self._comandos.values() if agora - c.inicio >= limite]
+            vencidos = [c for c in self._comandos.values() if agora - c.inicio >= limite and not c.externo]
             for c in vencidos:
                 self._comandos.pop((c.device_id, c.timestamp), None)
         for c in vencidos:
@@ -1228,11 +1247,98 @@ class Pipeline:
                     self._diag_t[device] = agora
                     self._pedir_diag(device, False)
 
+    # -- diagnóstico do ciclo de apontamentos reais --------------------------------------------------------
+
+    def diagnosticar_dispositivos(self, devices: list[str], timeout: float) -> dict[str, bool | None]:
+        """Bloqueante (chamado pela thread dos apontamentos): manda ``diag`` a cada device, com os tópicos efetivos
+        dele, e espera as respostas em paralelo até ``timeout`` s.
+
+        Devolve ``{device: True}`` (respondeu), ``False`` (sem resposta) ou ``None`` (não deu para perguntar: MQTT
+        desconectado, device inválido ou falha ao publicar). Sem resposta: ``resposta_comando(device, "diag",
+        False, msg)`` a cada vez (coluna Diagnóstico da aba Clientes), mas AVISO e erro "comando" só 1 vez por
+        incidente de device mudo; o incidente fecha (INFO) quando ele volta a responder.
+        """
+        resultado: dict[str, bool | None] = {}
+        cliente = self._cliente
+        conectado = (cliente is not None and not self._encerrado and getattr(cliente, "conectado", True)
+                     and getattr(cliente, "publicar", None) is not None)
+        cmds: dict[str, _Comando] = {}
+        for device in dict.fromkeys(str(d) for d in devices if d):
+            if not conectado:
+                resultado[device] = None
+                continue
+            try:
+                valido = digirail.validar_device_id(device)
+            except ValueError:
+                resultado[device] = None
+                continue
+            cmd = self._enviar(valido, "diag", {}, manual=False, externo=True)
+            if cmd is None:
+                resultado[device] = None
+            else:
+                cmds[device] = cmd
+        if cmds:
+            limite = time.monotonic() + max(0.0, float(timeout))
+            for cmd in cmds.values():
+                cmd.evento.wait(max(0.0, limite - time.monotonic()))
+            with self._trava_cmd:
+                for cmd in cmds.values():
+                    self._comandos.pop((cmd.device_id, cmd.timestamp), None)
+        for device, cmd in cmds.items():
+            if cmd.respondeu:
+                resultado[device] = True
+            elif cmd.cancelado:
+                resultado[device] = None
+            else:
+                resultado[device] = False
+                self._device_mudo(cmd, timeout)
+        return resultado
+
+    def _diag_respondido(self, device: str | None, cmd: _Comando | None) -> None:
+        """Resposta de diag: libera quem espera (o comando casado e qualquer diag do ciclo pendente do device) e
+        fecha o incidente de device mudo."""
+        acordar: list[_Comando] = []
+        with self._trava_cmd:
+            if cmd is not None and cmd.externo:
+                acordar.append(cmd)
+            if device:
+                for c in list(self._comandos.values()):
+                    if c.externo and c.device_id == device and c.comando == "diag":
+                        self._comandos.pop((c.device_id, c.timestamp), None)
+                        acordar.append(c)
+            voltou = bool(device) and device in self._mudos
+            if voltou:
+                self._mudos.discard(device)
+        for c in acordar:
+            c.respondeu = True
+            if c.evento is not None:
+                c.evento.set()
+        if voltou:
+            self._log("INFO", f"Dispositivo {device} voltou a responder ao diagnóstico.")
+
+    def _device_mudo(self, cmd: _Comando, timeout: float) -> None:
+        msg = (f"Sem resposta do dispositivo em {timeout:g} s (pedido em '{cmd.topico}', resposta esperada em "
+               f"'{cmd.topico_resposta}').")
+        self._avisar(self._ao_resposta_comando, cmd.device_id, "diag", False, msg)
+        with self._trava_cmd:
+            novo = cmd.device_id not in self._mudos
+            self._mudos.add(cmd.device_id)
+        if novo:
+            self._log("AVISO", f"Diagnóstico de {cmd.device_id}: {msg} A parada em aberto das máquinas dele vira "
+                               "97 nos apontamentos reais até ele voltar a responder.")
+            self._erro("comando", f"Dispositivo {cmd.device_id} não responde ao diagnóstico", cmd.topico,
+                       f"{msg} Confira o tópico de confirmação de comando (aba Clientes, \"Tópicos…\").")
+        else:
+            logger.info("Diagnóstico de %s continua sem resposta", cmd.device_id)
+
     def _cancelar_comandos(self, mensagem: str) -> None:
         """Desconexão: os pendentes falham sem contar erro (não foi culpa do dispositivo)."""
         with self._trava_cmd:
             pendentes, self._comandos = list(self._comandos.values()), {}
         for c in pendentes:
+            if c.externo and c.evento is not None:
+                c.cancelado = True
+                c.evento.set()
             self._falha_comando(c, mensagem, registrar=False)
 
     def _pendente(self, device: str | None, ts: int | None, comando: str) -> _Comando | None:
@@ -1266,6 +1372,7 @@ class Pipeline:
                 diag = dados if isinstance(dados, dict) else {}
                 cmd = self._pendente(device, ts, "diag")
                 quem = cmd.device_id if cmd is not None else device
+                self._diag_respondido(quem, cmd)
                 if quem:
                     self._avisar(self._ao_diagnostico, quem, json.dumps(diag, ensure_ascii=False))
                     self._cadastrar_oee(quem, diag)
