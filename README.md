@@ -114,6 +114,7 @@ pronto para baixar. O número vem da contagem de builds do GitHub, por isso algu
 
 | Versão | Data | Principais melhorias |
 | --- | --- | --- |
+| **v0.1.22** | 17/11/2026 | Apontamentos reais: grava o **ciclo médio** (segundos por peça nas últimas 10 alterações do contador, máx. 999) em cada apontamento do integrador, na coluna nova `ciclo_medio` do portal OEE (rodar `php artisan migrate` no portal). |
 | **v0.1.21** | 13/11/2026 | Mosquitto: pasta padrão `C:\Program Files\Mosquitto` e comando `mosquitto -c "<pasta>\mosquitto.conf" -v`, com a pasta tirada do campo **Endereço Mosquitto**. |
 | **v0.1.20** | 13/11/2026 | Apontamentos reais: a legenda **97 Sem apontamento IOT** passa a vir só do diagnóstico sem rede no fechamento do ciclo; trechos sem dados viram **98** (dentro do turno) ou **96** (fora do turno). Aparelho que mandou dados no último minuto conta como respondendo. Os 97 antigos são refeitos no primeiro ciclo. |
 | **v0.1.19** | 13/11/2026 | Botão **Reiniciar** na aba Clientes: liga a saída 1 do DigiRail, que aciona o relé e corta a energia do aparelho, acompanha a volta e desliga a saída. Aparelhos do **cadastro OEE** desconectados aparecem na aba Clientes, com a coluna **Máquina**. **Diagnóstico a cada 1 min.** |
