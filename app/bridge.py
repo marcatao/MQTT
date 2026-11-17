@@ -44,7 +44,8 @@ class PipelineBridge(QObject):
     #                "desde", "ultima_producao", "apontamentos_hoje", "ultima_leitura", "aviso",
     #                "diag" ("ok"|"ok (dados recentes)"|"sem resposta"|"sem MQTT"|null),
     #                "turno" ("dentro"|"fora"|"sem jornada"),
-    #                "jornada" (ex. "Seg–Qui 05:00–14:48, Sex 05:00–13:48" | null)}]}
+    #                "jornada" (ex. "Seg–Qui 05:00–14:48, Sex 05:00–13:48" | null),
+    #                "ciclo_medio" (int s | null, do apontamento mais recente)}]}
     apontamentos_atualizados = Signal(str)
     recalculo_concluido = Signal(int, str, bool, str)  # (maquina_id, dia "AAAA-MM-DD", sucesso, mensagem em português)
 

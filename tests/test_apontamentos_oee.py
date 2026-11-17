@@ -379,7 +379,9 @@ def _ep(v):
 class BancoFalso:
     """SQL Server de mentira: guarda as tabelas em memória e responde às consultas do módulo pelo texto."""
 
-    def __init__(self, com_97: bool = True, com_96: bool = True, jornada: bool = True) -> None:
+    def __init__(self, com_97: bool = True, com_96: bool = True, jornada: bool = True, com_ciclo: bool = True
+                 ) -> None:
+        self.com_ciclo = com_ciclo    # coluna apontamentos_estado.ciclo_medio
         legendas = {2: ("2", "Produção Normal", "produzindo", True),
                     99: ("99", "Microparada", "parada", True),
                     98: ("98", "Macro parada", "parada", True),
@@ -433,6 +435,11 @@ class BancoFalso:
             self.dados["iot"].append((device, ts, {canal: v}))
         self._salvo = copy.deepcopy(self.dados)
 
+    def ciclos(self, maquina):
+        """[(inicio, ciclo_medio)] dos apontamentos da máquina, em ordem."""
+        return sorted((_ep(a["inicio"]), a.get("ciclo")) for a in self.dados["apont"].values()
+                      if a["maquina"] == maquina)
+
     def lista(self, maquina):
         """[(legenda, inicio, fim, iot)] da máquina, em ordem."""
         return sorted(((a["legenda"], _ep(a["inicio"]), _ep(a["fim"]), a["obs"].startswith("[IoT]"))
@@ -471,6 +478,7 @@ class BancoFalso:
             if tabela == "calendario_dias":
                 return [(c,) for c in ("id", "calendario_id", "data", "tipo", "descricao")]
             extras = {"maquinas": {"atualizado_em", *(ap.COLUNAS_JORNADA if self.jornada else ())},
+                      "apontamentos_estado": {"ciclo_medio"} if self.com_ciclo else set(),
                       "ordens_producao": {"status_em"}}.get(tabela, set())
             return [(c,) for c in ap.TABELAS_OEE[tabela] | extras]
         if "FROM [OEE].[dbo].[legendas]" in sql and sql.startswith("SELECT [id], [codigo]"):
@@ -513,21 +521,34 @@ class BancoFalso:
             return [(max(tss) if tss else None,)]
         if sql.startswith("SELECT [id], [legenda_id], [inicio]"):
             maq, agora, ini = p
-            return sorted(((i, a["legenda"], a["inicio"], a["fim"], a["obs"], a["op"]) for i, a in d["apont"].items()
+            com = "[ciclo_medio]" in sql
+            return sorted(((i, a["legenda"], a["inicio"], a["fim"], a["obs"], a["op"],
+                            *([a.get("ciclo")] if com else [])) for i, a in d["apont"].items()
                            if a["maquina"] == maq and a["inicio"] <= agora and (a["fim"] is None or a["fim"] >= ini)),
                           key=lambda r: (r[2], r[0]))
         if sql.startswith("DELETE FROM"):
             d["apont"].pop(p[0])
             return []
         if sql.startswith("UPDATE [OEE].[dbo].[apontamentos_estado]"):
-            a = d["apont"][p[4]]
+            a = d["apont"][p[-1]]
             a["inicio"], a["fim"], a["legenda"] = p[0], p[1], p[2]
+            if "[ciclo_medio] = ?" in sql:
+                a["ciclo"] = p[3]
             return []
         if sql.startswith("INSERT INTO [OEE].[dbo].[apontamentos_estado]"):
             self.proximo_id += 1
-            d["apont"][self.proximo_id] = {"maquina": p[0], "legenda": p[1], "op": p[2], "inicio": p[3],
-                                           "fim": p[4], "obs": p[5]}
+            cols = [c.strip(" []") for c in sql.split("(", 1)[1].split(")", 1)[0].split(",")]
+            v = dict(zip(cols, p))
+            d["apont"][self.proximo_id] = {"maquina": v["maquina_id"], "legenda": v["legenda_id"],
+                                           "op": v["ordem_producao_id"], "inicio": v["inicio"], "fim": v["fim"],
+                                           "obs": v["observacao"], "ciclo": v.get("ciclo_medio")}
             return []
+        if sql.startswith("SELECT TOP (") and "ORDER BY [ts_unix] DESC" in sql:   # leituras antes (ciclo médio)
+            n = int(sql.split("TOP (", 1)[1].split(")", 1)[0])
+            canal = sql.split("[ts_unix], [", 1)[1].split("]", 1)[0]
+            dev, ate = p
+            linhas = sorted(((ts, v.get(canal)) for dv, ts, v in d["iot"] if dv == dev and ts < ate), reverse=True)
+            return linhas[:n]
         if sql.startswith("SELECT TOP 1 a.[inicio]"):
             cand = sorted(((a["inicio"], i, a) for i, a in d["apont"].items() if a["maquina"] == p[0]),
                           key=lambda x: (x[0], x[1]))
@@ -535,7 +556,8 @@ class BancoFalso:
                 return []
             _, _, a = cand[-1]
             leg = d["legendas"].get(a["legenda"])
-            return [(a["inicio"], a["legenda"], a["op"], leg[2] if leg else None)]
+            return [(a["inicio"], a["legenda"], a["op"], leg[2] if leg else None,
+                     *([a.get("ciclo")] if "[ciclo_medio]" in sql else []))]
         if sql.startswith("UPDATE [OEE].[dbo].[maquinas]"):
             m = d["maquinas"][p[-1]]
             m["situacao"], m["desde"], m["legenda"], m["op"] = p[0], _ep(p[1]), p[2], p[3]
@@ -1487,3 +1509,139 @@ def test_bridge_tem_recalcular_e_sinal():
 
 def test_config_legenda_fora_turno():
     assert Config().apontamentos.legenda_fora_turno == "96"
+
+
+# ============================================================================================ ciclo médio
+
+from app.core.apontamentos_oee import alteracoes, ciclo_medio  # noqa: E402
+
+
+def test_alteracoes_guardam_o_valor_e_marcam_o_reinicio():
+    alts = alteracoes([(0, 5), (10, 6), (20, 6), (30, 9), (40, 0), (50, 1), (60, None)])
+    assert alts[:2] == [(10, 6.0), (30, 9.0)]
+    assert alts[2][0] == 40 and alts[2][1] != alts[2][1]          # marcador de reinício (nan)
+    assert alts[3] == (50, 1.0)
+    assert producoes([(0, 5), (10, 6), (20, 6), (30, 9), (40, 0), (50, 1)]) == [10, 30, 50]
+
+
+def test_ciclo_medio_contador_de_1_em_1_e_a_media_dos_intervalos():
+    # 15 alterações com intervalos variados; valem as 10 últimas (11 registros)
+    tss = [0, 30, 50, 80, 100, 130, 150, 180, 200, 230, 250, 280, 300, 330, 350]
+    alts = [(t, float(i)) for i, t in enumerate(tss)]
+    ultimos = tss[-11:]
+    assert ciclo_medio(alts, 10_000) == round((ultimos[-1] - ultimos[0]) / 10)   # 250/10 = 25
+    assert ciclo_medio(alts, 10_000, n=2) == round((350 - 300) / 2)
+
+
+def test_ciclo_medio_contador_subindo_3_por_leitura_e_o_tempo_por_peca():
+    leituras = [(t, 3 * k) for k, t in enumerate(range(0, 200, 10))]   # leitura a cada 10 s, +3 peças
+    assert ciclo_medio(alteracoes(leituras), 10_000) == 3                # 100 s / 30 peças = 3,33 → 3
+
+
+def test_ciclo_medio_menos_de_2_alteracoes_e_none_e_teto_999():
+    assert ciclo_medio([], 100) is None
+    assert ciclo_medio([(10, 1.0)], 100) is None
+    assert ciclo_medio([(10, 1.0), (20, 2.0)], 15) is None                 # só 1 alteração até "ate"
+    assert ciclo_medio([(0, 1.0), (5000, 2.0)], 9999) == 999
+    assert ciclo_medio([(0, 1.0), (5000, 2.0)], 9999, teto=100) == 100
+
+
+def test_ciclo_medio_reinicio_do_contador_quebra_a_sequencia():
+    leituras = [(0, 100), (10, 101), (20, 102), (30, 103), (40, 0), (100, 1), (160, 2), (220, 3)]
+    alts = alteracoes(leituras)
+    assert ciclo_medio(alts, 1000) == 60                                 # só depois do reinício: 1→3 em 120 s
+    assert ciclo_medio(alts, 35) == 10                                   # antes do reinício: 101→103 em 20 s
+    assert ciclo_medio(alts, 120) is None                                # depois do reinício só 1 alteração
+
+
+def test_ciclo_medio_em_aberto_ate_agora_e_fechado_ate_o_fim():
+    alts = [(t, float(i)) for i, t in enumerate([0, 10, 20, 30, 40, 100, 160, 220])]
+    assert ciclo_medio(alts, 35, n=3) == 10              # fechado em 35: só o que veio até o fim
+    assert ciclo_medio(alts, 500, n=3) == 60             # em aberto: até agora
+
+
+def _maquina_com_ritmos(b):
+    """Produz a cada 30 s das 8h às 8h30, microparada de 2 min, a cada 20 s até 9h e para (aparelho ligado)."""
+    b.maquina(1)
+    ligado(b, "DEV1", "chd1_value", HOJE - 3600, T(8) - 60)
+    producao_continua(b, "DEV1", "chd1_value", T(8), T(8, 30), passo=30)            # valores 0..61
+    producao_continua(b, "DEV1", "chd1_value", T(8, 32), T(9), passo=20, valor=61)  # base 61 em 8h31m40
+    ligado(b, "DEV1", "chd1_value", T(9) + 20, T(9, 30), valor=61 + 85)
+
+
+def test_ciclo_cada_apontamento_tem_o_ciclo_ate_o_fim_dele_e_o_aberto_ate_agora():
+    b = BancoFalso()
+    _maquina_com_ritmos(b)
+    obj, logs, erros, res = novo(b, T(9, 30))
+    r = obj.executar_ciclo()
+    assert r["ok"] and not erros
+    assert [x[0] for x in b.lista(1)] == [98, 2, 99, 2, 98]
+    assert b.ciclos(1) == [(HOJE, None), (T(8), 30), (T(8, 30), 30), (T(8, 32), 20), (T(9), 20)]
+    assert r["maquinas"][0]["ciclo_medio"] == 20                          # do apontamento mais recente
+    inserts = [s for s, _p in b.comandos if s.startswith("INSERT INTO [OEE].[dbo].[apontamentos_estado]")]
+    assert inserts and all("[ciclo_medio]" in s for s in inserts)
+    # só o ciclo do aberto muda (nova produção mais lenta): é uma atualização normal
+    producao_continua(b, "DEV1", "chd1_value", T(9, 31), T(9, 33), passo=50, valor=146)
+    obj._relogio.t = T(9, 33, 30)
+    r = obj.executar_ciclo()
+    assert b.ciclos(1)[-1][0] == T(9, 31) and r["alterados"] >= 1
+
+
+def test_ciclo_usa_alteracoes_de_antes_da_janela():
+    b = BancoFalso()
+    b.maquina(1)
+    producao_continua(b, "DEV1", "chd1_value", T(22, dia=11), T(23, dia=11), passo=40)  # ontem: 40 s por peça
+    ligado(b, "DEV1", "chd1_value", T(23, dia=11) + 60, T(1), valor=91)                  # parada desde 23h
+    obj, *_ = novo(b, T(1))
+    r = obj.executar_ciclo()
+    assert b.lista(1) == [(98, HOJE, None, True)]
+    assert b.ciclos(1) == [(HOJE, 40)] and r["maquinas"][0]["ciclo_medio"] == 40
+    antes = [(s, p) for s, p in b.comandos if s.startswith("SELECT TOP (500) [ts_unix], [chd1_value]")]
+    assert antes and antes[0][1][1] == HOJE - MACRO_S - ap.MARGEM_LEITURAS
+
+
+def test_ciclo_consulta_de_antes_da_janela_e_limitada():
+    b = BancoFalso()
+    b.maquina(1)
+    producao_continua(b, "DEV1", "chd1_value", T(12, dia=11), T(13, dia=11), passo=40)
+    ligado(b, "DEV1", "chd1_value", T(13, dia=11) + 5, T(1), valor=91, passo=5)          # 12 h de linhas paradas
+    obj, *_ = novo(b, T(1))
+    obj.executar_ciclo()
+    antes = [s for s, _p in b.comandos if s.startswith("SELECT TOP (500)")]
+    assert len(antes) == ap.MAX_BLOCOS_CICLO
+    assert b.ciclos(1) == [(HOJE, None)]                                  # produção longe demais: sem dado
+
+
+def test_ciclo_coluna_ausente_segue_sem_ela_com_um_info():
+    b = BancoFalso(com_ciclo=False)
+    _maquina_com_ritmos(b)
+    obj, logs, erros, res = novo(b, T(9, 30))
+    r = obj.executar_ciclo()
+    obj.executar_ciclo()
+    assert r["ok"] and [x[0] for x in b.lista(1)] == [98, 2, 99, 2, 98]
+    assert not any("ciclo_medio" in s or "ORDER BY [ts_unix] DESC" in s for s, _p in b.comandos)
+    assert len([m for n, m in logs if "ciclo_medio" in m]) == 1
+    assert r["maquinas"][0]["ciclo_medio"] is None
+
+
+def test_ciclo_manual_aparado_nao_recebe_ciclo_medio():
+    b = BancoFalso()
+    b.maquina(1)
+    manual = b.apontamento(1, SETUP, T(23, dia=11), None, iot=False)     # em aberto desde ontem
+    _maquina_com_ritmos(b)
+    obj, *_ = novo(b, T(9, 30))
+    obj.executar_ciclo()
+    assert b.dados["apont"][manual].get("ciclo") is None
+    updates = [s for s, p in b.comandos if s.startswith("UPDATE [OEE].[dbo].[apontamentos_estado]") and p[-1] == manual]
+    assert updates and "[ciclo_medio]" not in updates[0]
+
+
+def test_planejar_com_ciclo_compara_e_leva_o_ciclo():
+    d = [Trecho(HOJE, None, PRODUZINDO, 25)]
+    existentes = [apont(1, 2, HOJE, None)]
+    assert planejar(d, existentes, HOJE, T(9), LEG, None, FUSO).vazio               # sem a coluna: igual
+    plano = planejar(d, existentes, HOJE, T(9), LEG, None, FUSO, com_ciclo=True)
+    assert [(x["id"], x["ciclo_medio"]) for x in plano.atualizar] == [(1, 25)]
+    assert planejar(d, [{**existentes[0], "ciclo_medio": 25}], HOJE, T(9), LEG, None, FUSO, com_ciclo=True).vazio
+    plano = planejar(d, [], HOJE, T(9), LEG, None, FUSO, com_ciclo=True)
+    assert plano.inserir[0]["ciclo_medio"] == 25

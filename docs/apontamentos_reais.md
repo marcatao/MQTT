@@ -144,6 +144,26 @@ confirmação "Os apontamentos MANUAIS desta máquina a partir de dd/mm serão a
 IoT" e, confirmado, o integrador refaz a máquina desde 00:00 local daquele dia até agora (mesma reconciliação, com
 `ini` = esse dia), sem esperar o ciclo. Resposta no sinal `recalculo_concluido` e no log.
 
+## Ciclo médio (decidido em 17/11/2026)
+
+`apontamentos_estado.ciclo_medio` (smallint NULL, segundos, 0–999; coluna criada pela migração
+`2026_12_07_000001_ciclo_medio_dos_apontamentos_reais.php` do portal OEE). O integrador grava em **cada apontamento
+do integrador** (criado ou atualizado) o tempo médio entre os **últimos 10 registros de alteração** do contador do
+canal de produção da máquina, até o fim do apontamento (ou até agora, se em aberto):
+
+- "Registro de alteração" = leitura em que o contador subiu (mesma regra das produções).
+- Com as alterações `a0 < a1 < … < aN` (N ≤ 10 intervalos, as mais recentes até aquele instante):
+  `ciclo_medio = round((t(aN) − t(a0)) / (contador(aN) − contador(a0)))` segundos por peça. Quando o contador sobe
+  de 1 em 1, é exatamente a média dos intervalos entre os registros; quando sobe mais de 1 por leitura (máquina mais
+  rápida que o envio de ~10 s), dá o tempo real por peça em vez de ~10 s.
+- Zerar/reiniciar o contador (valor menor) quebra a sequência: só valem as alterações depois do reinício.
+- Mais de um canal de produção: vale o primeiro canal de produção da máquina (iot1, depois iot2, iot3).
+- Menos de 2 alterações disponíveis: NULL. Acima de 999 s: **999**.
+- Para ter as 10 alterações mesmo no começo da janela, as leituras desse canal são lidas desde o que for mais antigo
+  entre o início normal da leitura e as últimas 11 alterações antes da janela (consulta própria, limitada).
+- Coluna ausente (migração não rodada): o integrador segue sem ela, em silêncio (1 INFO).
+- Atualizar o `ciclo_medio` de um apontamento em aberto a cada ciclo é uma atualização normal (conta em "atualizados").
+
 ## Apontamentos únicos e encadeados (regras do portal, `HorarioApontamento`)
 
 - Períodos seguidos com o mesmo estado formam **um único apontamento**, que vai crescendo; o último fica em aberto

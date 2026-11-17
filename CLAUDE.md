@@ -406,6 +406,9 @@ Especificação completa em `docs/apontamentos_reais.md` (fonte da verdade; cód
   aberto da máquina vira **97**.
 - **Recalcular** (13/11/2026): botão por máquina na aba, refaz a timeline desde o dia escolhido (até 7 dias), avisando
   que os apontamentos manuais desse período serão apagados.
+- **Ciclo médio** (17/11/2026): coluna `ciclo_medio` (smallint, 0–999 s) em `apontamentos_estado`, criada por migração
+  no portal OEE (pedido do usuário). Em cada apontamento do integrador: tempo médio por peça nas últimas 10 alterações
+  do contador do canal de produção até o fim do apontamento; acima de 999 grava 999; sem dados, NULL.
 - Primeira execução: a partir de **hoje 00:00** (hora de Brasília); depois reconcilia de ontem 00:00 até agora.
 - Atualiza a máquina como o portal (`SituacaoMaquina`: situação, desde, legenda, OP) e o status das OPs afetadas
   (`StatusOrdemProducao`). Permissões em `sql/permissoes_oee.sql`.
