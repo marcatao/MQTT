@@ -69,6 +69,14 @@ from .widgets import (
 )
 
 TITULO = "Integrador Alumbra MQTT + SQL + Mosquitto"
+
+
+def titulo_com_versao(versao: str | None = None) -> str:
+    """Nome do programa seguido da versão (ex.: "... Mosquitto v0.1.23"); sem versão, só o nome."""
+    from app.versao import VERSAO
+
+    v = (VERSAO if versao is None else versao).strip()
+    return f"{TITULO} {v}" if v else TITULO
 # Identificadores internos NÃO mudam com o título (senão o usuário perde a senha e os valores salvos).
 ORGANIZACAO = "Alumbra"
 APLICACAO = "MQTT SQL Server"
@@ -229,7 +237,7 @@ class JanelaPrincipal(QMainWindow):
         pasta_logs = getattr(getattr(config, "gravacao", None), "pasta_logs", "logs") or "logs"
         self.janela_erros = JanelaErros(pasta_logs, self, ler=ler_erros)
 
-        self.setWindowTitle(TITULO)
+        self.setWindowTitle(titulo_com_versao())
         self.setWindowIcon(icone_app())
         self.setMinimumSize(980, 640)
         self.resize(*tamanho_inicial())
@@ -412,7 +420,7 @@ class JanelaPrincipal(QMainWindow):
         self._logo.setPixmap(pixmap_app(40, self.devicePixelRatioF()))
         titulos = QVBoxLayout()
         titulos.setSpacing(0)
-        titulo = QLabel(TITULO, raiz)
+        titulo = QLabel(titulo_com_versao(), raiz)
         titulo.setObjectName("titulo")
         sub = QLabel("Recebe as leituras dos dispositivos via MQTT e grava no SQL Server, "
                      "e mostra o broker Mosquitto local.", raiz)

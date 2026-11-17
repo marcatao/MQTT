@@ -33,6 +33,10 @@ jobs:
           QT_QPA_PLATFORM: offscreen
         run: python -m pytest -q
 
+      - name: Gravar a versão no programa
+        shell: pwsh
+        run: Set-Content -Path app/versao.py -Encoding utf8 -Value 'VERSAO = "v0.1.${{ github.run_number }}"'
+
       - name: Gerar o executável
         shell: cmd
         run: build_exe.bat

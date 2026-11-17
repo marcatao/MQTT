@@ -74,7 +74,7 @@ def montar(qapp, tmp_path):
 
 def test_padroes_preenchidos(montar):
     janela, bridge, _ = montar()
-    assert janela.windowTitle() == "Integrador Alumbra MQTT + SQL + Mosquitto"
+    assert janela.windowTitle().startswith("Integrador Alumbra MQTT + SQL + Mosquitto")
     assert janela.campo_broker.text() == "192.168.100.162"
     assert janela.campo_porta.value() == 1883
     assert janela.campo_topico.text() == "NOVUS/Teste_Alumbra/#"
@@ -216,3 +216,10 @@ def test_fechar_chama_encerrar(montar):
     janela, bridge, _ = montar()
     janela.close()
     assert ("encerrar", 8.0) in bridge.chamadas
+
+
+def test_versao_depois_do_nome_do_programa():
+    from app.gui.janela import titulo_com_versao
+
+    assert titulo_com_versao("v0.1.23") == "Integrador Alumbra MQTT + SQL + Mosquitto v0.1.23"
+    assert titulo_com_versao("") == "Integrador Alumbra MQTT + SQL + Mosquitto"
