@@ -29,6 +29,12 @@ Especificação: ``docs/apontamentos_reais.md`` (fonte da verdade). Resumo:
   teto 999. As alterações de antes da janela vêm de ``_leituras_antes`` (blocos ``TOP (500)`` decrescentes, no
   máx. 4). Sem a coluna: 1 INFO e nada de ``ciclo_medio`` nos SQLs.
 
+- **Auditoria humana**: nos UPDATEs em ``apontamentos_estado`` o integrador nunca toca em ``atualizado_por_id`` e só
+  grava ``atualizado_em`` quando ``atualizado_por_id`` é NULL (``CASE WHEN``); sem a coluna, como antes.
+- **Origem IoT** (``iot_dispositivo_id``/``iot_canal``, colunas opcionais): cada inserir/atualizar do integrador leva
+  o dispositivo (``maquinas.iotN_dispositivo_id``) e o canal do 1º canal de produção com coluna na IOT001 (o mesmo do
+  ciclo médio); origem diferente conta como mudança. Manuais ficam NULL. Sem as colunas: 1 INFO, nenhum SQL as cita.
+
 JSON de cada ciclo (``ao_resultado``)::
 
     {"quando", "proxima" (ISO local | null), "minutos", "ok", "mensagem", "criados", "alterados", "excluidos",
@@ -557,7 +563,8 @@ class Plano:
 
 
 def planejar(desejados: list[Trecho], existentes: list[dict], ini: int, agora: int, legendas: LegendasIot,
-             op_maquina: int | None, fuso: tzinfo, com_ciclo: bool = False) -> Plano:
+             op_maquina: int | None, fuso: tzinfo, com_ciclo: bool = False,
+             origem: tuple[int | None, str] | None = None) -> Plano:
     """Compara os trechos desejados de ``[ini, agora]`` com os apontamentos existentes que cruzam a janela.
 
     ``existentes``: dicts com ``id, legenda_id, inicio, fim, observacao, ordem_producao_id`` (datas em epoch).
@@ -574,6 +581,8 @@ def planejar(desejados: list[Trecho], existentes: list[dict], ini: int, agora: i
     - ``com_ciclo`` (coluna ``ciclo_medio`` existe): inserir/atualizar do integrador levam ``ciclo_medio`` =
       ``Trecho.ciclo``, e o ``ciclo_medio`` diferente também conta como mudança. Manuais aparados e os do integrador
       fechados antes de ``ini`` não mexem no ``ciclo_medio``.
+    - ``origem`` = (``iot_dispositivo_id``, ``iot_canal``), quando as colunas existem: idem (inserir/atualizar do
+      integrador levam a origem e a origem diferente conta como mudança; manuais e os fechados antes de ``ini`` não).
     """
     plano = Plano()
     dentro_iot: list[dict] = []
@@ -626,15 +635,17 @@ def planejar(desejados: list[Trecho], existentes: list[dict], ini: int, agora: i
     for d, existente, legenda in casados:
         if existente is None and sobras:
             existente = sobras.pop(0)
-        ciclo = {"ciclo_medio": d.ciclo} if com_ciclo else {}
+        extra = {"ciclo_medio": d.ciclo} if com_ciclo else {}
+        if origem is not None:
+            extra.update(iot_dispositivo_id=origem[0], iot_canal=origem[1])
         if existente is None:
             plano.inserir.append({"legenda_id": legenda, "inicio": d.inicio, "fim": d.fim,
-                                  "ordem_producao_id": op_maquina, **ciclo})
+                                  "ordem_producao_id": op_maquina, **extra})
         elif ((existente["inicio"], existente["fim"], existente["legenda_id"]) != (d.inicio, d.fim, legenda)
-              or (com_ciclo and existente.get("ciclo_medio") != d.ciclo)):
+              or any(existente.get(k) != v for k, v in extra.items())):
             plano.atualizar.append({"id": existente["id"], "inicio": d.inicio, "fim": d.fim, "legenda_id": legenda,
                                     "ordem_producao_id": existente.get("ordem_producao_id"), "manual": False,
-                                    "antes": existente, **ciclo})
+                                    "antes": existente, **extra})
     for e in sobras:
         plano.excluir.append({**e, "manual": False})
     return plano
@@ -727,6 +738,7 @@ class Esquema:
     op_status_em: bool
     apont_atualizado_por: bool = False
     apont_ciclo_medio: bool = False           # apontamentos_estado.ciclo_medio existe (migração do portal)
+    apont_origem: bool = False                # apontamentos_estado.iot_dispositivo_id e iot_canal existem
     jornada_cols: frozenset = frozenset()     # colunas de jornada/calendário existentes em maquinas
     calendario_dias: bool = False             # [banco].[dbo].[calendario_dias] legível (exceções do calendário)
 
@@ -777,6 +789,8 @@ def detectar(cursor, oee: OeeConfig, sql: SqlServerConfig) -> tuple[Esquema | No
                    maquinas_atualizado_em="atualizado_em" in colunas["maquinas"],
                    op_status_em="status_em" in colunas["ordens_producao"],
                    apont_ciclo_medio="ciclo_medio" in colunas["apontamentos_estado"],
+                   apont_origem={"iot_dispositivo_id", "iot_canal"} <= colunas["apontamentos_estado"],
+                   apont_atualizado_por="atualizado_por_id" in colunas["apontamentos_estado"],
                    jornada_cols=jornada_cols, calendario_dias=calendario), ""
 
 
@@ -787,7 +801,8 @@ def sql_maquinas(e: Esquema) -> str:
     algum = " OR ".join(f"m.[iot{n}_dispositivo_id] IS NOT NULL" for n in SLOTS)
     jornada = ", ".join(f"m.[{c}]" if c in e.jornada_cols else "NULL" for c in COLUNAS_JORNADA)
     return (f"SELECT m.[id], m.[codigo], m.[nome], m.[micro_parada_s], m.[macro_parada_s], m.[situacao], "
-            f"m.[situacao_desde], m.[situacao_legenda_id], m.[ordem_producao_id], {sel}, {jornada} "
+            f"m.[situacao_desde], m.[situacao_legenda_id], m.[ordem_producao_id], {sel}, {jornada}, "
+            f"{', '.join(f'm.[iot{n}_dispositivo_id]' for n in SLOTS)} "
             f"FROM {e.t['maquinas']} m {joins} "
             f"WHERE m.[ativo] = 1 AND m.[d_e_l_e_t_] <> '*' AND ({algum}) ORDER BY m.[nome], m.[id]")
 
@@ -809,6 +824,14 @@ class Maquina:
     dias_semana: str | None = None
     jornada_inicio: str | None = None
     jornada_fim: str | None = None
+    ids_dispositivo: dict[str, int] = field(default_factory=dict)   # código do device → dispositivos_iot.id
+
+    def origem(self, canais_iot: set[str]) -> tuple[int | None, str] | None:
+        """(dispositivos_iot.id, canal) do 1º canal de produção com coluna na IOT001 (o mesmo do ciclo médio)."""
+        primeiro = next(((d, c) for d, c in self.canais if c in canais_iot), None)
+        if primeiro is None:
+            return None
+        return self.ids_dispositivo.get(primeiro[0]), primeiro[1]
 
 
 def maquina_da_linha(linha) -> Maquina:
@@ -828,8 +851,26 @@ def maquina_da_linha(linha) -> Maquina:
                    micro=inteiro(linha[3]), macro=inteiro(linha[4]), situacao=linha[5],
                    situacao_desde=epoch_de(linha[6]), situacao_legenda_id=inteiro(linha[7]),
                    ordem_producao_id=inteiro(linha[8]), canais=canais,
+                   ids_dispositivo=_ids_da_linha(linha),
                    **dict(zip(("calendario_id", "horarios_semana", "dias_semana", "jornada_inicio", "jornada_fim"),
                               _jornada_da_linha(linha))))
+
+
+def _ids_da_linha(linha) -> dict[str, int]:
+    """Código do device → ``iotN_dispositivo_id`` (colunas depois da jornada; o 1º slot de cada device vale)."""
+    base = 9 + 4 * len(SLOTS) + len(COLUNAS_JORNADA)
+    ids: dict[str, int] = {}
+    for i in range(len(SLOTS)):
+        if base + i >= len(linha):
+            break
+        device = str(linha[9 + 4 * i + 2] or "").strip()
+        valor = linha[base + i]
+        if device and valor is not None and device not in ids:
+            try:
+                ids[device] = int(valor)
+            except (TypeError, ValueError):
+                pass
+    return ids
 
 
 def _jornada_da_linha(linha) -> tuple:
@@ -898,6 +939,7 @@ class ApontamentosOee:
         self._aviso_sem_iot = False                 # AVISO da legenda 97 ausente já dado (até resolver)
         self._aviso_fora_turno = False              # AVISO da legenda 96 ausente já dado (até resolver)
         self._info_ciclo = False                    # INFO "sem a coluna ciclo_medio" já dado (até ela existir)
+        self._info_origem = False                   # INFO "sem as colunas de origem IoT" já dado
         self._sem_parametros: set[int] = set()      # máquinas sem micro/macro já avisadas (sessão)
         self._erro_conexao = False                  # incidente de conexão aberto (1 erro por incidente)
         self._trocou_sql = False                    # definir_sql: a próxima execução reconecta
@@ -1068,6 +1110,14 @@ class ApontamentosOee:
                                     "(migração do portal OEE não rodada); os apontamentos seguem sem o ciclo médio.")
         else:
             self._info_ciclo = False
+        if not self._esquema.apont_origem:
+            if not self._info_origem:
+                self._info_origem = True
+                self._logar("INFO", "Apontamentos reais: as colunas iot_dispositivo_id/iot_canal ainda não existem em "
+                                    "apontamentos_estado (migração do portal OEE não rodada); os apontamentos seguem "
+                                    "sem a origem IoT.")
+        else:
+            self._info_origem = False
         return None, (legendas, todas, maquinas)
 
     def _elegivel(self, m: Maquina, linha: dict) -> bool:
@@ -1524,8 +1574,11 @@ class ApontamentosOee:
                 desejados = [replace(t, ciclo=ciclo_medio(alts, agora if t.fim is None else t.fim))
                              for t in desejados]
             com_ciclo = e.apont_ciclo_medio
+            origem = m.origem(e.canais_iot) if e.apont_origem else None
+            extras_sel = (["ciclo_medio"] if com_ciclo else []) + (["iot_dispositivo_id", "iot_canal"]
+                                                                   if e.apont_origem else [])
             cur.execute(f"SELECT [id], [legenda_id], [inicio], [fim], [observacao], [ordem_producao_id]"
-                        f"{', [ciclo_medio]' if com_ciclo else ''} "
+                        f"{''.join(f', [{c}]' for c in extras_sel)} "
                         f"FROM {A} WITH (UPDLOCK) WHERE [maquina_id] = ? AND [inicio] <= ? "
                         "AND ([fim] IS NULL OR [fim] >= ?) ORDER BY [inicio], [id]",
                         m.id, utc_sql(agora), utc_sql(ini))
@@ -1534,11 +1587,12 @@ class ApontamentosOee:
                 existente = {"id": int(r[0]), "legenda_id": int(r[1]), "inicio": epoch_de(r[2]),
                              "fim": epoch_de(r[3]), "observacao": r[4],
                              "ordem_producao_id": None if r[5] is None else int(r[5])}
-                if com_ciclo:
-                    existente["ciclo_medio"] = None if r[6] is None else int(r[6])
+                for i, c in enumerate(extras_sel):
+                    v = r[6 + i]
+                    existente[c] = None if v is None else (str(v).strip() if c == "iot_canal" else int(v))
                 existentes.append(existente)
             plano = planejar(desejados, existentes, ini, agora, legendas, m.ordem_producao_id, self._fuso,
-                             com_ciclo=com_ciclo)
+                             com_ciclo=com_ciclo, origem=origem)
             contagem, avisos = self._aplicar(cur, m, plano, todas, agora)
             logs.extend(("AVISO", a) for a in avisos)
 
@@ -1669,24 +1723,32 @@ class ApontamentosOee:
                 contagem["manuais"] += 1
                 avisos.append(f"Apontamentos reais: apontamento manual {self._descrever(x, todas)} da máquina "
                               f"{self._nome(m)} excluído (coberto pelo IoT).")
-        com_ciclo = self._esquema.apont_ciclo_medio
+        e = self._esquema
+        com_ciclo, com_origem = e.apont_ciclo_medio, e.apont_origem
+        # auditoria humana: atualizado_por_id nunca é tocado; atualizado_em só quando ninguém editou
+        atualizado_em = ("[atualizado_em] = CASE WHEN [atualizado_por_id] IS NULL THEN ? ELSE [atualizado_em] END"
+                         if e.apont_atualizado_por else "[atualizado_em] = ?")
         for x in plano.atualizar:
-            ciclo = com_ciclo and "ciclo_medio" in x       # manuais aparados não recebem ciclo_medio
+            # manuais aparados e os fechados antes da janela não recebem ciclo_medio nem origem
+            extras = [c for c in ("ciclo_medio", "iot_dispositivo_id", "iot_canal")
+                      if c in x and (com_ciclo if c == "ciclo_medio" else com_origem)]
             cur.execute(f"UPDATE {A} SET [inicio] = ?, [fim] = ?, [legenda_id] = ?, "
-                        f"{'[ciclo_medio] = ?, ' if ciclo else ''}[atualizado_em] = ? WHERE [id] = ?",
+                        f"{''.join(f'[{c}] = ?, ' for c in extras)}{atualizado_em} WHERE [id] = ?",
                         utc_sql(x["inicio"]), None if x["fim"] is None else utc_sql(x["fim"]), x["legenda_id"],
-                        *([x["ciclo_medio"]] if ciclo else []), agora_sql, x["id"])
+                        *[x[c] for c in extras], agora_sql, x["id"])
             contagem["alterados"] += 1
             if x["manual"]:
                 avisos.append(f"Apontamentos reais: apontamento manual {self._descrever(x['antes'], todas)} da "
                               f"máquina {self._nome(m)} aparado pelo IoT (agora termina às "
                               f"{self._hora(x['fim'])}).")
         for x in plano.inserir:
+            extras = (["ciclo_medio"] if com_ciclo else []) + (["iot_dispositivo_id", "iot_canal"] if com_origem
+                                                               else [])
             colunas = "[maquina_id], [legenda_id], [ordem_producao_id], [inicio], [fim], [observacao], " \
-                      f"{'[ciclo_medio], ' if com_ciclo else ''}[criado_em], [atualizado_em]"
+                      f"{''.join(f'[{c}], ' for c in extras)}[criado_em], [atualizado_em]"
             valores = [m.id, x["legenda_id"], x["ordem_producao_id"], utc_sql(x["inicio"]),
                        None if x["fim"] is None else utc_sql(x["fim"]), OBSERVACAO,
-                       *([x.get("ciclo_medio")] if com_ciclo else []), agora_sql, agora_sql]
+                       *[x.get(c) for c in extras], agora_sql, agora_sql]
             cur.execute(f"INSERT INTO {A} ({colunas}) VALUES ({', '.join('?' for _ in valores)})", *valores)
             contagem["criados"] += 1
         return contagem, avisos

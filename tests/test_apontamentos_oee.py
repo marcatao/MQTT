@@ -5,6 +5,7 @@ Nada aqui acessa um SQL Server de verdade: ``BancoFalso`` imita, em memória, s�
 from __future__ import annotations
 
 import copy
+import re
 import json
 import threading
 import time
@@ -368,6 +369,11 @@ class Cursor:
         pass
 
 
+# coluna do SQL → chave do registro falso
+CAMPOS = {"inicio": "inicio", "fim": "fim", "legenda_id": "legenda", "ciclo_medio": "ciclo",
+          "iot_dispositivo_id": "dev", "iot_canal": "canal", "atualizado_em": "em", "atualizado_por_id": "por"}
+
+
 def _dt(t):
     return None if t is None else datetime.fromtimestamp(t, timezone.utc).replace(tzinfo=None)
 
@@ -379,9 +385,11 @@ def _ep(v):
 class BancoFalso:
     """SQL Server de mentira: guarda as tabelas em memória e responde às consultas do módulo pelo texto."""
 
-    def __init__(self, com_97: bool = True, com_96: bool = True, jornada: bool = True, com_ciclo: bool = True
-                 ) -> None:
+    def __init__(self, com_97: bool = True, com_96: bool = True, jornada: bool = True, com_ciclo: bool = True,
+                 com_origem: bool = True, com_auditoria: bool = True) -> None:
         self.com_ciclo = com_ciclo    # coluna apontamentos_estado.ciclo_medio
+        self.com_origem = com_origem  # colunas apontamentos_estado.iot_dispositivo_id / iot_canal
+        self.com_auditoria = com_auditoria   # coluna apontamentos_estado.atualizado_por_id
         legendas = {2: ("2", "Produção Normal", "produzindo", True),
                     99: ("99", "Microparada", "parada", True),
                     98: ("98", "Macro parada", "parada", True),
@@ -422,11 +430,11 @@ class BancoFalso:
             "jornada": (calendario_id, horarios_semana, dias_semana, jornada_inicio, jornada_fim)}
         self._salvo = copy.deepcopy(self.dados)
 
-    def apontamento(self, maquina, legenda, inicio, fim, iot=True, op=None):
+    def apontamento(self, maquina, legenda, inicio, fim, iot=True, op=None, por=None, em=None):
         self.proximo_id += 1
         self.dados["apont"][self.proximo_id] = {"maquina": maquina, "legenda": legenda, "inicio": _dt(inicio),
                                                 "fim": _dt(fim), "obs": ap.OBSERVACAO if iot else "manual",
-                                                "op": op}
+                                                "op": op, "por": por, "em": em}
         self._salvo = copy.deepcopy(self.dados)
         return self.proximo_id
 
@@ -478,7 +486,9 @@ class BancoFalso:
             if tabela == "calendario_dias":
                 return [(c,) for c in ("id", "calendario_id", "data", "tipo", "descricao")]
             extras = {"maquinas": {"atualizado_em", *(ap.COLUNAS_JORNADA if self.jornada else ())},
-                      "apontamentos_estado": {"ciclo_medio"} if self.com_ciclo else set(),
+                      "apontamentos_estado": ({"ciclo_medio"} if self.com_ciclo else set())
+                      | ({"iot_dispositivo_id", "iot_canal"} if self.com_origem else set())
+                      | ({"atualizado_por_id"} if self.com_auditoria else set()),
                       "ordens_producao": {"status_em"}}.get(tabela, set())
             return [(c,) for c in ap.TABELAS_OEE[tabela] | extras]
         if "FROM [OEE].[dbo].[legendas]" in sql and sql.startswith("SELECT [id], [codigo]"):
@@ -492,6 +502,7 @@ class BancoFalso:
                     disp = d["dispositivos"].get(dev)
                     linha += [canal, tipo, disp[0] if disp else None, disp[1] if disp else None]
                 linha += list(m["jornada"]) if self.jornada else [None] * 5
+                linha += [dev for dev, _c, _t in m["slots"]]          # iot1..3_dispositivo_id
                 linhas.append(tuple(linha))
             return linhas
         if sql.startswith("SELECT [calendario_id], [data], [tipo]"):
@@ -521,9 +532,9 @@ class BancoFalso:
             return [(max(tss) if tss else None,)]
         if sql.startswith("SELECT [id], [legenda_id], [inicio]"):
             maq, agora, ini = p
-            com = "[ciclo_medio]" in sql
+            extras = [c for c in re.findall(r"\[(\w+)\]", sql.split("[ordem_producao_id]", 1)[1].split(" FROM ")[0])]
             return sorted(((i, a["legenda"], a["inicio"], a["fim"], a["obs"], a["op"],
-                            *([a.get("ciclo")] if com else [])) for i, a in d["apont"].items()
+                            *[a.get(CAMPOS[c]) for c in extras]) for i, a in d["apont"].items()
                            if a["maquina"] == maq and a["inicio"] <= agora and (a["fim"] is None or a["fim"] >= ini)),
                           key=lambda r: (r[2], r[0]))
         if sql.startswith("DELETE FROM"):
@@ -531,9 +542,14 @@ class BancoFalso:
             return []
         if sql.startswith("UPDATE [OEE].[dbo].[apontamentos_estado]"):
             a = d["apont"][p[-1]]
-            a["inicio"], a["fim"], a["legenda"] = p[0], p[1], p[2]
-            if "[ciclo_medio] = ?" in sql:
-                a["ciclo"] = p[3]
+            sets = sql.split(" SET ", 1)[1].rsplit(" WHERE ", 1)[0]
+            pares = re.findall(r"\[(\w+)\] = (CASE WHEN \[atualizado_por_id\] IS NULL THEN \? ELSE \[\w+\] END|\?)",
+                               sets)
+            assert "atualizado_por_id] =" not in sets.replace("WHEN [atualizado_por_id] IS NULL", "")
+            for (coluna, expr), valor in zip(pares, p[:-1]):
+                if expr.startswith("CASE") and a.get("por") is not None:
+                    continue                                   # editado por usuário: preserva atualizado_em
+                a[CAMPOS[coluna]] = valor
             return []
         if sql.startswith("INSERT INTO [OEE].[dbo].[apontamentos_estado]"):
             self.proximo_id += 1
@@ -541,7 +557,9 @@ class BancoFalso:
             v = dict(zip(cols, p))
             d["apont"][self.proximo_id] = {"maquina": v["maquina_id"], "legenda": v["legenda_id"],
                                            "op": v["ordem_producao_id"], "inicio": v["inicio"], "fim": v["fim"],
-                                           "obs": v["observacao"], "ciclo": v.get("ciclo_medio")}
+                                           "obs": v["observacao"], "ciclo": v.get("ciclo_medio"),
+                                           "dev": v.get("iot_dispositivo_id"), "canal": v.get("iot_canal"),
+                                           "por": None, "em": v.get("atualizado_em")}
             return []
         if sql.startswith("SELECT TOP (") and "ORDER BY [ts_unix] DESC" in sql:   # leituras antes (ciclo médio)
             n = int(sql.split("TOP (", 1)[1].split(")", 1)[0])
@@ -1645,3 +1663,111 @@ def test_planejar_com_ciclo_compara_e_leva_o_ciclo():
     assert planejar(d, [{**existentes[0], "ciclo_medio": 25}], HOJE, T(9), LEG, None, FUSO, com_ciclo=True).vazio
     plano = planejar(d, [], HOJE, T(9), LEG, None, FUSO, com_ciclo=True)
     assert plano.inserir[0]["ciclo_medio"] == 25
+
+
+# ============================================================================================ auditoria e origem IoT
+
+
+def _comandos_apont(b, inicio="UPDATE"):
+    return [(s, p) for s, p in b.comandos if s.startswith(f"{inicio}") and "[apontamentos_estado]" in s]
+
+
+def test_update_preserva_atualizado_em_de_quem_editou_e_grava_quando_ninguem_editou():
+    b = BancoFalso()
+    b.maquina(1)
+    ligado(b, "DEV1", "chd1_value", ONTEM - 3600, T(3))
+    editado_em = _dt(T(1))
+    editado = b.apontamento(1, SETUP, HOJE, None, por=7, em=editado_em)            # o operador trocou o motivo
+    manual = b.apontamento(1, SETUP, T(22, dia=11), None, iot=False, por=5, em=editado_em)   # aberto desde ontem
+    obj, logs, erros, _ = novo(b, T(3))
+    obj.executar_ciclo()
+    a = b.dados["apont"][editado]
+    assert a["legenda"] == SETUP and a["dev"] == 1                    # atualizado (origem), motivo mantido
+    assert a["em"] == editado_em and a["por"] == 7                    # auditoria humana intacta
+    m = b.dados["apont"][manual]
+    assert _ep(m["fim"]) == T(23, 59, 59, dia=11) and m["em"] == editado_em and m["por"] == 5
+    assert m.get("dev") is None and m.get("canal") is None           # manual aparado não recebe origem
+    ups = _comandos_apont(b)
+    assert ups and all("CASE WHEN [atualizado_por_id] IS NULL THEN ? ELSE [atualizado_em] END" in s for s, _p in ups)
+    assert not any("[atualizado_por_id] = ?" in s for s, _p in ups)
+    # sem edição humana: o integrador grava atualizado_em
+    b.dados["apont"][editado]["por"] = None
+    b.commit()
+    obj._relogio.t = T(3, 5)
+    ligado(b, "DEV1", "chd1_value", T(3) + 60, T(3, 5))
+    b.dados["apont"][editado]["dev"] = None                           # força uma atualização
+    b.commit()
+    obj.executar_ciclo()
+    assert b.dados["apont"][editado]["em"] == ap.utc_sql(T(3, 5))
+
+
+def test_sem_a_coluna_atualizado_por_id_update_como_antes():
+    b = BancoFalso(com_auditoria=False)
+    b.maquina(1)
+    ligado(b, "DEV1", "chd1_value", HOJE - 3600, T(3))
+    b.apontamento(1, 98, HOJE, None)
+    obj, *_ = novo(b, T(3))
+    obj.executar_ciclo()
+    ups = _comandos_apont(b)
+    assert ups and all("CASE" not in s and "[atualizado_em] = ?" in s for s, _p in ups)
+
+
+def test_origem_iot_no_insert_no_update_e_em_apontamento_antigo_sem_origem():
+    b = BancoFalso()
+    b.maquina(1)
+    ligado(b, "DEV1", "chd1_value", HOJE - 3600, T(8) - 20)
+    producao_continua(b, "DEV1", "chd1_value", T(8), T(9))
+    antigo = b.apontamento(1, 98, HOJE, T(8) - 1)                     # do integrador, de antes da origem existir
+    obj, logs, erros, res = novo(b, T(9, 30))
+    r = obj.executar_ciclo()
+    assert r["ok"]
+    assert all((a["dev"], a["canal"]) == (1, "chd1_value") for a in b.dados["apont"].values())
+    assert b.dados["apont"][antigo]["dev"] == 1                       # ganhou a origem no ciclo
+    ins = _comandos_apont(b, "INSERT")
+    assert ins and all("[iot_dispositivo_id], [iot_canal]" in s for s, _p in ins)
+    # nada mudou: o ciclo seguinte não atualiza só por causa da origem
+    b.comandos.clear()
+    obj._relogio.t = T(9, 30, 10)
+    r = obj.executar_ciclo()
+    assert (r["criados"], r["alterados"], r["excluidos"]) == (0, 0, 0)
+    assert not _comandos_apont(b) and not _comandos_apont(b, "INSERT")
+
+
+def test_colunas_de_origem_ausentes_um_info_e_nenhum_sql_as_menciona():
+    b = BancoFalso(com_origem=False)
+    b.maquina(1)
+    ligado(b, "DEV1", "chd1_value", HOJE - 3600, T(3))
+    obj, logs, erros, _ = novo(b, T(3))
+    obj.executar_ciclo()
+    obj.executar_ciclo()
+    assert not any("iot_canal" in s or "[iot_dispositivo_id]" in s for s, _p in b.comandos
+                   if "[apontamentos_estado]" in s)
+    assert len([m for n, m in logs if "iot_dispositivo_id" in m]) == 1
+    assert b.lista(1) == [(98, HOJE, None, True)]
+
+
+def test_maquina_com_dois_canais_vale_o_primeiro_com_coluna():
+    b = BancoFalso()
+    b.colunas_iot -= {"chd5_value"}
+    b.maquina(1, canais=((2, "chd5_value"), (1, "chd1_value")))       # iot1 sem coluna na IOT001
+    ligado(b, "DEV1", "chd1_value", HOJE - 3600, T(3))
+    obj, *_ = novo(b, T(3))
+    obj.executar_ciclo()
+    assert [(a["dev"], a["canal"]) for a in b.dados["apont"].values()] == [(1, "chd1_value")]
+    b2 = BancoFalso()
+    b2.maquina(1, canais=((2, "chd5_value"), (1, "chd1_value")))      # as duas colunas existem: vale iot1
+    ligado(b2, "DEV1", "chd1_value", HOJE - 3600, T(3))
+    obj2, *_ = novo(b2, T(3))
+    obj2.executar_ciclo()
+    assert [(a["dev"], a["canal"]) for a in b2.dados["apont"].values()] == [(2, "chd5_value")]
+
+
+def test_planejar_com_origem_compara_e_leva_a_origem():
+    d = [Trecho(HOJE, None, MACRO)]
+    existentes = [apont(1, 98, HOJE, None)]
+    plano = planejar(d, existentes, HOJE, T(9), LEG, None, FUSO, origem=(4, "chd2_value"))
+    assert [(x["id"], x["iot_dispositivo_id"], x["iot_canal"]) for x in plano.atualizar] == [(1, 4, "chd2_value")]
+    feito = {**existentes[0], "iot_dispositivo_id": 4, "iot_canal": "chd2_value"}
+    assert planejar(d, [feito], HOJE, T(9), LEG, None, FUSO, origem=(4, "chd2_value")).vazio
+    assert planejar(d, [], HOJE, T(9), LEG, None, FUSO, origem=(4, "chd2_value")).inserir[0]["iot_canal"] == \
+        "chd2_value"
