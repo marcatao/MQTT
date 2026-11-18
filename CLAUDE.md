@@ -458,6 +458,13 @@ Especificação completa em `docs/apontamentos_reais.md` (fonte da verdade; cód
   prompt mostra `C:\Program Files\Mosquitto>mosquitto -c "C:\Program Files\Mosquitto\mosquitto.conf" -v`.
 - Quem já tinha um endereço salvo (QSettings) continua com ele; "Restaurar padrão" volta ao novo padrão.
 
+### Broker junto com o integrador (decidido com o usuário em 18/11/2026)
+
+- Causa conhecida: o Mosquitto roda dentro do integrador (QProcess) e para quando o programa fecha (troca de versão,
+  reinício do vigia); o firmware do DigiRail não reconecta sozinho e só volta desligando e ligando a alimentação.
+- O usuário escolheu **manter como está** (opções recusadas por ora: broker independente que sobrevive ao fechamento do
+  programa; Mosquitto como serviço do Windows). Retomar uma delas se ele pedir.
+
 ## Pendências conhecidas
 
 - Índice único `(device_id, ts_unix)` na IOT001 (opcional, decidir com o usuário).
