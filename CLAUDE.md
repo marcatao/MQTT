@@ -409,6 +409,9 @@ Especificação completa em `docs/apontamentos_reais.md` (fonte da verdade; cód
 - **Ciclo médio** (17/11/2026): coluna `ciclo_medio` (smallint, 0–999 s) em `apontamentos_estado`, criada por migração
   no portal OEE (pedido do usuário). Em cada apontamento do integrador: tempo médio por peça nas últimas 10 alterações
   do contador do canal de produção até o fim do apontamento; acima de 999 grava 999; sem dados, NULL.
+- **Auditoria e origem IoT** (18/11/2026): o integrador não sobrescreve a auditoria de quem editou no portal
+  (`atualizado_em` só quando `atualizado_por_id` é NULL; nunca mexe em `atualizado_por_id`) e grava `iot_dispositivo_id`
+  + `iot_canal` (colunas novas do portal) em cada apontamento automático.
 - Primeira execução: a partir de **hoje 00:00** (hora de Brasília); depois reconcilia de ontem 00:00 até agora.
 - Atualiza a máquina como o portal (`SituacaoMaquina`: situação, desde, legenda, OP) e o status das OPs afetadas
   (`StatusOrdemProducao`). Permissões em `sql/permissoes_oee.sql`.

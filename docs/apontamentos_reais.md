@@ -164,6 +164,21 @@ canal de produção da máquina, até o fim do apontamento (ou até agora, se em
 - Coluna ausente (migração não rodada): o integrador segue sem ela, em silêncio (1 INFO).
 - Atualizar o `ciclo_medio` de um apontamento em aberto a cada ciclo é uma atualização normal (conta em "atualizados").
 
+## Auditoria da edição e origem IoT (decidido em 18/11/2026)
+
+- **Edição pelo portal** (tela Apontamento real, Timeline, aplicativo): o portal já grava `atualizado_por_id` (usuário
+  logado) e `atualizado_em` (UTC) em toda alteração (trait `Auditavel`); as telas passam a mostrar "Alterado por X em
+  dd/mm/aaaa hh:mm".
+- **O integrador não apaga a auditoria humana**: ao atualizar um apontamento, nunca mexe em `atualizado_por_id`, e só
+  grava `atualizado_em` quando `atualizado_por_id` é NULL (ninguém editou). Apontamento editado por um usuário guarda
+  quem e quando editou, mesmo que o integrador depois estenda o `fim`, mude o `ciclo_medio` etc.
+- **Origem IoT**: colunas novas `iot_dispositivo_id` (FK `dispositivos_iot`, NULL) e `iot_canal` (varchar 20, NULL,
+  ex. `chd1_value`) em `apontamentos_estado`, criadas pela migração
+  `2026_12_08_000001_origem_iot_dos_apontamentos_reais.php` do portal. O integrador grava em cada apontamento dele
+  (inserir e atualizar) o dispositivo (`maquinas.iotN_dispositivo_id`) e o canal do **primeiro canal de produção** da
+  máquina com coluna na IOT001 (o mesmo do `ciclo_medio`). Manual fica NULL. Colunas ausentes: segue sem elas (1 INFO).
+  O portal mostra "Automático (IoT: <código do dispositivo> / <canal>)".
+
 ## Apontamentos únicos e encadeados (regras do portal, `HorarioApontamento`)
 
 - Períodos seguidos com o mesmo estado formam **um único apontamento**, que vai crescendo; o último fica em aberto
