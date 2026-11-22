@@ -24,7 +24,7 @@ from typing import Callable
 Logar = Callable[[str, str], None]
 Enviar = Callable[[str, bytes, dict, float], tuple[int, bytes]]
 
-MAX_POR_CHAMADA = 500       # o portal aceita até 500 por chamada (config oee.iot.max_apontamentos)
+MAX_POR_CHAMADA = 100       # o portal aceita até 100 por chamada (config oee.iot.max_apontamentos)
 MAX_PENDENTES = 20000       # limite da fila em memória (portal fora do ar por muito tempo)
 ROTA = "/api/iot/apontamentos/processar"
 

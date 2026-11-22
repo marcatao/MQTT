@@ -64,7 +64,7 @@ def test_sem_rede_nao_levanta_excecao():
     assert n.pendentes == [5]
 
 
-def test_lotes_de_ate_500():
+def test_lotes_de_ate_100():
     portal = PortalFalso()
     n = NotificadorPortal("https://portal", "tok", lambda *_: None, enviar=portal)
     n.avisar(list(range(1, MAX_POR_CHAMADA + 3)))

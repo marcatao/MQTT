@@ -233,10 +233,13 @@ local** (primeira execução) até agora. Leituras lidas a partir de `início_da
 ## Peças produzidas (22/11/2026)
 
 - Coluna `ciclos` de `apontamentos_estado` (criada pelo portal; sem ela, o integrador não grava nem avisa peças): em
-  cada apontamento de **produção** (legenda 2), a soma dos **pulsos do contador** do 1º canal de produção da máquina
-  (o mesmo do ciclo médio) dentro do trecho. Contador que voltou para trás (zerado) conta o valor novo. A parada começa
-  na última produção, então o pulso desse instante conta para a produção (até `fim + 1 s`), menos na virada do dia
-  (o trecho seguinte, também produção, conta o próprio início). Paradas: `ciclos` NULL.
+  **cada** apontamento do integrador (qualquer legenda: ciclo mais lento que a microparada cai num 99 e ainda é peça),
+  a soma dos **pulsos do contador** do 1º canal de produção da máquina (o mesmo do ciclo médio) de `inicio` a `fim`
+  inclusive (o seguinte começa 1 s depois: nenhum pulso perdido nem contado duas vezes); o em aberto até agora.
+  Contador que voltou para trás (zerado) conta o valor novo.
+- **Troca de OP do portal** (modo "novo"): o apontamento manual com observação começando por "Troca de OP" é ponto de
+  corte — o trecho do IoT é dividido nesse instante e esse apontamento é reaproveitado com a OP dele (antes o IoT o
+  apagava e a máquina voltava para a OP antiga).
 - Depois do commit, o aviso ao portal leva também `producao` (ids com `ciclos` novos) e `ops` (OPs afetadas). O portal
   calcula as **peças = ciclos × cavidades ativas do molde da OP** (sem molde = 1) e soma a **quantidade real** da OP.
 

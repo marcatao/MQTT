@@ -1833,9 +1833,11 @@ def test_ciclo_conta_os_pulsos_de_cada_trecho_de_producao_e_avisa_o_portal_das_p
     assert r["ok"] and not erros
     por_inicio = {_ep(a["inicio"]): (i, a) for i, a in b.dados["apont"].items()}
     i_prod, prod = por_inicio[T(8)]
-    assert prod["legenda"] == 2 and prod["ciclos"] == 361                  # 08:00:00 até 09:00:00 (inclusive)
-    assert por_inicio[T(9)][1]["ciclos"] is None                          # parada não conta
-    assert avisos[-1][1] == [i_prod] and avisos[-1][2] == [40]
+    assert prod["legenda"] == 2 and prod["ciclos"] == 360                  # 08:00:00 até 08:59:59
+    i_par, par = por_inicio[T(9)]
+    assert par["ciclos"] == 1                                              # o pulso das 09:00 abre a parada: conta nela
+    assert sum(a["ciclos"] or 0 for a in b.dados["apont"].values()) == 361 # nenhum pulso perdido nem contado 2 vezes
+    assert i_prod in avisos[-1][1] and i_par in avisos[-1][1] and avisos[-1][2] == [40]
     # Próximo ciclo sem pulsos novos: nada a refazer de peças.
     obj._relogio.t = T(9, 12)
     obj.executar_ciclo()
@@ -1851,3 +1853,44 @@ def test_sem_a_coluna_ciclos_no_portal_nao_grava_nem_avisa_pecas():
     obj._avisar_portal = lambda ids, *resto: avisos.append(resto)
     assert obj.executar_ciclo()["ok"]
     assert avisos[-1] == () and all("ciclos" not in s for s, _p in b.comandos if s.startswith("INSERT"))
+
+
+def test_pulsos_em_microparadas_seguidas_tambem_contam():
+    """Ciclo mais lento que a microparada: todos os trechos viram 99, mas cada pulso ainda é peça."""
+    b = BancoFalso()
+    b.maquina(1, micro=30, macro=300)
+    ligado(b, "DEV1", "chd1_value", T(7), T(8) - 40)
+    b.leituras("DEV1", "chd1_value", [(T(8) + 40 * k, k + 1) for k in range(20)])   # 1 pulso a cada 40 s
+    obj, logs, erros, _ = novo(b, T(8, 15))
+    obj._avisar_portal = lambda *a: None
+    assert obj.executar_ciclo()["ok"]
+    assert sum(a["ciclos"] or 0 for a in b.dados["apont"].values()) == 20
+
+
+def test_troca_de_op_do_portal_vira_ponto_de_corte_e_a_op_nova_fica():
+    """"Trocar OP" (modo novo) no portal cria um apontamento manual: o IoT corta ali e não volta para a OP antiga."""
+    b = BancoFalso()
+    b.maquina(1, op=40)
+    for op in (40, 41):
+        b.dados["ops"][op] = {"datrf": "", "c2_status": "", "quje": 0, "status": "aberta"}
+    ligado(b, "DEV1", "chd1_value", HOJE - 3600, T(8) - 20)
+    producao_continua(b, "DEV1", "chd1_value", T(8), T(9, 30))
+    obj, logs, erros, _ = novo(b, T(9))
+    obj._avisar_portal = lambda *a: None
+    obj.executar_ciclo()
+    aberto = next(i for i, a in b.dados["apont"].items() if a["fim"] is None)
+    # Portal: encerra o aberto às 08:59:59 com a OP 40 e cria a "Troca de OP" às 09:00 com a OP 41 (manual).
+    b.dados["apont"][aberto]["fim"] = _dt(T(9) - 1)
+    b.proximo_id += 1
+    b.dados["apont"][b.proximo_id] = {"maquina": 1, "legenda": 2, "op": 41, "inicio": _dt(T(9)), "fim": None,
+                                      "obs": "Troca de OP (Timeline)", "ciclo": None, "dev": None, "canal": None,
+                                      "por": 7, "em": None, "ciclos": None}
+    troca = b.proximo_id
+    b.dados["maquinas"][1]["op"] = 41
+    obj._relogio.t = T(9, 30)
+    obj.executar_ciclo()
+    assert troca in b.dados["apont"]                                       # não foi apagado
+    assert b.dados["apont"][troca]["op"] == 41 and b.dados["apont"][troca]["fim"] is None
+    assert b.dados["apont"][aberto]["op"] == 40 and _ep(b.dados["apont"][aberto]["fim"]) == T(9) - 1
+    assert b.dados["maquinas"][1]["op"] == 41
+    assert b.dados["apont"][troca]["ciclos"] == 181                        # 09:00:00 a 09:30:00, um pulso a cada 10 s

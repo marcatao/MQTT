@@ -590,9 +590,31 @@ class Plano:
         return {int(o) for o in ops if o is not None}
 
 
+MARCA_TROCA_OP = "Troca de OP"   # início da observação do apontamento da troca de OP no portal (TrocaOpMaquina)
+
+
+def eh_troca_de_op(apontamento: dict) -> bool:
+    """Apontamento manual que o portal/app cria ao "Trocar OP" no modo novo (``TrocaOpMaquina`` do portal)."""
+    return not do_integrador(apontamento) and str(apontamento.get("observacao") or "").startswith(MARCA_TROCA_OP)
+
+
+def dividir_nos_cortes(desejados: list[Trecho], cortes: list[int]) -> list[Trecho]:
+    """Divide os trechos nos instantes de corte (mesmo estado dos dois lados): o lado de antes termina 1 s antes."""
+    saida: list[Trecho] = []
+    for t in desejados:
+        atual = t
+        for c in cortes:
+            if atual.inicio < c and (atual.fim is None or c <= atual.fim):
+                saida.append(replace(atual, fim=c - 1))
+                atual = replace(atual, inicio=c)
+        saida.append(atual)
+    return saida
+
+
 def planejar(desejados: list[Trecho], existentes: list[dict], ini: int, agora: int, legendas: LegendasIot,
              op_maquina: int | None, fuso: tzinfo, com_ciclo: bool = False,
-             origem: tuple[int | None, str] | None = None, com_ciclos: bool = False) -> Plano:
+             origem: tuple[int | None, str] | None = None, com_ciclos: bool = False,
+             cortes: set[int] | None = None) -> Plano:
     """Compara os trechos desejados de ``[ini, agora]`` com os apontamentos existentes que cruzam a janela.
 
     ``existentes``: dicts com ``id, legenda_id, inicio, fim, observacao, ordem_producao_id`` (datas em epoch).
@@ -630,10 +652,10 @@ def planejar(desejados: list[Trecho], existentes: list[dict], ini: int, agora: i
                                         "ordem_producao_id": e.get("ordem_producao_id"), "manual": manual,
                                         "antes": e})
             continue
-        if manual:
+        if manual and e["inicio"] not in (cortes or set()):
             plano.excluir.append({**e, "manual": True})
         else:
-            dentro_iot.append(e)
+            dentro_iot.append(e)          # do integrador, ou a "Troca de OP" do portal (reaproveitada, mantém a OP)
 
     por_inicio: dict[int, dict] = {}
     sobras: list[dict] = []
@@ -665,7 +687,7 @@ def planejar(desejados: list[Trecho], existentes: list[dict], ini: int, agora: i
             existente = sobras.pop(0)
         extra = {"ciclo_medio": d.ciclo} if com_ciclo else {}
         if com_ciclos:
-            extra["ciclos"] = d.ciclos if d.estado == PRODUZINDO else None
+            extra["ciclos"] = d.ciclos
         if origem is not None:
             extra.update(iot_dispositivo_id=origem[0], iot_canal=origem[1])
         if existente is None:
@@ -1628,25 +1650,6 @@ class ApontamentosOee:
             if legendas.fora_turno is not None and not jornada.vazia:
                 segs = recortar_fora_turno(segs, intervalos_turno(jornada, ini, agora, self._fuso))
             desejados = dividir_por_dia(segs, self._fuso)
-            if canal_ciclo is not None and e.apont_ciclos:
-                # peças: pulsos do contador em cada trecho de produção (o portal multiplica pelas cavidades do molde)
-                # A parada começa NA última produção: o pulso desse instante é da produção (conta até fim + 1 s), a
-                # não ser que o trecho seguinte também seja produção (virada do dia: ele conta o próprio início).
-                incs = incrementos(leituras_ciclo)
-                novos: list[Trecho] = []
-                for i, t in enumerate(desejados):
-                    if t.estado == PRODUZINDO:
-                        seguinte = desejados[i + 1] if i + 1 < len(desejados) else None
-                        limite = agora if t.fim is None else (
-                            t.fim if seguinte is not None and seguinte.estado == PRODUZINDO else t.fim + 1)
-                        t = replace(t, ciclos=ciclos_no_trecho(incs, t.inicio, min(limite, agora)))
-                    novos.append(t)
-                desejados = novos
-            if canal_ciclo is not None and e.apont_ciclo_medio:
-                antes = self._leituras_antes(cur, canal_ciclo[0], canal_ciclo[1], desde)
-                alts = alteracoes(antes + leituras_ciclo)
-                desejados = [replace(t, ciclo=ciclo_medio(alts, agora if t.fim is None else t.fim))
-                             for t in desejados]
             com_ciclo = e.apont_ciclo_medio
             origem = m.origem(e.canais_iot) if e.apont_origem else None
             extras_sel = (["ciclo_medio"] if com_ciclo else []) + (["iot_dispositivo_id", "iot_canal"]
@@ -1666,8 +1669,26 @@ class ApontamentosOee:
                     v = r[6 + i]
                     existente[c] = None if v is None else (str(v).strip() if c == "iot_canal" else int(v))
                 existentes.append(existente)
+            # Troca de OP feita no portal/app (modo "novo"): o apontamento manual "Troca de OP" é um ponto de corte —
+            # o trecho do IoT é dividido ali e ele é reaproveitado com a OP nova (antes o IoT o apagava e a máquina
+            # voltava para a OP antiga).
+            cortes = {x["inicio"]: x for x in existentes if eh_troca_de_op(x) and ini < x["inicio"] <= agora}
+            if cortes:
+                desejados = dividir_nos_cortes(desejados, sorted(cortes))
+            if canal_ciclo is not None and e.apont_ciclos:
+                # peças: pulsos do contador em CADA trecho (de qualquer legenda: ciclo mais lento que a microparada cai
+                # num 99), de inicio a fim inclusive (o seguinte começa 1 s depois); o em aberto até agora. O portal
+                # multiplica pelas cavidades do molde da OP.
+                incs = incrementos(leituras_ciclo)
+                desejados = [replace(t, ciclos=ciclos_no_trecho(incs, t.inicio, agora if t.fim is None else min(t.fim, agora)))
+                             for t in desejados]
+            if canal_ciclo is not None and e.apont_ciclo_medio:
+                antes = self._leituras_antes(cur, canal_ciclo[0], canal_ciclo[1], desde)
+                alts = alteracoes(antes + leituras_ciclo)
+                desejados = [replace(t, ciclo=ciclo_medio(alts, agora if t.fim is None else t.fim))
+                             for t in desejados]
             plano = planejar(desejados, existentes, ini, agora, legendas, m.ordem_producao_id, self._fuso,
-                             com_ciclo=com_ciclo, origem=origem, com_ciclos=e.apont_ciclos)
+                             com_ciclo=com_ciclo, origem=origem, com_ciclos=e.apont_ciclos, cortes=set(cortes))
             contagem, avisos = self._aplicar(cur, m, plano, todas, agora)
             if e.apont_ciclos:
                 self._ops_para_avisar = sorted(plano.ops_afetadas())   # quantidade real das OPs (portal)
@@ -1813,7 +1834,7 @@ class ApontamentosOee:
             extras = [c for c in ("ciclo_medio", "iot_dispositivo_id", "iot_canal", "ciclos")
                       if c in x and (com_ciclo if c == "ciclo_medio" else e.apont_ciclos if c == "ciclos"
                                      else com_origem)]
-            if "ciclos" in extras and x["ciclos"] is not None and (x.get("antes") or {}).get("ciclos") != x["ciclos"]:
+            if "ciclos" in extras and (x.get("antes") or {}).get("ciclos") != x["ciclos"]:
                 self._para_producao.append(int(x["id"]))  # ciclos novos: o portal refaz as peças
             if x.get("antes") is None or int(x["antes"].get("legenda_id") or 0) != int(x["legenda_id"]):
                 self._para_avisar.append(int(x["id"]))   # legenda trocada: o portal confere a SS automática
