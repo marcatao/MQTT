@@ -114,6 +114,7 @@ pronto para baixar. O número vem da contagem de builds do GitHub, por isso algu
 
 | Versão | Data | Principais melhorias |
 | --- | --- | --- |
+| **v0.1.27** | 22/11/2026 | Peças: os pulsos do contador contam em **todos** os apontamentos (ciclo mais lento que a microparada também é peça), sem perder nem contar duas vezes. A **Trocar OP** feita no portal ou no app **não é mais desfeita** pelo integrador: a OP nova fica. |
 | **v0.1.26** | 22/11/2026 | Apontamentos reais: conta os **ciclos (pulsos do contador)** de cada apontamento de produção e avisa o portal, que calcula as **peças** (ciclos × cavidades ativas do molde da OP) e a **quantidade real da OP**. Precisa do portal atualizado (`php artisan migrate`). |
 | **v0.1.25** | 22/11/2026 | Apontamentos reais: depois de gravar, o integrador **avisa o portal OEE**, que abre a **SS automática** das legendas com "Abre SS" (antes ela não abria para os apontamentos do IoT). Configurar em `config.toml`, seção `[oee]`: `portal_url` e `portal_token` (o mesmo `IOT_TOKEN` do portal). |
 | **v0.1.24** | 18/11/2026 | Apontamentos reais: o integrador **não apaga mais quem editou** o apontamento no portal (usuário e data da alteração ficam guardados) e grava o **dispositivo IoT e o canal** em cada apontamento automático (colunas novas do portal; rodar `php artisan migrate`). |
