@@ -475,6 +475,15 @@ Especificação completa em `docs/apontamentos_reais.md` (fonte da verdade; cód
   `docs/apontamentos_reais.md`; código em `app/core/portal_oee.py`. Sem URL/token: desligado (1 INFO). Falha: fila em
   memória, reenvia no próximo ciclo.
 
+### Peças produzidas (decidido com o usuário em 22/11/2026)
+
+- O integrador conta os **pulsos do contador** (1º canal de produção da máquina) em cada apontamento de produção
+  (legenda 2) e grava em `apontamentos_estado.ciclos` (coluna do portal; sem ela, nada muda). Cada pulso = 1 ciclo da
+  máquina; o **portal** multiplica pelas cavidades ativas do molde da OP (sem molde = 1 peça) e soma a quantidade
+  real da OP (`ordens_producao.quantidade_real`). O aviso ao portal leva `producao` (ids com ciclos novos) e `ops`.
+  Peças por minuto (Timeline e app) e o gráfico de peças por hora são do portal. Detalhes em
+  `docs/apontamentos_reais.md`.
+
 ## Pendências conhecidas
 
 - Índice único `(device_id, ts_unix)` na IOT001 (opcional, decidir com o usuário).

@@ -230,6 +230,16 @@ local** (primeira execução) até agora. Leituras lidas a partir de `início_da
   no próximo ciclo; nunca derruba o ciclo. Lotes de até 500 ids. SS aberta: INFO "o portal abriu a SS ...".
 - Código: `app/core/portal_oee.py` (`NotificadorPortal`, só biblioteca padrão).
 
+## Peças produzidas (22/11/2026)
+
+- Coluna `ciclos` de `apontamentos_estado` (criada pelo portal; sem ela, o integrador não grava nem avisa peças): em
+  cada apontamento de **produção** (legenda 2), a soma dos **pulsos do contador** do 1º canal de produção da máquina
+  (o mesmo do ciclo médio) dentro do trecho. Contador que voltou para trás (zerado) conta o valor novo. A parada começa
+  na última produção, então o pulso desse instante conta para a produção (até `fim + 1 s`), menos na virada do dia
+  (o trecho seguinte, também produção, conta o próprio início). Paradas: `ciclos` NULL.
+- Depois do commit, o aviso ao portal leva também `producao` (ids com `ciclos` novos) e `ops` (OPs afetadas). O portal
+  calcula as **peças = ciclos × cavidades ativas do molde da OP** (sem molde = 1) e soma a **quantidade real** da OP.
+
 ## Execução e tela
 
 - Thread própria no core (sem Qt), a cada **3 min** (`[apontamentos] minutos = 3`; a tela pode mudar, valor salvo em

@@ -69,3 +69,21 @@ def test_lotes_de_ate_500():
     n = NotificadorPortal("https://portal", "tok", lambda *_: None, enviar=portal)
     n.avisar(list(range(1, MAX_POR_CHAMADA + 3)))
     assert [len(c[1]["apontamentos"]) for c in portal.chamadas] == [MAX_POR_CHAMADA, 2]
+
+
+def test_pecas_e_ops_vao_na_mesma_chamada():
+    portal = PortalFalso()
+    n = NotificadorPortal("https://portal", "tok", lambda *_: None, enviar=portal)
+    n.avisar([], [11, 12, 11], [40])
+    assert portal.chamadas[0][1] == {"apontamentos": [], "producao": [11, 12], "ops": [40]}
+    n.avisar([5])
+    assert portal.chamadas[1][1] == {"apontamentos": [5]}
+
+
+def test_pecas_pendentes_voltam_no_proximo_ciclo():
+    portal = PortalFalso(status=500)
+    n = NotificadorPortal("https://portal", "tok", lambda *_: None, enviar=portal)
+    n.avisar([], [7], [3])
+    portal.status = 200
+    n.avisar([])
+    assert portal.chamadas[-1][1] == {"apontamentos": [], "producao": [7], "ops": [3]}

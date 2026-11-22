@@ -5,6 +5,8 @@ O integrador grava ``apontamentos_estado`` direto no banco, e as regras que no p
 sucesso, o integrador chama ``POST {portal_url}/api/iot/apontamentos/processar`` com os ids dos apontamentos CRIADOS
 ou com a LEGENDA TROCADA, e o portal aplica a mesma regra das telas. O portal é idempotente (mandar de novo não abre
 outra SS). Situação da máquina e status das OPs o integrador já atualiza sozinho.
+Peças (22/11/2026): na mesma chamada vão ``producao`` (apontamentos de produção com ``ciclos`` novos: o portal
+calcula as peças = ciclos × cavidades ativas do molde da OP) e ``ops`` (OPs afetadas: o portal soma a quantidade real).
 
 Configuração em ``[oee]``: ``portal_url`` (ex.: ``https://www.alumbra.com.br/oee``) e ``portal_token`` (o mesmo
 ``IOT_TOKEN`` do ``.env`` do portal; ou a variável de ambiente ``OEE_PORTAL_TOKEN``). Sem os dois, o aviso fica
@@ -46,7 +48,9 @@ class NotificadorPortal:
         self._logar = logar
         self._enviar = enviar
         self._timeout = timeout
-        self._pendentes: list[int] = []
+        self._pendentes: list[int] = []         # SS automática (criados / legenda trocada)
+        self._producao: list[int] = []          # peças (ciclos novos)
+        self._ops: list[int] = []               # quantidade real das OPs
         self._info_desligado = False
         self._falhando = False
 
@@ -58,35 +62,48 @@ class NotificadorPortal:
     def pendentes(self) -> list[int]:
         return list(self._pendentes)
 
-    def avisar(self, ids: list[int]) -> None:
-        """Acrescenta os ids à fila e envia tudo o que estiver pendente. Nunca levanta exceção."""
+    def avisar(self, ids: list[int], producao: list[int] | None = None, ops: list[int] | None = None) -> None:
+        """Acrescenta os ids às filas e envia tudo o que estiver pendente. Nunca levanta exceção."""
         if not self.ligado:
-            if ids and not self._info_desligado:
+            if (ids or producao or ops) and not self._info_desligado:
                 self._info_desligado = True
                 self._logar("INFO", "Apontamentos reais: aviso ao portal OEE desligado ([oee] portal_url e portal_token "
                                     "vazios); a SS automática das legendas com \"Abre SS\" não abre para o IoT.")
             return
-        for i in ids:
-            if i not in self._pendentes:
-                self._pendentes.append(int(i))
-        if len(self._pendentes) > MAX_PENDENTES:
-            descartados = len(self._pendentes) - MAX_PENDENTES
-            self._pendentes = self._pendentes[descartados:]
-            self._logar("AVISO", f"Apontamentos reais: {descartados} aviso(s) antigos ao portal descartados (fila cheia).")
-        while self._pendentes:
-            lote = self._pendentes[:MAX_POR_CHAMADA]
-            if not self._enviar_lote(lote):
+        for fila, novos in ((self._pendentes, ids), (self._producao, producao or []), (self._ops, ops or [])):
+            vistos = set(fila)
+            for i in novos:
+                if int(i) not in vistos:
+                    fila.append(int(i))
+                    vistos.add(int(i))
+            if len(fila) > MAX_PENDENTES:
+                descartados = len(fila) - MAX_PENDENTES
+                del fila[:descartados]
+                self._logar("AVISO", f"Apontamentos reais: {descartados} aviso(s) antigos ao portal descartados (fila cheia).")
+        while self._pendentes or self._producao or self._ops:
+            lote = (self._pendentes[:MAX_POR_CHAMADA], self._producao[:MAX_POR_CHAMADA], self._ops[:MAX_POR_CHAMADA])
+            if not self._enviar_lote(*lote):
                 return
-            self._pendentes = self._pendentes[len(lote):]
+            del self._pendentes[:len(lote[0])]
+            del self._producao[:len(lote[1])]
+            del self._ops[:len(lote[2])]
 
-    def _enviar_lote(self, lote: list[int]) -> bool:
-        corpo = json.dumps({"apontamentos": lote}).encode()
+    def _enviar_lote(self, lote: list[int], producao: list[int] | None = None, ops: list[int] | None = None) -> bool:
+        dados_envio: dict = {"apontamentos": lote}
+        if producao:
+            dados_envio["producao"] = producao
+        if ops:
+            dados_envio["ops"] = ops
+        corpo = json.dumps(dados_envio).encode()
         cab = {"Content-Type": "application/json", "Accept": "application/json",
                "Authorization": f"Bearer {self._token}", "User-Agent": "Integrador-MQTT-Alumbra"}
         try:
             status, resposta = self._enviar(self._url + ROTA, corpo, cab, self._timeout)
         except Exception as exc:  # noqa: BLE001 (rede: tenta de novo no próximo ciclo)
             return self._falhou(f"sem conexão com o portal ({exc})")
+        if status == 422 and not lote:
+            # portal antigo (antes das peças) exige "apontamentos": descarta só esta remessa de peças
+            return True
         if status != 200:
             motivo = {401: "token recusado (confira [oee] portal_token = IOT_TOKEN do portal)",
                       503: "rota desligada no portal (IOT_TOKEN vazio no .env do portal)",

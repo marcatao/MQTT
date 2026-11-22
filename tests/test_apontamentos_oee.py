@@ -370,7 +370,7 @@ class Cursor:
 
 
 # coluna do SQL → chave do registro falso
-CAMPOS = {"inicio": "inicio", "fim": "fim", "legenda_id": "legenda", "ciclo_medio": "ciclo",
+CAMPOS = {"inicio": "inicio", "fim": "fim", "legenda_id": "legenda", "ciclo_medio": "ciclo", "ciclos": "ciclos",
           "iot_dispositivo_id": "dev", "iot_canal": "canal", "atualizado_em": "em", "atualizado_por_id": "por"}
 
 
@@ -386,8 +386,9 @@ class BancoFalso:
     """SQL Server de mentira: guarda as tabelas em memória e responde às consultas do módulo pelo texto."""
 
     def __init__(self, com_97: bool = True, com_96: bool = True, jornada: bool = True, com_ciclo: bool = True,
-                 com_origem: bool = True, com_auditoria: bool = True) -> None:
+                 com_origem: bool = True, com_auditoria: bool = True, com_ciclos: bool = True) -> None:
         self.com_ciclo = com_ciclo    # coluna apontamentos_estado.ciclo_medio
+        self.com_ciclos = com_ciclos  # coluna apontamentos_estado.ciclos (peças)
         self.com_origem = com_origem  # colunas apontamentos_estado.iot_dispositivo_id / iot_canal
         self.com_auditoria = com_auditoria   # coluna apontamentos_estado.atualizado_por_id
         legendas = {2: ("2", "Produção Normal", "produzindo", True),
@@ -488,7 +489,8 @@ class BancoFalso:
             extras = {"maquinas": {"atualizado_em", *(ap.COLUNAS_JORNADA if self.jornada else ())},
                       "apontamentos_estado": ({"ciclo_medio"} if self.com_ciclo else set())
                       | ({"iot_dispositivo_id", "iot_canal"} if self.com_origem else set())
-                      | ({"atualizado_por_id"} if self.com_auditoria else set()),
+                      | ({"atualizado_por_id"} if self.com_auditoria else set())
+                      | ({"ciclos"} if self.com_ciclos else set()),
                       "ordens_producao": {"status_em"}}.get(tabela, set())
             return [(c,) for c in ap.TABELAS_OEE[tabela] | extras]
         if "FROM [OEE].[dbo].[legendas]" in sql and sql.startswith("SELECT [id], [codigo]"):
@@ -558,6 +560,7 @@ class BancoFalso:
             d["apont"][self.proximo_id] = {"maquina": v["maquina_id"], "legenda": v["legenda_id"],
                                            "op": v["ordem_producao_id"], "inicio": v["inicio"], "fim": v["fim"],
                                            "obs": v["observacao"], "ciclo": v.get("ciclo_medio"),
+                                           "ciclos": v.get("ciclos"),
                                            "dev": v.get("iot_dispositivo_id"), "canal": v.get("iot_canal"),
                                            "por": None, "em": v.get("atualizado_em")}
             return [(self.proximo_id,)] if "OUTPUT INSERTED.[id]" in sql else []
@@ -1782,7 +1785,7 @@ def test_ciclo_avisa_o_portal_dos_criados_e_da_legenda_trocada_depois_do_commit(
     ligado(b, "DEV1", "chd1_value", T(9) + 10, T(9, 6), valor=361)
     obj, logs, erros, _ = novo(b, T(9, 2))
     avisados: list[list[int]] = []
-    obj._avisar_portal = lambda ids: avisados.append(list(ids))
+    obj._avisar_portal = lambda ids, *_resto: avisados.append(list(ids))
     obj.executar_ciclo()
     assert sorted(avisados[-1]) == sorted(b.dados["apont"].keys())          # os 3 criados
     em_aberto = max(b.dados["apont"])
@@ -1806,3 +1809,45 @@ def test_falha_no_aviso_ao_portal_nao_derruba_o_ciclo():
     r = obj.executar_ciclo()
     assert r["ok"] and not erros
     assert any("falha ao avisar o portal OEE" in m for _n, m in logs)
+
+
+def test_incrementos_somam_pulsos_e_reinicio_conta_o_valor_novo():
+    from app.core.apontamentos_oee import ciclos_no_trecho, incrementos
+    incs = incrementos([(0, 10), (10, 11), (20, 14), (30, 14), (40, None), (50, 2), (60, 5)])
+    assert incs == [(10, 1), (20, 3), (50, 2), (60, 3)]
+    assert ciclos_no_trecho(incs, 10, 50) == 6
+
+
+def test_ciclo_conta_os_pulsos_de_cada_trecho_de_producao_e_avisa_o_portal_das_pecas():
+    """Peças: cada pulso do contador no trecho de produção (o portal multiplica pelas cavidades do molde)."""
+    b = BancoFalso()
+    b.maquina(1, op=40)
+    b.dados["ops"][40] = {"datrf": "", "c2_status": "", "quje": 0, "status": "aberta"}
+    ligado(b, "DEV1", "chd1_value", HOJE - 3600, T(8) - 20)
+    producao_continua(b, "DEV1", "chd1_value", T(8), T(9))           # 1 pulso a cada 10 s de 08:00 a 09:00
+    ligado(b, "DEV1", "chd1_value", T(9) + 10, T(9, 10), valor=361)
+    obj, logs, erros, _ = novo(b, T(9, 10))
+    avisos: list = []
+    obj._avisar_portal = lambda ids, producao=None, ops=None: avisos.append((list(ids), producao, ops))
+    r = obj.executar_ciclo()
+    assert r["ok"] and not erros
+    por_inicio = {_ep(a["inicio"]): (i, a) for i, a in b.dados["apont"].items()}
+    i_prod, prod = por_inicio[T(8)]
+    assert prod["legenda"] == 2 and prod["ciclos"] == 361                  # 08:00:00 até 09:00:00 (inclusive)
+    assert por_inicio[T(9)][1]["ciclos"] is None                          # parada não conta
+    assert avisos[-1][1] == [i_prod] and avisos[-1][2] == [40]
+    # Próximo ciclo sem pulsos novos: nada a refazer de peças.
+    obj._relogio.t = T(9, 12)
+    obj.executar_ciclo()
+    assert avisos[-1][1] in (None, [])
+
+
+def test_sem_a_coluna_ciclos_no_portal_nao_grava_nem_avisa_pecas():
+    b = BancoFalso(com_ciclos=False)
+    b.maquina(1)
+    producao_continua(b, "DEV1", "chd1_value", T(8), T(9))
+    obj, logs, erros, _ = novo(b, T(9, 30))
+    avisos: list = []
+    obj._avisar_portal = lambda ids, *resto: avisos.append(resto)
+    assert obj.executar_ciclo()["ok"]
+    assert avisos[-1] == () and all("ciclos" not in s for s, _p in b.comandos if s.startswith("INSERT"))

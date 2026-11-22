@@ -168,6 +168,32 @@ def producoes(leituras: Iterable[tuple[int, Any]]) -> list[int]:
     return [ts for ts, v in alteracoes(leituras) if not math.isnan(v)]
 
 
+def incrementos(leituras: Iterable[tuple[int, Any]]) -> list[tuple[int, int]]:
+    """Pulsos do contador de UM canal: ``(ts_unix, quantos subiu)`` em cada leitura em que ele subiu.
+
+    A 1ª leitura é só a base. Contador menor que o anterior = zerado/reiniciado: conta o valor novo (o que contou
+    desde o zero) e vira a nova base. Valores ``None`` ou inválidos são ignorados.
+    """
+    saida: list[tuple[int, int]] = []
+    anterior: float | None = None
+    for ts, valor in sorted(((int(t), v) for t, v in leituras if v is not None), key=lambda x: x[0]):
+        try:
+            v = float(valor)
+        except (TypeError, ValueError):
+            continue
+        if anterior is not None:
+            delta = v - anterior if v >= anterior else v
+            if delta > 0:
+                saida.append((ts, int(round(delta))))
+        anterior = v
+    return saida
+
+
+def ciclos_no_trecho(incs: list[tuple[int, int]], inicio: int, fim: int) -> int:
+    """Soma dos pulsos com ``inicio <= ts <= fim``."""
+    return sum(d for ts, d in incs if inicio <= ts <= fim)
+
+
 def ciclo_medio(alteracoes_canal: list[tuple[int, float]], ate: int, n: int = 10, teto: int = 999) -> int | None:
     """Tempo médio por peça (s) nas últimas ``n`` alterações do contador até ``ate`` (inclusive).
 
@@ -448,6 +474,7 @@ class Trecho:
     fim: int | None
     estado: str
     ciclo: int | None = None        # ciclo_medio (s) até o fim (ou até agora, se em aberto); None = sem dado
+    ciclos: int | None = None       # pulsos do contador no trecho (só produção); o portal multiplica pelas cavidades
 
 
 def dividir_por_dia(segmentos: list[tuple[int, int, str]], fuso: tzinfo) -> list[Trecho]:
@@ -565,7 +592,7 @@ class Plano:
 
 def planejar(desejados: list[Trecho], existentes: list[dict], ini: int, agora: int, legendas: LegendasIot,
              op_maquina: int | None, fuso: tzinfo, com_ciclo: bool = False,
-             origem: tuple[int | None, str] | None = None) -> Plano:
+             origem: tuple[int | None, str] | None = None, com_ciclos: bool = False) -> Plano:
     """Compara os trechos desejados de ``[ini, agora]`` com os apontamentos existentes que cruzam a janela.
 
     ``existentes``: dicts com ``id, legenda_id, inicio, fim, observacao, ordem_producao_id`` (datas em epoch).
@@ -637,6 +664,8 @@ def planejar(desejados: list[Trecho], existentes: list[dict], ini: int, agora: i
         if existente is None and sobras:
             existente = sobras.pop(0)
         extra = {"ciclo_medio": d.ciclo} if com_ciclo else {}
+        if com_ciclos:
+            extra["ciclos"] = d.ciclos if d.estado == PRODUZINDO else None
         if origem is not None:
             extra.update(iot_dispositivo_id=origem[0], iot_canal=origem[1])
         if existente is None:
@@ -739,6 +768,7 @@ class Esquema:
     op_status_em: bool
     apont_atualizado_por: bool = False
     apont_ciclo_medio: bool = False           # apontamentos_estado.ciclo_medio existe (migração do portal)
+    apont_ciclos: bool = False                # apontamentos_estado.ciclos existe (peças pelo IoT, 22/11/2026)
     apont_origem: bool = False                # apontamentos_estado.iot_dispositivo_id e iot_canal existem
     jornada_cols: frozenset = frozenset()     # colunas de jornada/calendário existentes em maquinas
     calendario_dias: bool = False             # [banco].[dbo].[calendario_dias] legível (exceções do calendário)
@@ -790,6 +820,7 @@ def detectar(cursor, oee: OeeConfig, sql: SqlServerConfig) -> tuple[Esquema | No
                    maquinas_atualizado_em="atualizado_em" in colunas["maquinas"],
                    op_status_em="status_em" in colunas["ordens_producao"],
                    apont_ciclo_medio="ciclo_medio" in colunas["apontamentos_estado"],
+                   apont_ciclos="ciclos" in colunas["apontamentos_estado"],
                    apont_origem={"iot_dispositivo_id", "iot_canal"} <= colunas["apontamentos_estado"],
                    apont_atualizado_por="atualizado_por_id" in colunas["apontamentos_estado"],
                    jornada_cols=jornada_cols, calendario_dias=calendario), ""
@@ -950,6 +981,10 @@ class ApontamentosOee:
                                                                  logar).avisar
         self._para_avisar: list[int] = []           # ids da transação da máquina em andamento
         self._avisar_no_fim: list[int] = []         # ids já gravados (commit), avisados no fim do ciclo
+        self._para_producao: list[int] = []         # apontamentos de produção com ciclos novos (peças, no portal)
+        self._producao_no_fim: list[int] = []
+        self._ops_para_avisar: list[int] = []       # OPs afetadas (quantidade real, no portal)
+        self._ops_no_fim: list[int] = []
 
     # -- API (qualquer thread) ---------------------------------------------------------------------------
 
@@ -1368,8 +1403,13 @@ class ApontamentosOee:
     def _enviar_avisos(self) -> None:
         """Avisa o portal (SS automática) dos apontamentos gravados; uma chamada por ciclo. Nunca levanta exceção."""
         ids, self._avisar_no_fim = self._avisar_no_fim, []
+        producao, self._producao_no_fim = self._producao_no_fim, []
+        ops, self._ops_no_fim = self._ops_no_fim, []
         try:
-            self._avisar_portal(ids)
+            if producao or ops:
+                self._avisar_portal(ids, producao, ops)
+            else:
+                self._avisar_portal(ids)
         except Exception as exc:  # noqa: BLE001
             self._logar("AVISO", f"Apontamentos reais: falha ao avisar o portal OEE ({exc}).")
 
@@ -1516,6 +1556,8 @@ class ApontamentosOee:
         A = e.t["apontamentos_estado"]
         hoje = inicio_do_dia(agora, self._fuso)
         self._para_avisar = []
+        self._para_producao = []
+        self._ops_para_avisar = []
         ontem = inicio_do_dia(agora, self._fuso, -1)
         jornada = jornada or Jornada({})
         cur = self._conexao.cursor()
@@ -1554,9 +1596,9 @@ class ApontamentosOee:
             desde = ini - m.macro - MARGEM_LEITURAS
             listas: list[list[int]] = []
             ultima_leitura: int | None = None
-            # ciclo médio: 1º canal de produção da máquina com coluna na IOT001 (iot1, depois iot2, iot3)
+            # ciclo médio e ciclos (peças): 1º canal de produção da máquina com coluna na IOT001 (iot1, iot2, iot3)
             canal_ciclo = next(((d, c) for d, c in m.canais if c in e.canais_iot), None) \
-                if e.apont_ciclo_medio else None
+                if (e.apont_ciclo_medio or e.apont_ciclos) else None
             leituras_ciclo: list[tuple[int, Any]] = []
             for device, canais in por_device.items():
                 cols = ", ".join(f"[{c}]" for c in canais)
@@ -1586,7 +1628,21 @@ class ApontamentosOee:
             if legendas.fora_turno is not None and not jornada.vazia:
                 segs = recortar_fora_turno(segs, intervalos_turno(jornada, ini, agora, self._fuso))
             desejados = dividir_por_dia(segs, self._fuso)
-            if canal_ciclo is not None:
+            if canal_ciclo is not None and e.apont_ciclos:
+                # peças: pulsos do contador em cada trecho de produção (o portal multiplica pelas cavidades do molde)
+                # A parada começa NA última produção: o pulso desse instante é da produção (conta até fim + 1 s), a
+                # não ser que o trecho seguinte também seja produção (virada do dia: ele conta o próprio início).
+                incs = incrementos(leituras_ciclo)
+                novos: list[Trecho] = []
+                for i, t in enumerate(desejados):
+                    if t.estado == PRODUZINDO:
+                        seguinte = desejados[i + 1] if i + 1 < len(desejados) else None
+                        limite = agora if t.fim is None else (
+                            t.fim if seguinte is not None and seguinte.estado == PRODUZINDO else t.fim + 1)
+                        t = replace(t, ciclos=ciclos_no_trecho(incs, t.inicio, min(limite, agora)))
+                    novos.append(t)
+                desejados = novos
+            if canal_ciclo is not None and e.apont_ciclo_medio:
                 antes = self._leituras_antes(cur, canal_ciclo[0], canal_ciclo[1], desde)
                 alts = alteracoes(antes + leituras_ciclo)
                 desejados = [replace(t, ciclo=ciclo_medio(alts, agora if t.fim is None else t.fim))
@@ -1594,7 +1650,8 @@ class ApontamentosOee:
             com_ciclo = e.apont_ciclo_medio
             origem = m.origem(e.canais_iot) if e.apont_origem else None
             extras_sel = (["ciclo_medio"] if com_ciclo else []) + (["iot_dispositivo_id", "iot_canal"]
-                                                                   if e.apont_origem else [])
+                                                                   if e.apont_origem else []) \
+                + (["ciclos"] if e.apont_ciclos else [])
             cur.execute(f"SELECT [id], [legenda_id], [inicio], [fim], [observacao], [ordem_producao_id]"
                         f"{''.join(f', [{c}]' for c in extras_sel)} "
                         f"FROM {A} WITH (UPDLOCK) WHERE [maquina_id] = ? AND [inicio] <= ? "
@@ -1610,8 +1667,10 @@ class ApontamentosOee:
                     existente[c] = None if v is None else (str(v).strip() if c == "iot_canal" else int(v))
                 existentes.append(existente)
             plano = planejar(desejados, existentes, ini, agora, legendas, m.ordem_producao_id, self._fuso,
-                             com_ciclo=com_ciclo, origem=origem)
+                             com_ciclo=com_ciclo, origem=origem, com_ciclos=e.apont_ciclos)
             contagem, avisos = self._aplicar(cur, m, plano, todas, agora)
+            if e.apont_ciclos:
+                self._ops_para_avisar = sorted(plano.ops_afetadas())   # quantidade real das OPs (portal)
             logs.extend(("AVISO", a) for a in avisos)
 
             # situação da máquina pelo apontamento mais recente (SituacaoMaquina do portal)
@@ -1652,6 +1711,8 @@ class ApontamentosOee:
             linha["apontamentos_hoje"] = int((cur.fetchone() or [0])[0] or 0)
             self._conexao.commit()
             self._avisar_no_fim.extend(self._para_avisar)   # só o que foi gravado de fato
+            self._producao_no_fim.extend(self._para_producao)
+            self._ops_no_fim.extend(self._ops_para_avisar)
         except Exception:
             self._rollback()
             raise
@@ -1749,8 +1810,11 @@ class ApontamentosOee:
                          if e.apont_atualizado_por else "[atualizado_em] = ?")
         for x in plano.atualizar:
             # manuais aparados e os fechados antes da janela não recebem ciclo_medio nem origem
-            extras = [c for c in ("ciclo_medio", "iot_dispositivo_id", "iot_canal")
-                      if c in x and (com_ciclo if c == "ciclo_medio" else com_origem)]
+            extras = [c for c in ("ciclo_medio", "iot_dispositivo_id", "iot_canal", "ciclos")
+                      if c in x and (com_ciclo if c == "ciclo_medio" else e.apont_ciclos if c == "ciclos"
+                                     else com_origem)]
+            if "ciclos" in extras and x["ciclos"] is not None and (x.get("antes") or {}).get("ciclos") != x["ciclos"]:
+                self._para_producao.append(int(x["id"]))  # ciclos novos: o portal refaz as peças
             if x.get("antes") is None or int(x["antes"].get("legenda_id") or 0) != int(x["legenda_id"]):
                 self._para_avisar.append(int(x["id"]))   # legenda trocada: o portal confere a SS automática
             cur.execute(f"UPDATE {A} SET [inicio] = ?, [fim] = ?, [legenda_id] = ?, "
@@ -1764,7 +1828,7 @@ class ApontamentosOee:
                               f"{self._hora(x['fim'])}).")
         for x in plano.inserir:
             extras = (["ciclo_medio"] if com_ciclo else []) + (["iot_dispositivo_id", "iot_canal"] if com_origem
-                                                               else [])
+                                                               else []) + (["ciclos"] if e.apont_ciclos else [])
             colunas = "[maquina_id], [legenda_id], [ordem_producao_id], [inicio], [fim], [observacao], " \
                       f"{''.join(f'[{c}], ' for c in extras)}[criado_em], [atualizado_em]"
             valores = [m.id, x["legenda_id"], x["ordem_producao_id"], utc_sql(x["inicio"]),
@@ -1775,6 +1839,8 @@ class ApontamentosOee:
             novo = cur.fetchone()
             if novo is not None and novo[0] is not None:
                 self._para_avisar.append(int(novo[0]))   # o portal confere a SS automática
+                if x.get("ciclos") is not None:
+                    self._para_producao.append(int(novo[0]))  # o portal calcula as peças
             contagem["criados"] += 1
         return contagem, avisos
 
