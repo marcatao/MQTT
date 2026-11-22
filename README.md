@@ -114,6 +114,7 @@ pronto para baixar. O número vem da contagem de builds do GitHub, por isso algu
 
 | Versão | Data | Principais melhorias |
 | --- | --- | --- |
+| **v0.1.25** | 22/11/2026 | Apontamentos reais: depois de gravar, o integrador **avisa o portal OEE**, que abre a **SS automática** das legendas com "Abre SS" (antes ela não abria para os apontamentos do IoT). Configurar em `config.toml`, seção `[oee]`: `portal_url` e `portal_token` (o mesmo `IOT_TOKEN` do portal). |
 | **v0.1.24** | 18/11/2026 | Apontamentos reais: o integrador **não apaga mais quem editou** o apontamento no portal (usuário e data da alteração ficam guardados) e grava o **dispositivo IoT e o canal** em cada apontamento automático (colunas novas do portal; rodar `php artisan migrate`). |
 | **v0.1.23** | 17/11/2026 | A **versão aparece depois do nome do programa** no título da janela e no cabeçalho (ex.: "Integrador Alumbra MQTT + SQL + Mosquitto v0.1.23"). |
 | **v0.1.22** | 17/11/2026 | Apontamentos reais: grava o **ciclo médio** (segundos por peça nas últimas 10 alterações do contador, máx. 999) em cada apontamento do integrador, na coluna nova `ciclo_medio` do portal OEE (rodar `php artisan migrate` no portal). |
