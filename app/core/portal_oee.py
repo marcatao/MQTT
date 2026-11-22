@@ -1,0 +1,112 @@
+"""Aviso ao portal OEE depois de gravar os apontamentos reais (repositório ``marcatao/OEE``, Laravel).
+
+O integrador grava ``apontamentos_estado`` direto no banco, e as regras que no portal rodam ao salvar um apontamento
+(SS automática da legenda com "Abre SS") não rodam com um INSERT direto. Por isso, depois de cada gravação com
+sucesso, o integrador chama ``POST {portal_url}/api/iot/apontamentos/processar`` com os ids dos apontamentos CRIADOS
+ou com a LEGENDA TROCADA, e o portal aplica a mesma regra das telas. O portal é idempotente (mandar de novo não abre
+outra SS). Situação da máquina e status das OPs o integrador já atualiza sozinho.
+
+Configuração em ``[oee]``: ``portal_url`` (ex.: ``https://www.alumbra.com.br/oee``) e ``portal_token`` (o mesmo
+``IOT_TOKEN`` do ``.env`` do portal; ou a variável de ambiente ``OEE_PORTAL_TOKEN``). Sem os dois, o aviso fica
+desligado (1 INFO). Falha de rede não perde nada: os ids ficam pendentes e vão de novo no próximo ciclo.
+Só biblioteca padrão (urllib), sem dependência nova.
+"""
+from __future__ import annotations
+
+import json
+import os
+import urllib.error
+import urllib.request
+from typing import Callable
+
+Logar = Callable[[str, str], None]
+Enviar = Callable[[str, bytes, dict, float], tuple[int, bytes]]
+
+MAX_POR_CHAMADA = 500       # o portal aceita até 500 por chamada (config oee.iot.max_apontamentos)
+MAX_PENDENTES = 20000       # limite da fila em memória (portal fora do ar por muito tempo)
+ROTA = "/api/iot/apontamentos/processar"
+
+
+def _enviar_http(url: str, corpo: bytes, cabecalhos: dict, timeout: float) -> tuple[int, bytes]:
+    req = urllib.request.Request(url, data=corpo, headers=cabecalhos, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 (URL da configuração)
+            return resp.status, resp.read()
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read() or b""
+
+
+class NotificadorPortal:
+    """Fila de ids a avisar ao portal. Usado só pela thread dos apontamentos (sem trava)."""
+
+    def __init__(self, url: str | None, token: str | None, logar: Logar, enviar: Enviar = _enviar_http,
+                 timeout: float = 15.0) -> None:
+        self._url = (url or "").strip().rstrip("/")
+        self._token = (token or os.environ.get("OEE_PORTAL_TOKEN") or "").strip()
+        self._logar = logar
+        self._enviar = enviar
+        self._timeout = timeout
+        self._pendentes: list[int] = []
+        self._info_desligado = False
+        self._falhando = False
+
+    @property
+    def ligado(self) -> bool:
+        return bool(self._url and self._token)
+
+    @property
+    def pendentes(self) -> list[int]:
+        return list(self._pendentes)
+
+    def avisar(self, ids: list[int]) -> None:
+        """Acrescenta os ids à fila e envia tudo o que estiver pendente. Nunca levanta exceção."""
+        if not self.ligado:
+            if ids and not self._info_desligado:
+                self._info_desligado = True
+                self._logar("INFO", "Apontamentos reais: aviso ao portal OEE desligado ([oee] portal_url e portal_token "
+                                    "vazios); a SS automática das legendas com \"Abre SS\" não abre para o IoT.")
+            return
+        for i in ids:
+            if i not in self._pendentes:
+                self._pendentes.append(int(i))
+        if len(self._pendentes) > MAX_PENDENTES:
+            descartados = len(self._pendentes) - MAX_PENDENTES
+            self._pendentes = self._pendentes[descartados:]
+            self._logar("AVISO", f"Apontamentos reais: {descartados} aviso(s) antigos ao portal descartados (fila cheia).")
+        while self._pendentes:
+            lote = self._pendentes[:MAX_POR_CHAMADA]
+            if not self._enviar_lote(lote):
+                return
+            self._pendentes = self._pendentes[len(lote):]
+
+    def _enviar_lote(self, lote: list[int]) -> bool:
+        corpo = json.dumps({"apontamentos": lote}).encode()
+        cab = {"Content-Type": "application/json", "Accept": "application/json",
+               "Authorization": f"Bearer {self._token}", "User-Agent": "Integrador-MQTT-Alumbra"}
+        try:
+            status, resposta = self._enviar(self._url + ROTA, corpo, cab, self._timeout)
+        except Exception as exc:  # noqa: BLE001 (rede: tenta de novo no próximo ciclo)
+            return self._falhou(f"sem conexão com o portal ({exc})")
+        if status != 200:
+            motivo = {401: "token recusado (confira [oee] portal_token = IOT_TOKEN do portal)",
+                      503: "rota desligada no portal (IOT_TOKEN vazio no .env do portal)",
+                      429: "limite de chamadas do portal"}.get(status, f"resposta HTTP {status}")
+            return self._falhou(motivo)
+        if self._falhando:
+            self._falhando = False
+            self._logar("INFO", "Apontamentos reais: aviso ao portal OEE voltou a funcionar.")
+        try:
+            dados = json.loads(resposta or b"{}")
+        except ValueError:
+            dados = {}
+        for item in dados.get("apontamentos") or []:
+            if item.get("ss"):
+                self._logar("INFO", f"Apontamentos reais: o portal abriu a SS {item['ss']} (apontamento {item.get('id')}).")
+        return True
+
+    def _falhou(self, motivo: str) -> bool:
+        if not self._falhando:
+            self._falhando = True
+            self._logar("AVISO", f"Apontamentos reais: não deu para avisar o portal OEE: {motivo}. "
+                                 f"{len(self._pendentes)} apontamento(s) ficam para o próximo ciclo.")
+        return False

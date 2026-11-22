@@ -74,6 +74,7 @@ from typing import Any, Callable, Iterable
 
 from app.config import ApontamentosConfig, OeeConfig, SqlServerConfig
 from app.core import sql_conexao
+from app.core.portal_oee import NotificadorPortal
 from app.core.sink_sqlserver import classificar_erro
 
 logger = logging.getLogger("app.core.apontamentos")
@@ -907,7 +908,8 @@ class ApontamentosOee:
                  logar: Logar = _sem_log, ao_erro: AoErro = _nada, ao_resultado: AoResultado = _nada,
                  relogio: Relogio = time.time, conectar: Callable[[SqlServerConfig], object] | None = None,
                  diagnosticar: Diagnosticar | None = None, timeout_diag: float = 15.0,
-                 ao_recalculo: AoRecalculo = _nada) -> None:
+                 ao_recalculo: AoRecalculo = _nada,
+                 avisar_portal: Callable[[list[int]], None] | None = None) -> None:
         self._sql = replace(sql) if sql is not None else None
         self._oee = replace(oee_cfg) if oee_cfg is not None else OeeConfig()
         self._cfg = replace(apont_cfg) if apont_cfg is not None else ApontamentosConfig()
@@ -943,6 +945,11 @@ class ApontamentosOee:
         self._sem_parametros: set[int] = set()      # máquinas sem micro/macro já avisadas (sessão)
         self._erro_conexao = False                  # incidente de conexão aberto (1 erro por incidente)
         self._trocou_sql = False                    # definir_sql: a próxima execução reconecta
+        # Aviso ao portal (SS automática): ids criados ou com a legenda trocada, enviados depois do commit
+        self._avisar_portal = avisar_portal or NotificadorPortal(self._oee.portal_url, self._oee.portal_token,
+                                                                 logar).avisar
+        self._para_avisar: list[int] = []           # ids da transação da máquina em andamento
+        self._avisar_no_fim: list[int] = []         # ids já gravados (commit), avisados no fim do ciclo
 
     # -- API (qualquer thread) ---------------------------------------------------------------------------
 
@@ -1256,6 +1263,7 @@ class ApontamentosOee:
                 total[k] += contagem[k]
             for nivel, aviso in avisos:
                 self._logar(nivel, aviso)
+        self._enviar_avisos()
         n_maq = processadas
         resumo = (f"Apontamentos reais: {n_maq} {'máquina' if n_maq == 1 else 'máquinas'}, "
                   f"{total['criados']} criados, {total['alterados']} atualizados, {total['excluidos']} excluídos")
@@ -1350,11 +1358,20 @@ class ApontamentosOee:
             return False, f"Falha: {resumo}"
         for nivel, aviso in avisos:
             self._logar(nivel, aviso)
+        self._enviar_avisos()
         self._mesclar_resultado(linha, agora)
         manuais = contagem.get("manuais", 0)
         return True, (f"Recalculado desde {datetime.fromtimestamp(ini, self._fuso):%d/%m}: {contagem['criados']} "
                       f"criados, {contagem['alterados']} atualizados, {contagem['excluidos']} excluídos "
                       f"({manuais} {'manual apagado' if manuais == 1 else 'manuais apagados'}).")
+
+    def _enviar_avisos(self) -> None:
+        """Avisa o portal (SS automática) dos apontamentos gravados; uma chamada por ciclo. Nunca levanta exceção."""
+        ids, self._avisar_no_fim = self._avisar_no_fim, []
+        try:
+            self._avisar_portal(ids)
+        except Exception as exc:  # noqa: BLE001
+            self._logar("AVISO", f"Apontamentos reais: falha ao avisar o portal OEE ({exc}).")
 
     def _mesclar_resultado(self, linha: dict, agora: int) -> None:
         """Emite o último resultado do ciclo com a linha desta máquina atualizada (ou só ela, sem ciclo antes)."""
@@ -1498,6 +1515,7 @@ class ApontamentosOee:
         e = self._esquema
         A = e.t["apontamentos_estado"]
         hoje = inicio_do_dia(agora, self._fuso)
+        self._para_avisar = []
         ontem = inicio_do_dia(agora, self._fuso, -1)
         jornada = jornada or Jornada({})
         cur = self._conexao.cursor()
@@ -1633,6 +1651,7 @@ class ApontamentosOee:
             cur.execute(f"SELECT COUNT(*) FROM {A} WHERE [maquina_id] = ? AND [inicio] >= ?", m.id, utc_sql(hoje))
             linha["apontamentos_hoje"] = int((cur.fetchone() or [0])[0] or 0)
             self._conexao.commit()
+            self._avisar_no_fim.extend(self._para_avisar)   # só o que foi gravado de fato
         except Exception:
             self._rollback()
             raise
@@ -1732,6 +1751,8 @@ class ApontamentosOee:
             # manuais aparados e os fechados antes da janela não recebem ciclo_medio nem origem
             extras = [c for c in ("ciclo_medio", "iot_dispositivo_id", "iot_canal")
                       if c in x and (com_ciclo if c == "ciclo_medio" else com_origem)]
+            if x.get("antes") is None or int(x["antes"].get("legenda_id") or 0) != int(x["legenda_id"]):
+                self._para_avisar.append(int(x["id"]))   # legenda trocada: o portal confere a SS automática
             cur.execute(f"UPDATE {A} SET [inicio] = ?, [fim] = ?, [legenda_id] = ?, "
                         f"{''.join(f'[{c}] = ?, ' for c in extras)}{atualizado_em} WHERE [id] = ?",
                         utc_sql(x["inicio"]), None if x["fim"] is None else utc_sql(x["fim"]), x["legenda_id"],
@@ -1749,7 +1770,11 @@ class ApontamentosOee:
             valores = [m.id, x["legenda_id"], x["ordem_producao_id"], utc_sql(x["inicio"]),
                        None if x["fim"] is None else utc_sql(x["fim"]), OBSERVACAO,
                        *[x.get(c) for c in extras], agora_sql, agora_sql]
-            cur.execute(f"INSERT INTO {A} ({colunas}) VALUES ({', '.join('?' for _ in valores)})", *valores)
+            cur.execute(f"INSERT INTO {A} ({colunas}) OUTPUT INSERTED.[id] VALUES ({', '.join('?' for _ in valores)})",
+                        *valores)
+            novo = cur.fetchone()
+            if novo is not None and novo[0] is not None:
+                self._para_avisar.append(int(novo[0]))   # o portal confere a SS automática
             contagem["criados"] += 1
         return contagem, avisos
 

@@ -152,6 +152,9 @@ class OeeConfig:
     tabela: str = "dbo.dispositivos_iot"
     unidade: str = "manutencao"             # manutencao | tecnologia | ambos (CHECK no portal)
     tipo: str = "contador"                  # sensor | clp | gateway | contador | outro
+    # Aviso ao portal depois de gravar os apontamentos reais (SS automática), ver app/core/portal_oee.py.
+    portal_url: str = ""                    # ex.: https://www.alumbra.com.br/oee (vazio = desligado)
+    portal_token: str = ""                  # = IOT_TOKEN do .env do portal (ou variável OEE_PORTAL_TOKEN)
 
 
 @dataclass

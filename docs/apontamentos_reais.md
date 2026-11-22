@@ -217,6 +217,19 @@ local** (primeira execução) até agora. Leituras lidas a partir de `início_da
   `parada` se `c2_status = 'U'` ou o apontamento em aberto mais recente da OP não é `produzindo`; `andamento` se há
   apontamento em aberto produzindo, `c2_quje > 0` ou a OP tem algum apontamento; senão `aberta`. Só grava se mudou.
 
+## SS automática pelo portal (aviso depois de gravar)
+
+- O integrador grava `apontamentos_estado` direto no banco, então a regra do portal que roda ao salvar um apontamento
+  (SS automática da legenda com "Abre SS") não roda sozinha. Depois de gravar (commit), no fim de cada ciclo e de cada
+  Recalcular, o integrador chama `POST {portal_url}/api/iot/apontamentos/processar` com os ids dos apontamentos
+  **criados** (`OUTPUT INSERTED.[id]`) e dos **atualizados com a legenda trocada** (ex.: 99 → 98). Os que só cresceram
+  não vão. O portal aplica a `SsAutomatica` (a mesma das telas) e é idempotente.
+- Configuração: `[oee] portal_url` (ex.: `https://www.alumbra.com.br/oee`) e `[oee] portal_token` (= `IOT_TOKEN` do
+  `.env` do portal; ou a variável de ambiente `OEE_PORTAL_TOKEN`). Sem os dois: desligado, 1 INFO.
+- Falha (rede, token recusado, portal fora): 1 AVISO por incidente, os ids ficam numa fila em memória (até 20.000) e vão
+  no próximo ciclo; nunca derruba o ciclo. Lotes de até 500 ids. SS aberta: INFO "o portal abriu a SS ...".
+- Código: `app/core/portal_oee.py` (`NotificadorPortal`, só biblioteca padrão).
+
 ## Execução e tela
 
 - Thread própria no core (sem Qt), a cada **3 min** (`[apontamentos] minutos = 3`; a tela pode mudar, valor salvo em

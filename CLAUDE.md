@@ -465,6 +465,16 @@ Especificação completa em `docs/apontamentos_reais.md` (fonte da verdade; cód
 - O usuário escolheu **manter como está** (opções recusadas por ora: broker independente que sobrevive ao fechamento do
   programa; Mosquitto como serviço do Windows). Retomar uma delas se ele pedir.
 
+### SS automática pelo portal (decidido com o usuário em 22/11/2026)
+
+- O usuário escolheu que o integrador **chame o portal** (em vez de o portal varrer o banco): depois de gravar os
+  apontamentos reais, ele faz `POST {portal_url}/api/iot/apontamentos/processar` (token `[oee] portal_token` = `IOT_TOKEN`
+  do portal, ou a variável `OEE_PORTAL_TOKEN`) com os ids **criados** e os **com a legenda trocada**; o portal abre a
+  SS automática das legendas com "Abre SS" (regra única do portal, idempotente). A gravação continua direta no banco,
+  e a situação da máquina e o status das OPs continuam sendo feitos pelo integrador. Detalhes em
+  `docs/apontamentos_reais.md`; código em `app/core/portal_oee.py`. Sem URL/token: desligado (1 INFO). Falha: fila em
+  memória, reenvia no próximo ciclo.
+
 ## Pendências conhecidas
 
 - Índice único `(device_id, ts_unix)` na IOT001 (opcional, decidir com o usuário).

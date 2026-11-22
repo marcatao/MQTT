@@ -560,7 +560,7 @@ class BancoFalso:
                                            "obs": v["observacao"], "ciclo": v.get("ciclo_medio"),
                                            "dev": v.get("iot_dispositivo_id"), "canal": v.get("iot_canal"),
                                            "por": None, "em": v.get("atualizado_em")}
-            return []
+            return [(self.proximo_id,)] if "OUTPUT INSERTED.[id]" in sql else []
         if sql.startswith("SELECT TOP (") and "ORDER BY [ts_unix] DESC" in sql:   # leituras antes (ciclo médio)
             n = int(sql.split("TOP (", 1)[1].split(")", 1)[0])
             canal = sql.split("[ts_unix], [", 1)[1].split("]", 1)[0]
@@ -1771,3 +1771,38 @@ def test_planejar_com_origem_compara_e_leva_a_origem():
     assert planejar(d, [feito], HOJE, T(9), LEG, None, FUSO, origem=(4, "chd2_value")).vazio
     assert planejar(d, [], HOJE, T(9), LEG, None, FUSO, origem=(4, "chd2_value")).inserir[0]["iot_canal"] == \
         "chd2_value"
+
+
+def test_ciclo_avisa_o_portal_dos_criados_e_da_legenda_trocada_depois_do_commit():
+    """SS automática: o portal recebe os apontamentos criados e os que trocaram de legenda (não os que só cresceram)."""
+    b = BancoFalso()
+    b.maquina(1)
+    ligado(b, "DEV1", "chd1_value", HOJE - 3600, T(8) - 20)
+    producao_continua(b, "DEV1", "chd1_value", T(8), T(9))
+    ligado(b, "DEV1", "chd1_value", T(9) + 10, T(9, 6), valor=361)
+    obj, logs, erros, _ = novo(b, T(9, 2))
+    avisados: list[list[int]] = []
+    obj._avisar_portal = lambda ids: avisados.append(list(ids))
+    obj.executar_ciclo()
+    assert sorted(avisados[-1]) == sorted(b.dados["apont"].keys())          # os 3 criados
+    em_aberto = max(b.dados["apont"])
+    obj._relogio.t = T(9, 4)
+    obj.executar_ciclo()
+    assert avisados[-1] == []                                               # só cresceu (99 continua): nada
+    obj._relogio.t = T(9, 6)
+    obj.executar_ciclo()
+    assert avisados[-1] == [em_aberto]                                      # 99 → 98: legenda trocada
+
+
+def test_falha_no_aviso_ao_portal_nao_derruba_o_ciclo():
+    b = BancoFalso()
+    b.maquina(1)
+    producao_continua(b, "DEV1", "chd1_value", T(8), T(9))
+    obj, logs, erros, _ = novo(b, T(9, 30))
+
+    def quebra(_ids):
+        raise RuntimeError("sem rede")
+    obj._avisar_portal = quebra
+    r = obj.executar_ciclo()
+    assert r["ok"] and not erros
+    assert any("falha ao avisar o portal OEE" in m for _n, m in logs)

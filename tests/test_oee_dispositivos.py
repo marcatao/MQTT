@@ -87,7 +87,8 @@ def test_diagnostico_padrao_1_minuto_e_config_oee():
     exemplo = tomllib.loads((RAIZ / "config.example.toml").read_text(encoding="utf-8"))
     assert exemplo["dispositivos"]["diagnostico_minutos"] == 1
     assert exemplo["oee"] == {"habilitado": True, "banco": "OEE", "tabela": "dbo.dispositivos_iot",
-                              "unidade": "manutencao", "tipo": "contador"}
+                              "unidade": "manutencao", "tipo": "contador",
+                              "portal_url": "", "portal_token": ""}
     for n in (4, 5, 6):
         assert exemplo["mapeamento"][f"chd{n}"] == [f"chd{n}_value", f"chd{n}.value", f"chd{n}"]
 
