@@ -114,6 +114,7 @@ pronto para baixar. O número vem da contagem de builds do GitHub, por isso algu
 
 | Versão | Data | Principais melhorias |
 | --- | --- | --- |
+| **v0.1.28** | 23/11/2026 | Apontamentos reais: quando o operador **divide uma parada** no portal (encurta e aponta outra legenda), o integrador **mantém a divisão** e a legenda escolhida, em vez de apagar o apontamento manual. Em produção o IoT continua prevalecendo. |
 | **v0.1.27** | 22/11/2026 | Peças: os pulsos do contador contam em **todos** os apontamentos (ciclo mais lento que a microparada também é peça), sem perder nem contar duas vezes. A **Trocar OP** feita no portal ou no app **não é mais desfeita** pelo integrador: a OP nova fica. |
 | **v0.1.26** | 22/11/2026 | Apontamentos reais: conta os **ciclos (pulsos do contador)** de cada apontamento de produção e avisa o portal, que calcula as **peças** (ciclos × cavidades ativas do molde da OP) e a **quantidade real da OP**. Precisa do portal atualizado (`php artisan migrate`). |
 | **v0.1.25** | 22/11/2026 | Apontamentos reais: depois de gravar, o integrador **avisa o portal OEE**, que abre a **SS automática** das legendas com "Abre SS" (antes ela não abria para os apontamentos do IoT). Configurar em `config.toml`, seção `[oee]`: `portal_url` e `portal_token` (o mesmo `IOT_TOKEN` do portal). |
