@@ -686,24 +686,37 @@ def test_ciclo_seguinte_cresce_o_mesmo_apontamento_e_volta_a_produzir():
     assert b.dados["maquinas"][1]["situacao"] == "produzindo"
 
 
-def test_ciclo_manual_coberto_e_excluido_com_aviso_e_legenda_do_operador_mantida():
+def test_ciclo_manual_dentro_da_parada_divide_e_legenda_do_operador_mantida():
+    """Divisão manual dentro de uma parada do IoT (revisto em 23/11/2026): o manual fica, a parada é cortada nele."""
     b = BancoFalso()
     b.maquina(1)
     producao_continua(b, "DEV1", "chd1_value", T(8), T(9))
     obj, logs, erros, _ = novo(b, T(9, 30))
+    obj._avisar_portal = lambda *a: None
     obj.executar_ciclo()
     parada = next(i for i, a in b.dados["apont"].items() if _ep(a["inicio"]) == T(9))
     b.dados["apont"][parada]["legenda"] = SETUP                      # o operador apontou o motivo
-    manual = b.apontamento(1, 99, T(10), T(10, 5), iot=False)       # e um manual por cima do IoT
+    manual = b.apontamento(1, 99, T(10), T(10, 5), iot=False)       # e dividiu a parada às 10:00
     b.commit()
     obj._relogio.t = T(10, 30)
     r = obj.executar_ciclo()
-    assert manual not in b.dados["apont"]
-    assert b.dados["apont"][parada]["legenda"] == SETUP
-    assert r["excluidos"] == 1
+    assert manual in b.dados["apont"] and r["excluidos"] == 0
+    assert b.dados["apont"][parada]["legenda"] == SETUP and _ep(b.dados["apont"][parada]["fim"]) == T(10) - 1
+    assert not [m for n, m in logs if n == "AVISO"]
+
+
+def test_ciclo_manual_coberto_pela_producao_e_excluido_com_aviso():
+    b = BancoFalso()
+    b.maquina(1)
+    producao_continua(b, "DEV1", "chd1_value", T(8), T(10))
+    manual = b.apontamento(1, 99, T(9), T(9, 5), iot=False)          # parada manual onde o IoT viu produção
+    b.commit()
+    obj, logs, erros, _ = novo(b, T(10, 30))
+    obj._avisar_portal = lambda *a: None
+    r = obj.executar_ciclo()
+    assert manual not in b.dados["apont"] and r["excluidos"] == 1
     avisos = [m for n, m in logs if n == "AVISO"]
     assert len(avisos) == 1 and "manual" in avisos[0] and "Injetora 01" in avisos[0] and "excluído" in avisos[0]
-    assert "12/11/2026 10:00:00" in avisos[0]
 
 
 def test_ciclo_usa_ontem_quando_ja_ha_apontamento_do_integrador_ontem():
@@ -1894,3 +1907,45 @@ def test_troca_de_op_do_portal_vira_ponto_de_corte_e_a_op_nova_fica():
     assert b.dados["apont"][aberto]["op"] == 40 and _ep(b.dados["apont"][aberto]["fim"]) == T(9) - 1
     assert b.dados["maquinas"][1]["op"] == 41
     assert b.dados["apont"][troca]["ciclos"] == 181                        # 09:00:00 a 09:30:00, um pulso a cada 10 s
+
+
+def test_divisao_manual_de_uma_parada_e_mantida_com_a_legenda_do_operador():
+    """O operador divide a parada do IoT (98) no portal: 09:00–09:19:59 continua do IoT e 09:20 vira Setup (manual)."""
+    b = BancoFalso()
+    b.maquina(1)
+    ligado(b, "DEV1", "chd1_value", HOJE - 3600, T(8) - 20)
+    producao_continua(b, "DEV1", "chd1_value", T(8), T(9))
+    ligado(b, "DEV1", "chd1_value", T(9) + 10, T(10), valor=361)
+    obj, logs, erros, _ = novo(b, T(9, 30))
+    obj._avisar_portal = lambda *a: None
+    obj.executar_ciclo()
+    parada = next(i for i, a in b.dados["apont"].items() if a["fim"] is None)
+    assert b.dados["apont"][parada]["legenda"] == 98
+    # Portal: encurta a 98 até 09:19:59 e o operador cria Setup às 09:20 (manual).
+    b.dados["apont"][parada]["fim"] = _dt(T(9, 20) - 1)
+    b.proximo_id += 1
+    b.dados["apont"][b.proximo_id] = {"maquina": 1, "legenda": SETUP, "op": None, "inicio": _dt(T(9, 20)), "fim": None,
+                                      "obs": None, "ciclo": None, "dev": None, "canal": None, "por": 7, "em": None,
+                                      "ciclos": None}
+    manual = b.proximo_id
+    obj._relogio.t = T(9, 40)
+    obj.executar_ciclo()
+    assert manual in b.dados["apont"] and b.dados["apont"][manual]["legenda"] == SETUP   # mantido
+    assert b.dados["apont"][manual]["fim"] is None
+    assert _ep(b.dados["apont"][parada]["fim"]) == T(9, 20) - 1                       # sem buraco
+    assert not [m for n, m in logs if n == "AVISO"]                                  # nada apagado
+
+
+def test_manual_em_cima_de_producao_continua_coberto_pelo_iot():
+    b = BancoFalso()
+    b.maquina(1)
+    producao_continua(b, "DEV1", "chd1_value", T(8), T(9, 30))
+    b.proximo_id += 1
+    b.dados["apont"][b.proximo_id] = {"maquina": 1, "legenda": SETUP, "op": None, "inicio": _dt(T(8, 30)), "fim": None,
+                                      "obs": None, "ciclo": None, "dev": None, "canal": None, "por": 7, "em": None,
+                                      "ciclos": None}
+    manual = b.proximo_id
+    obj, logs, erros, _ = novo(b, T(9, 30))
+    obj._avisar_portal = lambda *a: None
+    obj.executar_ciclo()
+    assert manual not in b.dados["apont"]                                              # IoT diz que produziu

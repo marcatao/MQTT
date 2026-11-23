@@ -1672,7 +1672,16 @@ class ApontamentosOee:
             # Troca de OP feita no portal/app (modo "novo"): o apontamento manual "Troca de OP" é um ponto de corte —
             # o trecho do IoT é dividido ali e ele é reaproveitado com a OP nova (antes o IoT o apagava e a máquina
             # voltava para a OP antiga).
-            cortes = {x["inicio"]: x for x in existentes if eh_troca_de_op(x) and ini < x["inicio"] <= agora}
+            # Divisão manual de uma parada (o operador encurta e cria outro com outra legenda; o portal preenche o
+            # buraco com 98): apontamento manual que começa DENTRO de uma parada do IoT também é ponto de corte e fica
+            # com a legenda dele. Em produção, o IoT prevalece (o manual é coberto e excluído, como antes).
+            def em_parada(t: int) -> bool:
+                return any(d.estado != PRODUZINDO and d.inicio <= t and (d.fim is None or t <= d.fim) for d in desejados)
+
+            cortes = {x["inicio"]: x for x in existentes
+                      if ini < x["inicio"] <= agora and (eh_troca_de_op(x) or (
+                          ini_forcado is None and not do_integrador(x) and em_parada(x["inicio"])))}
+            # (o Recalcular continua apagando os manuais do período, como a tela avisa)
             if cortes:
                 desejados = dividir_nos_cortes(desejados, sorted(cortes))
             if canal_ciclo is not None and e.apont_ciclos:

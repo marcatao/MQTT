@@ -485,6 +485,12 @@ Especificação completa em `docs/apontamentos_reais.md` (fonte da verdade; cód
   Peças por minuto (Timeline e app) e o gráfico de peças por hora são do portal. Detalhes em
   `docs/apontamentos_reais.md`.
 
+### Divisão manual das paradas (decidido com o usuário em 23/11/2026)
+
+- Para dividir uma parada em mais de uma legenda, o operador encurta a parada no portal (o buraco vira 98 para editar).
+  Apontamento manual que começa dentro de uma parada do IoT é **ponto de corte** e é mantido com a legenda dele (antes o
+  IoT apagava todo manual da janela). Em produção o IoT prevalece. O Recalcular continua apagando os manuais.
+
 ## Pendências conhecidas
 
 - Índice único `(device_id, ts_unix)` na IOT001 (opcional, decidir com o usuário).

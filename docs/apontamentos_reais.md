@@ -237,6 +237,10 @@ local** (primeira execução) até agora. Leituras lidas a partir de `início_da
   a soma dos **pulsos do contador** do 1º canal de produção da máquina (o mesmo do ciclo médio) de `inicio` a `fim`
   inclusive (o seguinte começa 1 s depois: nenhum pulso perdido nem contado duas vezes); o em aberto até agora.
   Contador que voltou para trás (zerado) conta o valor novo.
+- **Divisão manual de uma parada** (23/11/2026): o operador encurta uma parada e aponta outra legenda (o portal
+  preenche o buraco com 98). Apontamento manual que começa DENTRO de uma parada do IoT é ponto de corte: o trecho é
+  dividido ali e o manual fica com a legenda dele (o IoT não o apaga mais). Manual em cima de produção continua coberto
+  pelo IoT (excluído com aviso). O Recalcular continua apagando os manuais do período.
 - **Troca de OP do portal** (modo "novo"): o apontamento manual com observação começando por "Troca de OP" é ponto de
   corte — o trecho do IoT é dividido nesse instante e esse apontamento é reaproveitado com a OP dele (antes o IoT o
   apagava e a máquina voltava para a OP antiga).
