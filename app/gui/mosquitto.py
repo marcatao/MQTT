@@ -15,6 +15,9 @@ Config (`[mosquitto]` no config.toml, `MosquittoConfig` em app/config.py): `past
 ".exe" acrescentado se faltar; o resto são argumentos) e `iniciar_automaticamente`. O prompt mostrado é sempre
 ``<pasta>><comando>``, como no Prompt de Comando do Windows.
 
+Mosquitto já aberto (23/11/2026): antes de iniciar, `fechar_anteriores` fecha os `mosquitto.exe` que já estão rodando
+(tasklist + taskkill, só Windows), para o novo conseguir a porta 1883.
+
 Endereço Mosquitto: `[mosquitto] pasta` é só o padrão. A pasta escolhida no campo da aba fica em QSettings
 (`mosquitto/pasta`, chave `CHAVE_PASTA`), vale mais que o config.toml e é lida ao abrir (inclusive no reinício do
 vigia, antes do início automático). Só é salva por ação do usuário: Iniciar com sucesso, Enter no campo ou o seletor.
@@ -56,6 +59,53 @@ DICA_SERVICO = ("Se o Mosquitto já roda como serviço do Windows, pare o servi�
                 "[mosquitto] iniciar_automaticamente")
 
 FabricaProcesso = Callable[[QObject], QProcess]
+FechadorAnteriores = Callable[[str, "set[int]"], "list[int]"]   # (nome do .exe, PIDs a poupar) → PIDs fechados
+
+
+def pids_do_programa(nome_exe: str) -> list[int]:
+    """PIDs dos processos com esse nome de executável (só Windows; ``tasklist``). Vazio em outro sistema ou erro."""
+    if sys.platform != "win32":
+        return []
+    try:
+        r = subprocess.run(["tasklist", "/FI", f"IMAGENAME eq {nome_exe}", "/FO", "CSV", "/NH"],
+                           capture_output=True, timeout=5, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return pids_da_saida_tasklist(decodificar(r.stdout), nome_exe)
+
+
+def pids_da_saida_tasklist(texto: str, nome_exe: str) -> list[int]:
+    """PIDs das linhas CSV do ``tasklist /FO CSV /NH`` (``"mosquitto.exe","1234","Console","1","8.000 K"``)."""
+    pids: list[int] = []
+    for linha in texto.splitlines():
+        partes = [c.strip().strip('"') for c in linha.strip().split('","')]
+        if len(partes) >= 2 and partes[0].lower() == nome_exe.lower():
+            try:
+                pids.append(int(partes[1]))
+            except ValueError:
+                pass
+    return pids
+
+
+def fechar_anteriores(nome_exe: str, poupar: set[int]) -> list[int]:
+    """Fecha à força (``taskkill /F``) os ``nome_exe`` já abertos — ex.: o Mosquitto que ficou de uma execução anterior
+    do integrador ou aberto à mão e segura a porta 1883. Devolve os PIDs fechados. Espera até 3 s que sumam."""
+    alvos = [p for p in pids_do_programa(nome_exe) if p not in poupar]
+    fechados: list[int] = []
+    for pid in alvos:
+        try:
+            r = subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, timeout=5,
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if r.returncode == 0:
+            fechados.append(pid)
+        else:
+            log.warning("Mosquitto: não consegui fechar o PID %s: %s", pid, decodificar(r.stdout + r.stderr).strip())
+    limite = time.monotonic() + 3
+    while fechados and time.monotonic() < limite and set(fechados) & set(pids_do_programa(nome_exe)):
+        time.sleep(0.2)
+    return fechados
 
 
 # ---------------------------------------------------------------------- utilitários (testáveis sem Qt)
@@ -191,9 +241,11 @@ class ConsoleMosquitto(QObject):
 
     def __init__(self, config: MosquittoConfig, parent: QObject | None = None,
                  fabrica_processo: FabricaProcesso | None = None,
-                 interpretador: tuple[str, list[str]] | None = None):
+                 interpretador: tuple[str, list[str]] | None = None,
+                 fechador: FechadorAnteriores | None = None):
         super().__init__(parent)
         self.config = config
+        self._fechador = fechador
         self._pasta: str | None = None  # None = a de config.pasta
         self._fabrica = fabrica_processo or (lambda pai: QProcess(pai))
         self._interpretador = interpretador or interpretador_padrao()
@@ -285,6 +337,14 @@ class ConsoleMosquitto(QObject):
             self._erro(f"{nome} não encontrado",
                        f"{nome} não encontrado em {self.pasta} — confira o Endereço Mosquitto (botão …).")
             return False
+        # Mosquitto já aberto (de uma execução anterior do integrador, aberto à mão...) segura a porta 1883 e o novo
+        # não sobe: fecha antes (pedido do usuário em 23/11/2026). O comando extra (mosquitto_sub) não é afetado.
+        exe = os.path.basename(programa)
+        fechados = (self._fechador or fechar_anteriores)(exe, {p for p in (self.pid,) if p})
+        if fechados:
+            texto = (f"{exe} já estava aberto (PID {', '.join(map(str, fechados))}): fechado antes de iniciar.")
+            log.info("Mosquitto: %s", texto)
+            self.saida.emit("aviso", texto)
         proc = self._fabrica(self)
         proc.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)  # mosquitto -v escreve no stderr
         proc.setWorkingDirectory(self.pasta)

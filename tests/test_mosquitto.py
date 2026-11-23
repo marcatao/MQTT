@@ -368,3 +368,39 @@ def test_tema_escuro_e_limpar(abrir):
     painel.botao_limpar.click()
     assert painel.caixa.linhas_texto() == []
     assert console.rodando  # Limpar não para o processo
+
+
+# ---------------------------------------------------------------------- Mosquitto já aberto (23/11/2026)
+def test_pids_da_saida_do_tasklist():
+    from app.gui.mosquitto import pids_da_saida_tasklist
+
+    texto = ('"mosquitto.exe","4321","Console","1","8.120 K"\r\n'
+             '"mosquitto.exe","999","Services","0","7.000 K"\r\n'
+             '"mosquitto_sub.exe","55","Console","1","3.000 K"\r\n')
+    assert pids_da_saida_tasklist(texto, "mosquitto.exe") == [4321, 999]
+    assert pids_da_saida_tasklist("INFO: Nenhuma tarefa em execução.", "mosquitto.exe") == []
+
+
+def test_fecha_o_mosquitto_ja_aberto_antes_de_iniciar(abrir, monkeypatch):
+    import app.gui.mosquitto as mod
+
+    chamadas = []
+
+    def fechador(exe, poupar):
+        chamadas.append((exe, set(poupar)))
+        return [4321]
+
+    monkeypatch.setattr(mod, "fechar_anteriores", fechador)
+    janela, console, painel = abrir()
+    assert chamadas == [("mosquitto.exe", set())]        # antes de iniciar, sem processo próprio a poupar
+    assert esperar(lambda: console.estado == "rodando", 5)
+    assert "mosquitto.exe já estava aberto (PID 4321): fechado antes de iniciar." in _texto(painel)
+
+
+def test_nada_aberto_inicia_sem_aviso(abrir, monkeypatch):
+    import app.gui.mosquitto as mod
+
+    monkeypatch.setattr(mod, "fechar_anteriores", lambda exe, poupar: [])
+    janela, console, painel = abrir()
+    assert esperar(lambda: console.estado == "rodando", 5)
+    assert "já estava aberto" not in _texto(painel)

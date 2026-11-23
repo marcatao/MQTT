@@ -491,6 +491,15 @@ Especificação completa em `docs/apontamentos_reais.md` (fonte da verdade; cód
   Apontamento manual que começa dentro de uma parada do IoT é **ponto de corte** e é mantido com a legenda dele (antes o
   IoT apagava todo manual da janela). Em produção o IoT prevalece. O Recalcular continua apagando os manuais.
 
+### Mosquitto já aberto ao iniciar (decidido com o usuário em 23/11/2026)
+
+- Antes de iniciar o Mosquitto (ao abrir o programa, no reinício do vigia ou pelo botão Iniciar), o integrador procura
+  outros `mosquitto.exe` abertos (`tasklist`) e os fecha à força (`taskkill /PID … /T /F`), esperando até 3 s que
+  sumam; só então inicia o dele. Motivo: um Mosquitto que ficou aberto segura a porta 1883 e o novo não sobe. Aviso no
+  console ("mosquitto.exe já estava aberto (PID …): fechado antes de iniciar.") e no log. Só Windows; o
+  `mosquitto_sub` do campo Comando não é afetado. Um Mosquitto rodando como serviço pode exigir administrador para
+  fechar (fica um WARNING no log). Código: `fechar_anteriores` em `app/gui/mosquitto.py`.
+
 ### Milissegundos (decidido com o usuário em 23/11/2026)
 
 - Micro/macro parada do portal em ms (`maquinas.micro_parada_ms|macro_parada_ms`, valem mais que as colunas em s) e
