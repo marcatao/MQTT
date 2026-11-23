@@ -1016,7 +1016,7 @@ class ApontamentosOee:
                  relogio: Relogio = time.time, conectar: Callable[[SqlServerConfig], object] | None = None,
                  diagnosticar: Diagnosticar | None = None, timeout_diag: float = 15.0,
                  ao_recalculo: AoRecalculo = _nada,
-                 avisar_portal: Callable[[list[int]], None] | None = None) -> None:
+                 avisar_portal: Callable[..., None] | None = None) -> None:
         self._sql = replace(sql) if sql is not None else None
         self._oee = replace(oee_cfg) if oee_cfg is not None else OeeConfig()
         self._cfg = replace(apont_cfg) if apont_cfg is not None else ApontamentosConfig()
@@ -1061,6 +1061,8 @@ class ApontamentosOee:
         self._producao_no_fim: list[int] = []
         self._ops_para_avisar: list[int] = []       # OPs afetadas (quantidade real, no portal)
         self._ops_no_fim: list[int] = []
+        self._para_excluir: list[int] = []          # do IoT que o banco não deixou excluir (abriram SS/OS): o portal exclui
+        self._excluir_no_fim: list[int] = []
 
     # -- API (qualquer thread) ---------------------------------------------------------------------------
 
@@ -1481,8 +1483,11 @@ class ApontamentosOee:
         ids, self._avisar_no_fim = self._avisar_no_fim, []
         producao, self._producao_no_fim = self._producao_no_fim, []
         ops, self._ops_no_fim = self._ops_no_fim, []
+        excluir, self._excluir_no_fim = self._excluir_no_fim, []
         try:
-            if producao or ops:
+            if excluir:
+                self._avisar_portal(ids, producao, ops, excluir)
+            elif producao or ops:
                 self._avisar_portal(ids, producao, ops)
             else:
                 self._avisar_portal(ids)
@@ -1634,6 +1639,7 @@ class ApontamentosOee:
         self._para_avisar = []
         self._para_producao = []
         self._ops_para_avisar = []
+        self._para_excluir = []
         ontem = inicio_do_dia(agora, self._fuso, -1)
         jornada = jornada or Jornada({})
         cur = self._conexao.cursor()
@@ -1811,6 +1817,7 @@ class ApontamentosOee:
             self._avisar_no_fim.extend(self._para_avisar)   # só o que foi gravado de fato
             self._producao_no_fim.extend(self._para_producao)
             self._ops_no_fim.extend(self._ops_para_avisar)
+            self._excluir_no_fim.extend(self._para_excluir)
         except Exception:
             self._rollback()
             raise
@@ -1888,25 +1895,27 @@ class ApontamentosOee:
         cur.execute(f"SELECT [id], [inicio], [observacao] FROM {A} WHERE [maquina_id] = ? AND [fim] IS NULL "
                     "ORDER BY [inicio], [id]", m.id)
         abertos = [(int(r[0]), epoch_de(r[1]), r[2]) for r in cur.fetchall() or []]
-        if len(abertos) < 2:
+        if not abertos:
             return []
+        # (também um só em aberto que não é o último; os que o portal vai excluir não contam como "seguinte")
+        ignorar = set(self._para_excluir)
         atualizado_em = ("[atualizado_em] = CASE WHEN [atualizado_por_id] IS NULL THEN ? ELSE [atualizado_em] END"
                          if e.apont_atualizado_por else "[atualizado_em] = ?")
         avisos: list[str] = []
         for id_, inicio, observacao in abertos:
-            cur.execute(f"SELECT TOP 1 [inicio] FROM {A} WHERE [maquina_id] = ? AND [id] <> ? AND "
+            cur.execute(f"SELECT TOP 20 [inicio], [id] FROM {A} WHERE [maquina_id] = ? AND [id] <> ? AND "
                         "([inicio] > ? OR ([inicio] = ? AND [id] > ?)) ORDER BY [inicio], [id]",
                         m.id, id_, utc_sql(inicio), utc_sql(inicio), id_)
-            r = cur.fetchone()
+            r = next((x for x in cur.fetchall() or [] if int(x[1]) not in ignorar), None)
             if r is None or r[0] is None:
                 continue                       # é o mais recente: fica em aberto
             fim = max(inicio, min(epoch_de(r[0]) - 1, fim_do_dia(inicio, self._fuso)))
             cur.execute(f"UPDATE {A} SET [fim] = ?, {atualizado_em} WHERE [id] = ? AND [fim] IS NULL",
                         utc_sql(fim), utc_sql(agora), id_)
             origem = "do IoT" if do_integrador({"observacao": observacao}) else "manual"
-            avisos.append(f"Apontamentos reais: máquina {self._nome(m)} tinha dois apontamentos em aberto; o "
-                          f"{origem} de {self._hora(inicio)} foi encerrado às {self._hora(fim)} (só o mais recente "
-                          "fica em aberto).")
+            avisos.append(f"Apontamentos reais: máquina {self._nome(m)}: o apontamento {origem} de "
+                          f"{self._hora(inicio)} estava em aberto sem ser o último; encerrado às {self._hora(fim)} "
+                          "(só o mais recente fica em aberto).")
         return avisos
 
     def _aplicar(self, cur, m: Maquina, plano: Plano, todas: dict[int, Legenda], agora: int
@@ -1921,10 +1930,16 @@ class ApontamentosOee:
             except Exception as exc:  # noqa: BLE001
                 if classificar_erro(exc)[0] != "dados":
                     raise
-                # FK (OS/SS ligada ao apontamento): o SQL Server só cancela o comando, a transação continua
-                avisos.append(f"Apontamentos reais: o apontamento {self._descrever(x, todas)} da máquina "
-                              f"{self._nome(m)} não pôde ser excluído (está ligado a outro registro do portal, "
-                              "ex.: OS/SS); mantido.")
+                # FK (OS/SS ligada ao apontamento): o SQL Server só cancela o comando, a transação continua. O do IoT
+                # vai para o portal excluir com o chamado junto (SS pendente / OS sem atendimento canceladas).
+                if not x.get("manual"):
+                    self._para_excluir.append(int(x["id"]))
+                    avisos.append(f"Apontamentos reais: o apontamento {self._descrever(x, todas)} da máquina "
+                                  f"{self._nome(m)} abriu SS/OS automática; o portal vai excluí-lo com o chamado.")
+                else:
+                    avisos.append(f"Apontamentos reais: o apontamento {self._descrever(x, todas)} da máquina "
+                                  f"{self._nome(m)} não pôde ser excluído (está ligado a outro registro do portal, "
+                                  "ex.: OS/SS); mantido.")
                 continue
             contagem["excluidos"] += 1
             if x["manual"]:

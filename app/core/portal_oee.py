@@ -51,6 +51,7 @@ class NotificadorPortal:
         self._pendentes: list[int] = []         # SS automática (criados / legenda trocada)
         self._producao: list[int] = []          # peças (ciclos novos)
         self._ops: list[int] = []               # quantidade real das OPs
+        self._excluir: list[int] = []           # do IoT com SS/OS que o banco não deixou excluir (o portal exclui)
         self._info_desligado = False
         self._falhando = False
 
@@ -62,15 +63,17 @@ class NotificadorPortal:
     def pendentes(self) -> list[int]:
         return list(self._pendentes)
 
-    def avisar(self, ids: list[int], producao: list[int] | None = None, ops: list[int] | None = None) -> None:
+    def avisar(self, ids: list[int], producao: list[int] | None = None, ops: list[int] | None = None,
+               excluir: list[int] | None = None) -> None:
         """Acrescenta os ids às filas e envia tudo o que estiver pendente. Nunca levanta exceção."""
         if not self.ligado:
-            if (ids or producao or ops) and not self._info_desligado:
+            if (ids or producao or ops or excluir) and not self._info_desligado:
                 self._info_desligado = True
                 self._logar("INFO", "Apontamentos reais: aviso ao portal OEE desligado ([oee] portal_url e portal_token "
                                     "vazios); a SS automática das legendas com \"Abre SS\" não abre para o IoT.")
             return
-        for fila, novos in ((self._pendentes, ids), (self._producao, producao or []), (self._ops, ops or [])):
+        for fila, novos in ((self._pendentes, ids), (self._producao, producao or []), (self._ops, ops or []),
+                            (self._excluir, excluir or [])):
             vistos = set(fila)
             for i in novos:
                 if int(i) not in vistos:
@@ -80,16 +83,21 @@ class NotificadorPortal:
                 descartados = len(fila) - MAX_PENDENTES
                 del fila[:descartados]
                 self._logar("AVISO", f"Apontamentos reais: {descartados} aviso(s) antigos ao portal descartados (fila cheia).")
-        while self._pendentes or self._producao or self._ops:
+        while self._pendentes or self._producao or self._ops or self._excluir:
             lote = (self._pendentes[:MAX_POR_CHAMADA], self._producao[:MAX_POR_CHAMADA], self._ops[:MAX_POR_CHAMADA])
-            if not self._enviar_lote(*lote):
+            excluir_lote = self._excluir[:MAX_POR_CHAMADA]
+            if not (self._enviar_lote(*lote, excluir=excluir_lote) if excluir_lote else self._enviar_lote(*lote)):
                 return
             del self._pendentes[:len(lote[0])]
             del self._producao[:len(lote[1])]
             del self._ops[:len(lote[2])]
+            del self._excluir[:len(excluir_lote)]
 
-    def _enviar_lote(self, lote: list[int], producao: list[int] | None = None, ops: list[int] | None = None) -> bool:
+    def _enviar_lote(self, lote: list[int], producao: list[int] | None = None, ops: list[int] | None = None,
+                     excluir: list[int] | None = None) -> bool:
         dados_envio: dict = {"apontamentos": lote}
+        if excluir:
+            dados_envio["excluir"] = excluir
         if producao:
             dados_envio["producao"] = producao
         if ops:
@@ -116,6 +124,10 @@ class NotificadorPortal:
             dados = json.loads(resposta or b"{}")
         except ValueError:
             dados = {}
+        for item in dados.get("excluidos") or []:
+            chamados = "; ".join(item.get("chamados") or [])
+            self._logar("INFO", f"Apontamentos reais: o portal excluiu o apontamento {item.get('id')} (trecho corrigido)"
+                                + (f": {chamados}." if chamados else "."))
         for item in dados.get("apontamentos") or []:
             if item.get("ss"):
                 self._logar("INFO", f"Apontamentos reais: o portal abriu a SS {item['ss']} (apontamento {item.get('id')}).")

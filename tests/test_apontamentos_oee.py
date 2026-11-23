@@ -542,11 +542,11 @@ class BancoFalso:
         if sql.startswith("SELECT [id], [inicio], [observacao] FROM") and "[fim] IS NULL" in sql:   # abertos
             return sorted(((i, a["inicio"], a["obs"]) for i, a in d["apont"].items()
                            if a["maquina"] == p[0] and a["fim"] is None), key=lambda r: (r[1], r[0]))
-        if sql.startswith("SELECT TOP 1 [inicio] FROM") and "[id] <> ?" in sql:   # seguinte de um aberto
+        if sql.startswith("SELECT TOP 20 [inicio], [id] FROM") and "[id] <> ?" in sql:   # seguintes de um aberto
             maq, id_, ini, _ini, _id = p
             cand = sorted((a["inicio"], i) for i, a in d["apont"].items()
                           if a["maquina"] == maq and i != id_ and (a["inicio"] > ini or (a["inicio"] == ini and i > id_)))
-            return [(cand[0][0],)] if cand else []
+            return cand[:20]
         if sql.startswith("DELETE FROM"):
             d["apont"].pop(p[0])
             return []
@@ -2019,10 +2019,48 @@ def test_so_o_mais_recente_fica_em_aberto_mesmo_com_manual_esquecido():
     integ._esquema = ap.Esquema(t={"apontamentos_estado": "[OEE].[dbo].[apontamentos_estado]"}, iot="", canais_iot=set(),
                                 maquinas_atualizado_em=True, op_status_em=False, apont_atualizado_por=True)
     integ._fuso = FUSO
+    integ._para_excluir = []
     m = ap.Maquina(id=1, codigo="INJ01", nome="Injetora 01", micro=60, macro=300, situacao=None, situacao_desde=None,
                    situacao_legenda_id=None, ordem_producao_id=None, canais=[])
     avisos = abertos(integ, b.cursor(), m, T(12))
     assert _ep(b.dados["apont"][manual]["fim"]) == T(12) - 601
     assert b.dados["apont"][iot]["fim"] is None
-    assert len(avisos) == 1 and "manual" in avisos[0] and "dois apontamentos em aberto" in avisos[0]
+    assert len(avisos) == 1 and "manual" in avisos[0] and "estava em aberto sem ser o último" in avisos[0]
     assert abertos(integ, b.cursor(), m, T(12)) == []           # já certo: nada a fazer
+
+
+def test_trecho_do_iot_com_ss_que_o_banco_nao_deixa_excluir_vai_para_o_portal_excluir():
+    """97 do IoT que abriu SS no meio de uma produção que o IoT corrigiu: o banco recusa o DELETE (FK); o integrador
+    pede ao portal para excluir (campo excluir) e NÃO encerra a produção em aberto por causa dele."""
+    b = BancoFalso()
+    b.maquina(1)
+    producao_continua(b, "DEV1", "chd1_value", T(8), T(9, 30))
+    velhos = [b.apontamento(1, 97, T(8, 10 * i), T(8, 10 * i + 5)) for i in range(1, 5)]
+    for v in velhos:
+        b.fk_ids.add(v)
+    b.falhas.append(("DELETE FROM", ErroOdbc("fk")))
+    obj, logs, erros, _ = novo(b, T(9, 30))
+    chamadas: list[tuple] = []
+    obj._avisar_portal = lambda *args: chamadas.append(args)
+    r = obj.executar_ciclo()
+    assert r["ok"] and not erros
+    barrados = [v for v in velhos if v in b.dados["apont"] and b.dados["apont"][v]["legenda"] == 97]
+    assert barrados                                                   # o banco não deixou excluir
+    assert chamadas and len(chamadas[-1]) == 4 and sorted(chamadas[-1][3]) == sorted(barrados)
+    assert any("o portal vai excluí-lo com o chamado" in m for n, m in logs if n == "AVISO")
+    abertos = [a for a in b.dados["apont"].values() if a["fim"] is None]
+    assert len(abertos) == 1 and abertos[0]["legenda"] == 2            # a produção segue em aberto
+
+
+def test_notificador_manda_o_campo_excluir_e_loga_o_que_o_portal_excluiu():
+    from app.core.portal_oee import NotificadorPortal
+    enviados, logs = [], []
+
+    def enviar(url, corpo, cab, timeout):
+        enviados.append(json.loads(corpo))
+        return 200, json.dumps({"excluidos": [{"id": 7, "chamados": ["SS 000046 cancelada"]}]}).encode()
+
+    n = NotificadorPortal("https://portal/oee", "t" * 40, lambda nivel, msg: logs.append((nivel, msg)), enviar)
+    n.avisar([], None, None, [7])
+    assert enviados == [{"apontamentos": [], "excluir": [7]}]
+    assert any("excluiu o apontamento 7" in m and "SS 000046 cancelada" in m for _n, m in logs)

@@ -504,7 +504,11 @@ Especificação completa em `docs/apontamentos_reais.md` (fonte da verdade; cód
 
 - Ao fim do ciclo de cada máquina, `_fechar_abertos_anteriores` encerra os apontamentos em aberto que não são o mais
   recente (de qualquer origem: portal, app ou IoT) 1 s antes do seguinte, sem passar do dia (regra do portal
-  `HorarioApontamento::fecharAbertosAnteriores`), com AVISO no log. O portal faz o mesmo a cada aviso do integrador.
+  `HorarioApontamento::fecharAbertosAnteriores`), com AVISO no log; também um ÚNICO em aberto que não é o último. O
+  portal faz o mesmo a cada aviso do integrador.
+- Apontamento do IoT que o integrador quer excluir (trecho corrigido, ex.: 97 quando o aparelho voltou) e o banco recusa
+  (FK: abriu SS/OS automática): vai no campo `excluir` do aviso ao portal, que exclui com o chamado junto (SS pendente e
+  OS sem atendimento canceladas). Enquanto isso, ele não conta como "seguinte" ao fechar os abertos.
 
 ### Milissegundos (decidido com o usuário em 23/11/2026)
 
