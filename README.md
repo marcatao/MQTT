@@ -114,6 +114,7 @@ pronto para baixar. O número vem da contagem de builds do GitHub, por isso algu
 
 | Versão | Data | Principais melhorias |
 | --- | --- | --- |
+| **v0.1.31** | 23/11/2026 | **Só um apontamento em aberto por máquina**: se ficar um apontamento antigo em aberto (manual do portal/app ou do IoT), o integrador o encerra 1 s antes do seguinte a cada ciclo e avisa no log. |
 | **v0.1.30** | 23/11/2026 | Ao abrir (e ao clicar em Iniciar na aba Mosquitto), se já houver um **Mosquitto aberto** ele é **fechado antes** e só então o integrador inicia o dele — assim a porta 1883 fica livre. O console avisa qual foi fechado. |
 | **v0.1.29** | 23/11/2026 | **Milissegundos**: micro e macro parada aceitam fração de segundo (0,5 s = 500 ms) e o ciclo médio é gravado também em milissegundos (máquinas com mais de uma peça por segundo). Como o aparelho manda uma leitura a cada ~10 s, a microparada usada é no mínimo 1,5 × esse intervalo (a aba mostra "usa 15"). |
 | **v0.1.28** | 23/11/2026 | Apontamentos reais: quando o operador **divide uma parada** no portal (encurta e aponta outra legenda), o integrador **mantém a divisão** e a legenda escolhida, em vez de apagar o apontamento manual. Em produção o IoT continua prevalecendo. |
