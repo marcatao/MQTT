@@ -1763,6 +1763,7 @@ class ApontamentosOee:
                              com_ciclo=com_ciclo, origem=origem, com_ciclos=e.apont_ciclos, cortes=set(cortes),
                              com_ciclo_ms=com_ciclo and e.apont_ciclo_ms)
             contagem, avisos = self._aplicar(cur, m, plano, todas, agora)
+            avisos.extend(self._fechar_abertos_anteriores(cur, m, agora))
             if e.apont_ciclos:
                 self._ops_para_avisar = sorted(plano.ops_afetadas())   # quantidade real das OPs (portal)
             logs.extend(("AVISO", a) for a in avisos)
@@ -1877,6 +1878,36 @@ class ApontamentosOee:
                 if cur.fetchone() is not None:
                     return inicio, device
         return None
+
+    def _fechar_abertos_anteriores(self, cur, m: Maquina, agora: int) -> list[str]:
+        """Só o apontamento MAIS RECENTE da máquina fica em aberto (regra do portal, ``HorarioApontamento::
+        fecharAbertosAnteriores``): os outros em aberto — de qualquer origem (portal, app, IoT) — são encerrados 1 s
+        antes do seguinte, sem passar do dia deles. Pedido do usuário em 23/11/2026 (dois apontamentos em aberto)."""
+        e = self._esquema
+        A = e.t["apontamentos_estado"]
+        cur.execute(f"SELECT [id], [inicio], [observacao] FROM {A} WHERE [maquina_id] = ? AND [fim] IS NULL "
+                    "ORDER BY [inicio], [id]", m.id)
+        abertos = [(int(r[0]), epoch_de(r[1]), r[2]) for r in cur.fetchall() or []]
+        if len(abertos) < 2:
+            return []
+        atualizado_em = ("[atualizado_em] = CASE WHEN [atualizado_por_id] IS NULL THEN ? ELSE [atualizado_em] END"
+                         if e.apont_atualizado_por else "[atualizado_em] = ?")
+        avisos: list[str] = []
+        for id_, inicio, observacao in abertos:
+            cur.execute(f"SELECT TOP 1 [inicio] FROM {A} WHERE [maquina_id] = ? AND [id] <> ? AND "
+                        "([inicio] > ? OR ([inicio] = ? AND [id] > ?)) ORDER BY [inicio], [id]",
+                        m.id, id_, utc_sql(inicio), utc_sql(inicio), id_)
+            r = cur.fetchone()
+            if r is None or r[0] is None:
+                continue                       # é o mais recente: fica em aberto
+            fim = max(inicio, min(epoch_de(r[0]) - 1, fim_do_dia(inicio, self._fuso)))
+            cur.execute(f"UPDATE {A} SET [fim] = ?, {atualizado_em} WHERE [id] = ? AND [fim] IS NULL",
+                        utc_sql(fim), utc_sql(agora), id_)
+            origem = "do IoT" if do_integrador({"observacao": observacao}) else "manual"
+            avisos.append(f"Apontamentos reais: máquina {self._nome(m)} tinha dois apontamentos em aberto; o "
+                          f"{origem} de {self._hora(inicio)} foi encerrado às {self._hora(fim)} (só o mais recente "
+                          "fica em aberto).")
+        return avisos
 
     def _aplicar(self, cur, m: Maquina, plano: Plano, todas: dict[int, Legenda], agora: int
                  ) -> tuple[dict, list[str]]:

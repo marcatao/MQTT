@@ -539,6 +539,14 @@ class BancoFalso:
                             *[a.get(CAMPOS[c]) for c in extras]) for i, a in d["apont"].items()
                            if a["maquina"] == maq and a["inicio"] <= agora and (a["fim"] is None or a["fim"] >= ini)),
                           key=lambda r: (r[2], r[0]))
+        if sql.startswith("SELECT [id], [inicio], [observacao] FROM") and "[fim] IS NULL" in sql:   # abertos
+            return sorted(((i, a["inicio"], a["obs"]) for i, a in d["apont"].items()
+                           if a["maquina"] == p[0] and a["fim"] is None), key=lambda r: (r[1], r[0]))
+        if sql.startswith("SELECT TOP 1 [inicio] FROM") and "[id] <> ?" in sql:   # seguinte de um aberto
+            maq, id_, ini, _ini, _id = p
+            cand = sorted((a["inicio"], i) for i, a in d["apont"].items()
+                          if a["maquina"] == maq and i != id_ and (a["inicio"] > ini or (a["inicio"] == ini and i > id_)))
+            return [(cand[0][0],)] if cand else []
         if sql.startswith("DELETE FROM"):
             d["apont"].pop(p[0])
             return []
@@ -1994,3 +2002,27 @@ def test_planejar_leva_ciclo_medio_ms_quando_a_coluna_existe():
     plano = ap.planejar([ap.Trecho(100, None, PRODUZINDO, ciclo=0, ciclo_ms=40)], [], 100, 200, leg, None,
                         timezone.utc, com_ciclo=True, com_ciclo_ms=True)
     assert plano.inserir[0]["ciclo_medio"] == 0 and plano.inserir[0]["ciclo_medio_ms"] == 40
+
+
+# ---------------------------------------------------------------------- dois em aberto (23/11/2026)
+def test_so_o_mais_recente_fica_em_aberto_mesmo_com_manual_esquecido():
+    """Um "2" manual ficou em aberto (feito no portal) e o IoT abriu a parada depois: o ciclo encerra o manual
+    1 s antes do seguinte e só o mais recente fica em aberto."""
+    b = BancoFalso()
+    b.maquina(1)
+    inicio = T(12) - 3 * 3600
+    manual = b.apontamento(1, 2, inicio, None, iot=False)
+    # o IoT gravou uma parada em aberto depois, sem fechar o manual (como no print do usuário)
+    iot = b.apontamento(1, 98, T(12) - 600, None)
+    abertos = ApontamentosOee._fechar_abertos_anteriores
+    integ = ApontamentosOee.__new__(ApontamentosOee)
+    integ._esquema = ap.Esquema(t={"apontamentos_estado": "[OEE].[dbo].[apontamentos_estado]"}, iot="", canais_iot=set(),
+                                maquinas_atualizado_em=True, op_status_em=False, apont_atualizado_por=True)
+    integ._fuso = FUSO
+    m = ap.Maquina(id=1, codigo="INJ01", nome="Injetora 01", micro=60, macro=300, situacao=None, situacao_desde=None,
+                   situacao_legenda_id=None, ordem_producao_id=None, canais=[])
+    avisos = abertos(integ, b.cursor(), m, T(12))
+    assert _ep(b.dados["apont"][manual]["fim"]) == T(12) - 601
+    assert b.dados["apont"][iot]["fim"] is None
+    assert len(avisos) == 1 and "manual" in avisos[0] and "dois apontamentos em aberto" in avisos[0]
+    assert abertos(integ, b.cursor(), m, T(12)) == []           # já certo: nada a fazer

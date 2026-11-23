@@ -500,6 +500,12 @@ Especificação completa em `docs/apontamentos_reais.md` (fonte da verdade; cód
   `mosquitto_sub` do campo Comando não é afetado. Um Mosquitto rodando como serviço pode exigir administrador para
   fechar (fica um WARNING no log). Código: `fechar_anteriores` em `app/gui/mosquitto.py`.
 
+### Só um apontamento em aberto (decidido com o usuário em 23/11/2026)
+
+- Ao fim do ciclo de cada máquina, `_fechar_abertos_anteriores` encerra os apontamentos em aberto que não são o mais
+  recente (de qualquer origem: portal, app ou IoT) 1 s antes do seguinte, sem passar do dia (regra do portal
+  `HorarioApontamento::fecharAbertosAnteriores`), com AVISO no log. O portal faz o mesmo a cada aviso do integrador.
+
 ### Milissegundos (decidido com o usuário em 23/11/2026)
 
 - Micro/macro parada do portal em ms (`maquinas.micro_parada_ms|macro_parada_ms`, valem mais que as colunas em s) e
