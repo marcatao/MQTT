@@ -6,6 +6,9 @@ Especificação: ``docs/apontamentos_reais.md`` (fonte da verdade). Resumo:
   canal (``iotN_dispositivo_id`` + ``iotN_canal``) com dispositivo ativo e tipo ``producao`` (ou NULL).
 - **Produção** = leitura em que o contador do canal subiu em relação à leitura anterior do mesmo canal (valor menor =
   contador zerado = nova base). Com vários canais, vale a produção de qualquer um.
+- Micro/macro em segundos com fração: ``micro_parada_ms``/``macro_parada_ms`` do portal valem mais que as colunas
+  antigas em segundos. Micro abaixo de 1,5 × o intervalo típico das leituras do aparelho é elevada a isso
+  (``limites_efetivos``): parada menor que o intervalo entre leituras não é visível.
 - Intervalo entre produções ``gap``: ``< micro`` → 2 Produção Normal; ``micro ≤ gap < macro`` → 99 Microparada;
   ``≥ macro`` → 98 Macro parada. A parada começa na última produção; o trecho em aberto usa ``agora − p``.
 - **Falta de linhas na IOT001** (regra revista em 13/11/2026): não gera 97 nem desconta nada do intervalo; é máquina
@@ -26,7 +29,8 @@ Especificação: ``docs/apontamentos_reais.md`` (fonte da verdade). Resumo:
 - **Ciclo médio** (``ciclo_medio``, coluna opcional de ``apontamentos_estado``): em cada apontamento do integrador
   criado ou atualizado, o tempo médio por peça nas últimas 10 alterações do contador do 1º canal de produção, até o
   fim do apontamento (ou agora, se em aberto); reinício do contador quebra a sequência; < 2 alterações = NULL;
-  teto 999. As alterações de antes da janela vêm de ``_leituras_antes`` (blocos ``TOP (500)`` decrescentes, no
+  teto 999. Com a coluna ``ciclo_medio_ms`` (23/11/2026), grava também o ciclo em MILISSEGUNDOS (sem teto prático:
+  máquinas com mais de uma peça por segundo). As alterações de antes da janela vêm de ``_leituras_antes`` (blocos ``TOP (500)`` decrescentes, no
   máx. 4). Sem a coluna: 1 INFO e nada de ``ciclo_medio`` nos SQLs.
 
 - **Auditoria humana**: nos UPDATEs em ``apontamentos_estado`` o integrador nunca toca em ``atualizado_por_id`` e só
@@ -38,12 +42,13 @@ Especificação: ``docs/apontamentos_reais.md`` (fonte da verdade). Resumo:
 JSON de cada ciclo (``ao_resultado``)::
 
     {"quando", "proxima" (ISO local | null), "minutos", "ok", "mensagem", "criados", "alterados", "excluidos",
-     "maquinas": [{"maquina_id", "codigo", "nome", "canais", "micro_s", "macro_s", "legenda", "legenda_descricao",
+     "maquinas": [{"maquina_id", "codigo", "nome", "canais", "micro_s", "macro_s" (s, com fração),
+                   "micro_efetiva_s" (só quando ajustada pelo intervalo das leituras), "legenda", "legenda_descricao",
                    "desde", "ultima_producao", "apontamentos_hoje", "ultima_leitura", "aviso",
                    "diag": "ok" | "ok (dados recentes)" | "sem resposta" | "sem MQTT" | null,
                    "turno": "dentro" | "fora" | "sem jornada",
                    "jornada": "Seg–Qui 05:00–14:48, Sex 05:00–13:48" | null,
-                   "ciclo_medio": int | null (do apontamento mais recente)}]}
+                   "ciclo_medio": s (int; com fração se existir ciclo_medio_ms) | null (do mais recente)}]}
 - Trechos iguais seguidos = um apontamento; nenhum passa da meia-noite local (``[apontamentos] fuso``); encadeados
   (``fim = próximo início − 1 s``); trecho < 2 s é absorvido; o último fica em aberto (``fim`` NULL).
 - Reconciliação por máquina, numa transação: os do integrador (``observacao`` começando por ``[IoT]``) são
@@ -195,11 +200,26 @@ def ciclos_no_trecho(incs: list[tuple[int, int]], inicio: int, fim: int) -> int:
 
 
 def ciclo_medio(alteracoes_canal: list[tuple[int, float]], ate: int, n: int = 10, teto: int = 999) -> int | None:
-    """Tempo médio por peça (s) nas últimas ``n`` alterações do contador até ``ate`` (inclusive).
+    """Tempo médio por peça em SEGUNDOS INTEIROS (coluna antiga ``ciclo_medio``); ver ``ciclo_medio_ms``."""
+    razao = _segundos_por_peca(alteracoes_canal, ate, n)
+    return None if razao is None else max(0, min(int(teto), int(razao + 0.5)))
+
+
+def ciclo_medio_ms(alteracoes_canal: list[tuple[int, float]], ate: int, n: int = 10,
+                   teto_ms: int = 999_999_999) -> int | None:
+    """Tempo médio por peça em MILISSEGUNDOS (coluna ``ciclo_medio_ms``, pedido do usuário em 23/11/2026: máquinas
+    que fazem mais de uma peça por segundo). O ``ts_unix`` é de segundos, mas a média de muitas peças entre leituras
+    dá a fração: 250 pulsos em 10 s = 40 ms por peça."""
+    razao = _segundos_por_peca(alteracoes_canal, ate, n)
+    return None if razao is None else max(0, min(int(teto_ms), int(razao * 1000 + 0.5)))
+
+
+def _segundos_por_peca(alteracoes_canal: list[tuple[int, float]], ate: int, n: int = 10) -> float | None:
+    """Tempo médio por peça (s, com fração) nas últimas ``n`` alterações do contador até ``ate`` (inclusive).
 
     Com as alterações ``a0 < … < aK`` (K ≤ n intervalos, as mais recentes até ``ate``, sem atravessar um reinício):
-    ``round((t(aK) − t(a0)) / (contador(aK) − contador(a0)))``. Contador de 1 em 1 = média dos intervalos; subindo
-    mais de 1 por leitura = tempo real por peça. Menos de 2 alterações: None. Acima de ``teto``: ``teto``.
+    ``(t(aK) − t(a0)) / (contador(aK) − contador(a0))``. Contador de 1 em 1 = média dos intervalos; subindo
+    mais de 1 por leitura = tempo real por peça. Menos de 2 alterações: None.
     """
     validas = sorted((int(t), float(v)) for t, v in alteracoes_canal if int(t) <= ate)
     seq: list[tuple[int, float]] = []
@@ -217,7 +237,29 @@ def ciclo_medio(alteracoes_canal: list[tuple[int, float]], ate: int, n: int = 10
     dv = seq[0][1] - seq[-1][1]
     if dv <= 0 or dt < 0:
         return None
-    return max(0, min(int(teto), int(dt / dv + 0.5)))
+    return dt / dv
+
+
+def passo_das_leituras(instantes: Iterable[int], padrao: float = 10.0) -> float:
+    """Intervalo típico (mediana, s) entre leituras seguidas do aparelho; ``padrao`` com menos de 3 leituras."""
+    ts = sorted({int(t) for t in instantes})
+    difs = sorted(b - a for a, b in zip(ts, ts[1:]) if b > a)
+    if len(difs) < 2:
+        return padrao
+    meio = len(difs) // 2
+    return float(difs[meio]) if len(difs) % 2 else (difs[meio - 1] + difs[meio]) / 2
+
+
+def limites_efetivos(micro: float, macro: float, passo: float) -> tuple[float, float]:
+    """Micro/macro parada usados na classificação (23/11/2026, micro/macro em milissegundos no portal).
+
+    O aparelho só manda leitura a cada ``passo`` segundos e o ``ts_unix`` é de segundos: um intervalo menor que isso
+    não é visível. Com micro abaixo de 1,5 × ``passo`` (ex.: 0,5 s com leitura a cada 10 s), toda produção viraria
+    microparada; então a micro efetiva é no mínimo 1,5 × ``passo`` (uma leitura sem o contador subir já é parada)
+    e a macro fica pelo menos 1 s acima dela.
+    """
+    micro_ef = max(float(micro), 1.5 * float(passo))
+    return micro_ef, max(float(macro), micro_ef + 1.0)
 
 
 def juntar_producoes(*listas: Iterable[int]) -> list[int]:
@@ -225,7 +267,7 @@ def juntar_producoes(*listas: Iterable[int]) -> list[int]:
     return sorted({int(t) for lista in listas for t in lista})
 
 
-def classificar(gap: float, micro: int, macro: int) -> str:
+def classificar(gap: float, micro: float, macro: float) -> str:
     if gap < micro:
         return PRODUZINDO
     if gap < macro:
@@ -233,7 +275,7 @@ def classificar(gap: float, micro: int, macro: int) -> str:
     return MACRO
 
 
-def segmentos_continuos(prods: Iterable[int], ini: int, agora: int, micro: int, macro: int
+def segmentos_continuos(prods: Iterable[int], ini: int, agora: int, micro: float, macro: float
                         ) -> list[tuple[int, int, str]]:
     """Trechos ``(inicio, fim_exclusivo, estado)`` que cobrem ``[ini, agora]`` sem buracos, já mesclados.
 
@@ -474,6 +516,7 @@ class Trecho:
     fim: int | None
     estado: str
     ciclo: int | None = None        # ciclo_medio (s) até o fim (ou até agora, se em aberto); None = sem dado
+    ciclo_ms: int | None = None     # o mesmo em milissegundos (coluna ciclo_medio_ms)
     ciclos: int | None = None       # pulsos do contador no trecho (só produção); o portal multiplica pelas cavidades
 
 
@@ -614,7 +657,7 @@ def dividir_nos_cortes(desejados: list[Trecho], cortes: list[int]) -> list[Trech
 def planejar(desejados: list[Trecho], existentes: list[dict], ini: int, agora: int, legendas: LegendasIot,
              op_maquina: int | None, fuso: tzinfo, com_ciclo: bool = False,
              origem: tuple[int | None, str] | None = None, com_ciclos: bool = False,
-             cortes: set[int] | None = None) -> Plano:
+             cortes: set[int] | None = None, com_ciclo_ms: bool = False) -> Plano:
     """Compara os trechos desejados de ``[ini, agora]`` com os apontamentos existentes que cruzam a janela.
 
     ``existentes``: dicts com ``id, legenda_id, inicio, fim, observacao, ordem_producao_id`` (datas em epoch).
@@ -686,6 +729,8 @@ def planejar(desejados: list[Trecho], existentes: list[dict], ini: int, agora: i
         if existente is None and sobras:
             existente = sobras.pop(0)
         extra = {"ciclo_medio": d.ciclo} if com_ciclo else {}
+        if com_ciclo_ms:
+            extra["ciclo_medio_ms"] = d.ciclo_ms
         if com_ciclos:
             extra["ciclos"] = d.ciclos
         if origem is not None:
@@ -791,6 +836,8 @@ class Esquema:
     apont_atualizado_por: bool = False
     apont_ciclo_medio: bool = False           # apontamentos_estado.ciclo_medio existe (migração do portal)
     apont_ciclos: bool = False                # apontamentos_estado.ciclos existe (peças pelo IoT, 22/11/2026)
+    apont_ciclo_ms: bool = False              # apontamentos_estado.ciclo_medio_ms existe (23/11/2026)
+    maquinas_ms: bool = False                 # maquinas.micro_parada_ms e macro_parada_ms existem (23/11/2026)
     apont_origem: bool = False                # apontamentos_estado.iot_dispositivo_id e iot_canal existem
     jornada_cols: frozenset = frozenset()     # colunas de jornada/calendário existentes em maquinas
     calendario_dias: bool = False             # [banco].[dbo].[calendario_dias] legível (exceções do calendário)
@@ -843,6 +890,8 @@ def detectar(cursor, oee: OeeConfig, sql: SqlServerConfig) -> tuple[Esquema | No
                    op_status_em="status_em" in colunas["ordens_producao"],
                    apont_ciclo_medio="ciclo_medio" in colunas["apontamentos_estado"],
                    apont_ciclos="ciclos" in colunas["apontamentos_estado"],
+                   apont_ciclo_ms="ciclo_medio_ms" in colunas["apontamentos_estado"],
+                   maquinas_ms={"micro_parada_ms", "macro_parada_ms"} <= colunas["maquinas"],
                    apont_origem={"iot_dispositivo_id", "iot_canal"} <= colunas["apontamentos_estado"],
                    apont_atualizado_por="atualizado_por_id" in colunas["apontamentos_estado"],
                    jornada_cols=jornada_cols, calendario_dias=calendario), ""
@@ -854,7 +903,11 @@ def sql_maquinas(e: Esquema) -> str:
                      for n in SLOTS)
     algum = " OR ".join(f"m.[iot{n}_dispositivo_id] IS NOT NULL" for n in SLOTS)
     jornada = ", ".join(f"m.[{c}]" if c in e.jornada_cols else "NULL" for c in COLUNAS_JORNADA)
-    return (f"SELECT m.[id], m.[codigo], m.[nome], m.[micro_parada_s], m.[macro_parada_s], m.[situacao], "
+    # micro/macro em segundos com fração: as colunas em ms do portal (23/11/2026) valem mais que as antigas (s)
+    micro, macro = (("COALESCE(m.[micro_parada_ms] / 1000.0, m.[micro_parada_s])",
+                     "COALESCE(m.[macro_parada_ms] / 1000.0, m.[macro_parada_s])") if e.maquinas_ms
+                    else ("m.[micro_parada_s]", "m.[macro_parada_s]"))
+    return (f"SELECT m.[id], m.[codigo], m.[nome], {micro}, {macro}, m.[situacao], "
             f"m.[situacao_desde], m.[situacao_legenda_id], m.[ordem_producao_id], {sel}, {jornada}, "
             f"{', '.join(f'm.[iot{n}_dispositivo_id]' for n in SLOTS)} "
             f"FROM {e.t['maquinas']} m {joins} "
@@ -866,8 +919,8 @@ class Maquina:
     id: int
     codigo: str
     nome: str
-    micro: int | None
-    macro: int | None
+    micro: float | None             # segundos (com fração: 0.5 = 500 ms)
+    macro: float | None
     situacao: str | None
     situacao_desde: int | None
     situacao_legenda_id: int | None
@@ -902,7 +955,8 @@ def maquina_da_linha(linha) -> Maquina:
         return None if v is None else int(v)
 
     return Maquina(id=int(linha[0]), codigo=str(linha[1] or ""), nome=str(linha[2] or ""),
-                   micro=inteiro(linha[3]), macro=inteiro(linha[4]), situacao=linha[5],
+                   micro=None if linha[3] is None else float(linha[3]),
+                   macro=None if linha[4] is None else float(linha[4]), situacao=linha[5],
                    situacao_desde=epoch_de(linha[6]), situacao_legenda_id=inteiro(linha[7]),
                    ordem_producao_id=inteiro(linha[8]), canais=canais,
                    ids_dispositivo=_ids_da_linha(linha),
@@ -1550,8 +1604,8 @@ class ApontamentosOee:
 
     def _linha_maquina(self, m: Maquina) -> dict:
         return {"maquina_id": m.id, "codigo": m.codigo, "nome": m.nome,
-                "canais": ", ".join(f"{d}/{c}" for d, c in m.canais), "micro_s": int(m.micro or 0),
-                "macro_s": int(m.macro or 0), "legenda": "", "legenda_descricao": "",
+                "canais": ", ".join(f"{d}/{c}" for d, c in m.canais), "micro_s": float(m.micro or 0),
+                "macro_s": float(m.macro or 0), "legenda": "", "legenda_descricao": "",
                 "desde": iso_local(m.situacao_desde), "ultima_producao": None, "apontamentos_hoje": 0,
                 "ultima_leitura": None, "ciclo_medio": None,
                 "aviso": None if m.canais else "Sem canal IoT de produção com dispositivo ativo.",
@@ -1615,18 +1669,20 @@ class ApontamentosOee:
 
             # leituras: por dispositivo, só as colunas dos canais da máquina (a última linha, mesmo com valores
             # NULL, é a última notícia do aparelho: início do 97 quando ele não responde ao diagnóstico)
-            desde = ini - m.macro - MARGEM_LEITURAS
+            desde = int(ini - m.macro - MARGEM_LEITURAS)
             listas: list[list[int]] = []
             ultima_leitura: int | None = None
             # ciclo médio e ciclos (peças): 1º canal de produção da máquina com coluna na IOT001 (iot1, iot2, iot3)
             canal_ciclo = next(((d, c) for d, c in m.canais if c in e.canais_iot), None) \
                 if (e.apont_ciclo_medio or e.apont_ciclos) else None
             leituras_ciclo: list[tuple[int, Any]] = []
+            instantes: list[int] = []                # ts_unix das leituras (intervalo típico do aparelho)
             for device, canais in por_device.items():
                 cols = ", ".join(f"[{c}]" for c in canais)
                 cur.execute(f"SELECT [ts_unix], {cols} FROM {e.iot} WHERE [device_id] = CAST(? AS varchar(100)) "
                             "AND [ts_unix] >= ? AND [ts_unix] <= ? ORDER BY [ts_unix]", device, desde, agora)
                 leituras = cur.fetchall() or []
+                instantes.extend(int(l[0]) for l in leituras)
                 for i in range(len(canais)):
                     listas.append(producoes((l[0], l[1 + i]) for l in leituras))
                     if canal_ciclo == (device, canais[i]):
@@ -1644,7 +1700,10 @@ class ApontamentosOee:
             prods = [p for p in prods if p <= agora]
 
             # falta de linhas na IOT001 não gera 97 (regra revista em 13/11/2026): só o diagnóstico sem resposta
-            segs = segmentos_continuos(prods, ini, agora, m.micro, m.macro)
+            micro_ef, macro_ef = limites_efetivos(m.micro, m.macro, passo_das_leituras(instantes))
+            if micro_ef > m.micro:
+                linha["micro_efetiva_s"] = micro_ef     # a tela mostra que a micro cadastrada foi ajustada
+            segs = segmentos_continuos(prods, ini, agora, micro_ef, macro_ef)
             if mudo and legendas.sem_iot is not None:
                 segs = marcar_sem_resposta(segs, prods, ini, ultima_leitura)
             if legendas.fora_turno is not None and not jornada.vazia:
@@ -1652,7 +1711,9 @@ class ApontamentosOee:
             desejados = dividir_por_dia(segs, self._fuso)
             com_ciclo = e.apont_ciclo_medio
             origem = m.origem(e.canais_iot) if e.apont_origem else None
-            extras_sel = (["ciclo_medio"] if com_ciclo else []) + (["iot_dispositivo_id", "iot_canal"]
+            extras_sel = (["ciclo_medio"] if com_ciclo else []) + (["ciclo_medio_ms"] if com_ciclo and e.apont_ciclo_ms
+                                                                   else []) \
+                + (["iot_dispositivo_id", "iot_canal"]
                                                                    if e.apont_origem else []) \
                 + (["ciclos"] if e.apont_ciclos else [])
             cur.execute(f"SELECT [id], [legenda_id], [inicio], [fim], [observacao], [ordem_producao_id]"
@@ -1694,10 +1755,13 @@ class ApontamentosOee:
             if canal_ciclo is not None and e.apont_ciclo_medio:
                 antes = self._leituras_antes(cur, canal_ciclo[0], canal_ciclo[1], desde)
                 alts = alteracoes(antes + leituras_ciclo)
-                desejados = [replace(t, ciclo=ciclo_medio(alts, agora if t.fim is None else t.fim))
+                desejados = [replace(t, ciclo=ciclo_medio(alts, agora if t.fim is None else t.fim),
+                                     ciclo_ms=ciclo_medio_ms(alts, agora if t.fim is None else t.fim)
+                                     if e.apont_ciclo_ms else None)
                              for t in desejados]
             plano = planejar(desejados, existentes, ini, agora, legendas, m.ordem_producao_id, self._fuso,
-                             com_ciclo=com_ciclo, origem=origem, com_ciclos=e.apont_ciclos, cortes=set(cortes))
+                             com_ciclo=com_ciclo, origem=origem, com_ciclos=e.apont_ciclos, cortes=set(cortes),
+                             com_ciclo_ms=com_ciclo and e.apont_ciclo_ms)
             contagem, avisos = self._aplicar(cur, m, plano, todas, agora)
             if e.apont_ciclos:
                 self._ops_para_avisar = sorted(plano.ops_afetadas())   # quantidade real das OPs (portal)
@@ -1706,7 +1770,8 @@ class ApontamentosOee:
             # situação da máquina pelo apontamento mais recente (SituacaoMaquina do portal)
             L = e.t["legendas"]
             cur.execute(f"SELECT TOP 1 a.[inicio], a.[legenda_id], a.[ordem_producao_id], l.[tipo]"
-                        f"{', a.[ciclo_medio]' if com_ciclo else ''} FROM {A} a "
+                        f"{', a.[ciclo_medio]' if com_ciclo else ''}"
+                        f"{', a.[ciclo_medio_ms]' if com_ciclo and e.apont_ciclo_ms else ''} FROM {A} a "
                         f"LEFT JOIN {L} l ON l.[id] = a.[legenda_id] WHERE a.[maquina_id] = ? "
                         "ORDER BY a.[inicio] DESC, a.[id] DESC", m.id)
             r = cur.fetchone()
@@ -1732,6 +1797,8 @@ class ApontamentosOee:
                 linha["legenda_descricao"] = leg.descricao if leg else ""
                 linha["desde"] = iso_local(epoch_de(r[0]))
                 linha["ciclo_medio"] = None if not com_ciclo or r[4] is None else int(r[4])
+                if com_ciclo and e.apont_ciclo_ms and r[5] is not None:
+                    linha["ciclo_medio"] = int(r[5]) / 1000     # segundos com fração (ms)
             else:
                 plano_ops = set()
             for op in sorted(plano.ops_afetadas() | plano_ops):
@@ -1840,8 +1907,9 @@ class ApontamentosOee:
                          if e.apont_atualizado_por else "[atualizado_em] = ?")
         for x in plano.atualizar:
             # manuais aparados e os fechados antes da janela não recebem ciclo_medio nem origem
-            extras = [c for c in ("ciclo_medio", "iot_dispositivo_id", "iot_canal", "ciclos")
+            extras = [c for c in ("ciclo_medio", "ciclo_medio_ms", "iot_dispositivo_id", "iot_canal", "ciclos")
                       if c in x and (com_ciclo if c == "ciclo_medio" else e.apont_ciclos if c == "ciclos"
+                                     else com_ciclo and e.apont_ciclo_ms if c == "ciclo_medio_ms"
                                      else com_origem)]
             if "ciclos" in extras and (x.get("antes") or {}).get("ciclos") != x["ciclos"]:
                 self._para_producao.append(int(x["id"]))  # ciclos novos: o portal refaz as peças
@@ -1857,8 +1925,9 @@ class ApontamentosOee:
                               f"máquina {self._nome(m)} aparado pelo IoT (agora termina às "
                               f"{self._hora(x['fim'])}).")
         for x in plano.inserir:
-            extras = (["ciclo_medio"] if com_ciclo else []) + (["iot_dispositivo_id", "iot_canal"] if com_origem
-                                                               else []) + (["ciclos"] if e.apont_ciclos else [])
+            extras = (["ciclo_medio"] if com_ciclo else []) \
+                + (["ciclo_medio_ms"] if com_ciclo and e.apont_ciclo_ms else []) \
+                + (["iot_dispositivo_id", "iot_canal"] if com_origem else []) + (["ciclos"] if e.apont_ciclos else [])
             colunas = "[maquina_id], [legenda_id], [ordem_producao_id], [inicio], [fim], [observacao], " \
                       f"{''.join(f'[{c}], ' for c in extras)}[criado_em], [atualizado_em]"
             valores = [m.id, x["legenda_id"], x["ordem_producao_id"], utc_sql(x["inicio"]),

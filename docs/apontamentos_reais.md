@@ -258,3 +258,18 @@ local** (primeira execução) até agora. Leituras lidas a partir de `início_da
   Apontamentos hoje e Última mensagem.
 - Permissões: `sql/permissoes_oee.sql` (SELECT em maquinas, dispositivos_iot, legendas, ordens_producao;
   SELECT/INSERT/UPDATE/DELETE em apontamentos_estado; UPDATE em maquinas e ordens_producao) e SELECT na IOT001.
+
+## Milissegundos (decidido com o usuário em 23/11/2026)
+
+Máquinas que fazem mais de uma peça por segundo.
+
+- **Micro/macro parada** em segundos com fração: o portal grava `maquinas.micro_parada_ms` e `macro_parada_ms`
+  (0,5 s = 500); quando existem, valem mais que as colunas antigas em segundos (`COALESCE(ms / 1000.0, s)`).
+- **Limite visível**: o `ts_unix` é de segundos e o aparelho manda uma leitura a cada ~10 s. Uma parada menor que o
+  intervalo entre leituras não aparece nos dados. Por isso a micro usada é no mínimo **1,5 × o intervalo típico das
+  leituras** do aparelho (mediana dos intervalos na janela; `limites_efetivos`), e a macro fica pelo menos 1 s acima
+  dela. Sem isso, com micro de 0,5 s, toda produção viraria microparada. A aba mostra "(usa 15)" ao lado da micro
+  cadastrada quando ela é ajustada.
+- **Ciclo médio em ms**: com a coluna `apontamentos_estado.ciclo_medio_ms`, o integrador grava também o ciclo em
+  milissegundos (ex.: 250 pulsos em 10 s = 40 ms por peça). O `ciclo_medio` antigo (s inteiros, 0–999) continua
+  gravado. O portal usa o de ms para mostrar "0,040 s" e calcular as peças por minuto.

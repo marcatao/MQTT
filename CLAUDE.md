@@ -491,6 +491,13 @@ Especificação completa em `docs/apontamentos_reais.md` (fonte da verdade; cód
   Apontamento manual que começa dentro de uma parada do IoT é **ponto de corte** e é mantido com a legenda dele (antes o
   IoT apagava todo manual da janela). Em produção o IoT prevalece. O Recalcular continua apagando os manuais.
 
+### Milissegundos (decidido com o usuário em 23/11/2026)
+
+- Micro/macro parada do portal em ms (`maquinas.micro_parada_ms|macro_parada_ms`, valem mais que as colunas em s) e
+  ciclo médio também em ms (`apontamentos_estado.ciclo_medio_ms`, além do `ciclo_medio` em s). Como o `ts_unix` é
+  de segundos e as leituras vêm a cada ~10 s, a micro usada é no mínimo 1,5 × o intervalo típico das leituras
+  (`limites_efetivos`). Detalhes em `docs/apontamentos_reais.md`.
+
 ## Pendências conhecidas
 
 - Índice único `(device_id, ts_unix)` na IOT001 (opcional, decidir com o usuário).

@@ -144,6 +144,21 @@ def _inteiro(valor: Any) -> int | None:
             return None
 
 
+def _numero(valor: Any) -> float | None:
+    try:
+        return float(valor)
+    except (TypeError, ValueError):
+        return None
+
+
+def segundos_texto(valor: float | None) -> str:
+    """Segundos com até 3 casas, vírgula decimal: 60 → "60", 0.5 → "0,5", 0.04 → "0,04"."""
+    if valor is None:
+        return SEM_VALOR
+    texto = f"{valor:.3f}".rstrip("0").rstrip(".")
+    return texto.replace(".", ",")
+
+
 def ler_iso(texto: Any) -> datetime | None:
     """ISO 8601 local ("AAAA-MM-DDTHH:MM:SS") → datetime; vazio ou inválido → None."""
     t = _texto(texto)
@@ -197,8 +212,8 @@ class Maquina:
     codigo: str
     nome: str
     canais: str
-    micro_s: int | None
-    macro_s: int | None
+    micro_s: float | None       # segundos, com fração (0.5 = 500 ms)
+    macro_s: float | None
     legenda: str
     legenda_descricao: str
     desde: str
@@ -209,6 +224,7 @@ class Maquina:
     diag: str = ""      # "ok" | "sem resposta" | "sem MQTT" | "" (null)
     turno: str = ""     # "dentro" | "fora" | "sem jornada" | ""
     jornada: str = ""   # "Seg–Sex 05:00–14:48" | ""
+    micro_efetiva_s: float | None = None   # micro usada (cadastrada abaixo do intervalo de leitura do aparelho)
 
     @property
     def nome_exibido(self) -> str:
@@ -227,9 +243,10 @@ class Maquina:
     def texto_limites(self) -> str:
         if self.micro_s is None and self.macro_s is None:
             return SEM_VALOR
-        micro = SEM_VALOR if self.micro_s is None else str(self.micro_s)
-        macro = SEM_VALOR if self.macro_s is None else str(self.macro_s)
-        return f"{micro} / {macro}"
+        texto = f"{segundos_texto(self.micro_s)} / {segundos_texto(self.macro_s)}"
+        if self.micro_efetiva_s is not None:
+            texto += f" (usa {segundos_texto(self.micro_efetiva_s)})"
+        return texto
 
 
 @dataclass
@@ -251,8 +268,9 @@ def _maquina(d: dict) -> Maquina:
         codigo=_texto(d.get("codigo")),
         nome=_texto(d.get("nome")),
         canais=_texto(d.get("canais")),
-        micro_s=_inteiro(d.get("micro_s")),
-        macro_s=_inteiro(d.get("macro_s")),
+        micro_s=_numero(d.get("micro_s")),
+        macro_s=_numero(d.get("macro_s")),
+        micro_efetiva_s=_numero(d.get("micro_efetiva_s")),
         legenda=_texto(d.get("legenda")),
         legenda_descricao=_texto(d.get("legenda_descricao")),
         desde=_texto(d.get("desde")),
@@ -522,8 +540,12 @@ class ModeloApontamentos(QAbstractTableModel):
         elif col == COL_DIAG and m.diag:
             partes.append(DICAS_DIAG.get(m.diag, m.diag))
         elif col == COL_LIMITES:
-            partes.append(f"Microparada a partir de {m.micro_s if m.micro_s is not None else SEM_VALOR} s; "
-                          f"macro parada a partir de {m.macro_s if m.macro_s is not None else SEM_VALOR} s.")
+            partes.append(f"Microparada a partir de {segundos_texto(m.micro_s)} s; "
+                          f"macro parada a partir de {segundos_texto(m.macro_s)} s.")
+            if m.micro_efetiva_s is not None:
+                partes.append(f"O aparelho manda leitura a cada ~{segundos_texto(m.micro_efetiva_s / 1.5)} s: uma "
+                              f"parada menor que {segundos_texto(m.micro_efetiva_s)} s não é visível, então a "
+                              "microparada usada é essa.")
         elif col == COL_CANAIS and m.canais:
             partes.append(m.canais)
         if m.aviso:

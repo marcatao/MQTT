@@ -1949,3 +1949,48 @@ def test_manual_em_cima_de_producao_continua_coberto_pelo_iot():
     obj._avisar_portal = lambda *a: None
     obj.executar_ciclo()
     assert manual not in b.dados["apont"]                                              # IoT diz que produziu
+
+
+# ---------------------------------------------------------------------- milissegundos (23/11/2026)
+from datetime import timezone  # noqa: E402
+
+from app.core.apontamentos_oee import (ciclo_medio_ms, limites_efetivos, passo_das_leituras,  # noqa: E402
+                                       segmentos_continuos)
+
+
+def test_ciclo_medio_ms_mais_de_uma_peca_por_segundo():
+    # 250 pulsos a cada 10 s = 40 ms por peça; a coluna antiga (s inteiros) fica 0
+    alts = alteracoes([(1000 + 10 * i, 250 * i) for i in range(12)])
+    assert ciclo_medio_ms(alts, 1110) == 40
+    assert ciclo_medio(alts, 1110) == 0
+    # 1 pulso a cada 32 s continua igual nas duas
+    alts = alteracoes([(1000 + 32 * i, i) for i in range(5)])
+    assert (ciclo_medio_ms(alts, 2000), ciclo_medio(alts, 2000)) == (32000, 32)
+    assert ciclo_medio_ms(alteracoes([(1, 1)]), 10) is None
+
+
+def test_passo_das_leituras_e_a_mediana_dos_intervalos():
+    assert passo_das_leituras([0, 10, 20, 31, 40, 50]) == 10
+    assert passo_das_leituras([5]) == 10.0                       # poucas leituras: padrão
+    assert passo_das_leituras([0, 1, 2, 3], padrao=7) == 1
+
+
+def test_limites_efetivos_micro_abaixo_do_intervalo_das_leituras():
+    assert limites_efetivos(0.5, 2.0, 10) == (15.0, 16.0)        # 0,5 s com leitura a cada 10 s
+    assert limites_efetivos(60, 300, 10) == (60.0, 300.0)        # cadastro acima do intervalo: sem mudança
+    assert limites_efetivos(0.5, 2.0, 0.2) == (0.5, 2.0)         # leituras mais rápidas que a micro
+
+
+def test_maquina_rapida_produzindo_a_cada_leitura_nao_vira_microparada():
+    prods = [1000 + 10 * i for i in range(30)]                  # contador subiu em toda leitura (10 s)
+    micro, macro = limites_efetivos(0.5, 2.0, passo_das_leituras(prods))
+    assert segmentos_continuos(prods, 1000, 1290, micro, macro) == [(1000, 1290, PRODUZINDO)]
+    # sem o ajuste, tudo seria parada (o problema que ele evita)
+    assert all(e != PRODUZINDO for a, b, e in segmentos_continuos(prods, 1010, 1290, 0.5, 2.0) if b > a)
+
+
+def test_planejar_leva_ciclo_medio_ms_quando_a_coluna_existe():
+    leg = LegendasIot(1, 2, 3)
+    plano = ap.planejar([ap.Trecho(100, None, PRODUZINDO, ciclo=0, ciclo_ms=40)], [], 100, 200, leg, None,
+                        timezone.utc, com_ciclo=True, com_ciclo_ms=True)
+    assert plano.inserir[0]["ciclo_medio"] == 0 and plano.inserir[0]["ciclo_medio_ms"] == 40
