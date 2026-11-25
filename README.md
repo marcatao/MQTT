@@ -114,6 +114,7 @@ pronto para baixar. O número vem da contagem de builds do GitHub, por isso algu
 
 | Versão | Data | Principais melhorias |
 | --- | --- | --- |
+| **v0.1.33** | 25/11/2026 | **Até 3 turnos por dia**: o integrador lê os turnos do cadastro da máquina no portal e o intervalo entre turnos (ex.: almoço entre o turno 1 e o 2) vira **96 Fora de turno**, sem contar como parada. Sem turnos no cadastro, vale a jornada antiga. |
 | **v0.1.32** | 23/11/2026 | Quando o IoT corrige um trecho (ex.: **97 Sem resposta** depois que o aparelho voltou) e o apontamento antigo tinha aberto **SS automática**, o integrador pede ao portal para excluí-lo com a SS junto (antes ele ficava no meio da produção). Também encerra um apontamento em aberto que não é o último. |
 | **v0.1.31** | 23/11/2026 | **Só um apontamento em aberto por máquina**: se ficar um apontamento antigo em aberto (manual do portal/app ou do IoT), o integrador o encerra 1 s antes do seguinte a cada ciclo e avisa no log. |
 | **v0.1.30** | 23/11/2026 | Ao abrir (e ao clicar em Iniciar na aba Mosquitto), se já houver um **Mosquitto aberto** ele é **fechado antes** e só então o integrador inicia o dele — assim a porta 1883 fica livre. O console avisa qual foi fechado. |
