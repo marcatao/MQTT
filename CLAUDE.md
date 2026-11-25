@@ -510,6 +510,12 @@ Especificação completa em `docs/apontamentos_reais.md` (fonte da verdade; cód
   (FK: abriu SS/OS automática): vai no campo `excluir` do aviso ao portal, que exclui com o chamado junto (SS pendente e
   OS sem atendimento canceladas). Enquanto isso, ele não conta como "seguinte" ao fechar os abertos.
 
+### Até 3 turnos por dia (decidido com o usuário em 25/11/2026)
+
+- O portal grava `maquinas.turnos_semana` (JSON `{"1": {"1": ["06:00","14:00"], "2": [...], "3": [...]}}`; opcional,
+  detectado pelas colunas). O integrador lê (`turnos_de`, `Jornada.turnos_do_dia`) e `intervalos_turno` devolve cada
+  turno: o intervalo entre turnos é fora de turno (96). Sem a coluna/valor, vale a jornada antiga (`horarios_semana`).
+
 ### Milissegundos (decidido com o usuário em 23/11/2026)
 
 - Micro/macro parada do portal em ms (`maquinas.micro_parada_ms|macro_parada_ms`, valem mais que as colunas em s) e

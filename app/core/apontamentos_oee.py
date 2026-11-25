@@ -383,6 +383,14 @@ class Jornada:
     dias_semana: str = ""                       # dias de trabalho (padrão: os dias com horário; senão "12345")
     padrao: tuple[str, str] | None = None       # horário de dia útil por exceção sem horário próprio
     excecoes: dict[date, bool] = field(default_factory=dict)   # data → útil? (só com calendário)
+    turnos: dict[int, list[tuple[str, str]]] = field(default_factory=dict)  # dia ISO → turnos (até 3), se houver
+
+    def turnos_do_dia(self, dia: date) -> list[tuple[str, str]]:
+        """Turnos do dia (``turnos_semana`` do portal); sem eles, o horário do dia (1 turno). Vazio = sem horário."""
+        if self.turnos:
+            return self.turnos.get(dia.isoweekday(), [])
+        h = self.horario(dia)
+        return [h] if h is not None else []
 
     @property
     def vazia(self) -> bool:
@@ -398,13 +406,42 @@ class Jornada:
         return self.horarios.get(dia.isoweekday()) or self.padrao or next(iter(self.horarios.values()), None)
 
 
+def turnos_de(turnos_semana: Any) -> dict[int, list[tuple[str, str]]]:
+    """``JornadaSemanal::turnos`` do portal: JSON ``{"1": {"1": ["06:00","14:00"], "2": [...]}, …}`` (ou listas) →
+    dia ISO → turnos em ordem (até 3). Inválido ou vazio: {} (vale a jornada antiga)."""
+    if not isinstance(turnos_semana, str) or not turnos_semana.strip():
+        return {}
+    try:
+        lido = json.loads(turnos_semana)
+    except ValueError:
+        return {}
+    if not isinstance(lido, dict):
+        return {}
+    saida: dict[int, list[tuple[str, str]]] = {}
+    for dia, turnos in lido.items():
+        try:
+            n = int(dia)
+        except (TypeError, ValueError):
+            continue
+        itens = sorted(turnos.items(), key=lambda kv: int(kv[0])) if isinstance(turnos, dict) else list(enumerate(turnos or [], 1))
+        lista = []
+        for _num, t in itens:
+            if isinstance(t, (list, tuple)) and len(t) >= 2:
+                a, b = _hora_valida(t[0]), _hora_valida(t[1])
+                if a and b and a != b:
+                    lista.append((a, b))
+        if n in DIAS_CURTOS and lista:
+            saida[n] = lista[:3]
+    return dict(sorted(saida.items()))
+
+
 def montar_jornada(horarios_semana: Any, dias_semana: Any, jornada_inicio: Any, jornada_fim: Any,
-                   excecoes: dict[date, bool] | None = None) -> Jornada:
+                   excecoes: dict[date, bool] | None = None, turnos_semana: Any = None) -> Jornada:
     horarios = jornada_de(horarios_semana, dias_semana, jornada_inicio, jornada_fim)
     ini, fim = _hora_valida(jornada_inicio), _hora_valida(jornada_fim)
     padrao = (ini, fim) if ini and fim and ini != fim else None
     dias = "".join(c for c in str(dias_semana or "") if c.isdigit())
-    return Jornada(horarios, dias, padrao, dict(excecoes or {}))
+    return Jornada(horarios, dias, padrao, dict(excecoes or {}), turnos_de(turnos_semana))
 
 
 def _instante(dia: date, hhmm: str, fuso: tzinfo) -> int:
@@ -423,10 +460,14 @@ def intervalos_turno(jornada: Jornada, ini: int, agora: int, fuso: tzinfo) -> li
     dia = dia_local(ini, fuso) - timedelta(days=1)       # turno de ontem que vira o dia
     ultimo = dia_local(agora, fuso)
     while dia <= ultimo:
-        h = jornada.horario(dia) if jornada.trabalha(dia) else None
-        if h is not None:
+        # até 3 turnos por dia (portal, 25/11/2026): o intervalo entre turnos fica fora de turno (96)
+        primeiro: int | None = None
+        for h in (jornada.turnos_do_dia(dia) if jornada.trabalha(dia) else []):
             a = _instante(dia, h[0], fuso)
             b = _instante(dia + timedelta(days=1) if h[1] <= h[0] else dia, h[1], fuso)
+            if primeiro is not None and a < primeiro:      # turno que começa depois da meia-noite (ex.: T3 às 00:30)
+                a, b = a + 86400, b + 86400
+            primeiro = a if primeiro is None else primeiro
             if b > ini and a <= agora:
                 saida.append((a, b))
         dia += timedelta(days=1)
@@ -820,7 +861,8 @@ def sql_permissoes_oee(banco: str) -> str:
     return f"EXEC [{sql_conexao.validar_banco(banco)}].sys.sp_executesql N'SELECT {itens}'"
 
 
-COLUNAS_JORNADA = ("calendario_id", "horarios_semana", "dias_semana", "jornada_inicio", "jornada_fim")
+COLUNAS_JORNADA = ("calendario_id", "horarios_semana", "dias_semana", "jornada_inicio", "jornada_fim",
+                   "turnos_semana")   # turnos_semana: até 3 turnos por dia (portal, 25/11/2026); opcional
 SQL_PERM_IOT = ("EXEC {banco}.sys.sp_executesql N'SELECT HAS_PERMS_BY_NAME(@obj, N''OBJECT'', N''SELECT'')', "
                 "N'@obj nvarchar(400)', @obj = ?")
 
@@ -931,6 +973,7 @@ class Maquina:
     dias_semana: str | None = None
     jornada_inicio: str | None = None
     jornada_fim: str | None = None
+    turnos_semana: str | None = None   # JSON {"1": {"1": ["06:00","14:00"], "2": [...]}, …} (portal, 25/11/2026)
     ids_dispositivo: dict[str, int] = field(default_factory=dict)   # código do device → dispositivos_iot.id
 
     def origem(self, canais_iot: set[str]) -> tuple[int | None, str] | None:
@@ -960,8 +1003,7 @@ def maquina_da_linha(linha) -> Maquina:
                    situacao_desde=epoch_de(linha[6]), situacao_legenda_id=inteiro(linha[7]),
                    ordem_producao_id=inteiro(linha[8]), canais=canais,
                    ids_dispositivo=_ids_da_linha(linha),
-                   **dict(zip(("calendario_id", "horarios_semana", "dias_semana", "jornada_inicio", "jornada_fim"),
-                              _jornada_da_linha(linha))))
+                   **dict(zip(COLUNAS_JORNADA, _jornada_da_linha(linha))))
 
 
 def _ids_da_linha(linha) -> dict[str, int]:
@@ -1279,7 +1321,8 @@ class ApontamentosOee:
 
     def _jornada(self, m: Maquina, excecoes: dict[int, dict[date, bool]]) -> Jornada:
         return montar_jornada(m.horarios_semana, m.dias_semana, m.jornada_inicio, m.jornada_fim,
-                              excecoes.get(m.calendario_id, {}) if m.calendario_id is not None else {})
+                              excecoes.get(m.calendario_id, {}) if m.calendario_id is not None else {},
+                              m.turnos_semana)
 
     def _ler_excecoes(self, maquinas: list[Maquina], agora: int) -> dict[int, dict[date, bool]]:
         """Exceções de ``calendario_dias`` dos calendários das máquinas, de ``dias_correcao`` + 2 dias atrás até
@@ -1618,7 +1661,8 @@ class ApontamentosOee:
 
     def _turno_sem_calendario(self, m: Maquina) -> dict:
         """diag/turno/jornada iniciais da linha (só pelos dias da semana); o ciclo refaz com o calendário."""
-        jornada = montar_jornada(m.horarios_semana, m.dias_semana, m.jornada_inicio, m.jornada_fim)
+        jornada = montar_jornada(m.horarios_semana, m.dias_semana, m.jornada_inicio, m.jornada_fim,
+                                 turnos_semana=m.turnos_semana)
         agora = int(self._relogio())
         if jornada.vazia:
             return {"diag": None, "turno": "sem jornada", "jornada": None}

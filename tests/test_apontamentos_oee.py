@@ -503,7 +503,8 @@ class BancoFalso:
                 for dev, canal, tipo in m["slots"]:
                     disp = d["dispositivos"].get(dev)
                     linha += [canal, tipo, disp[0] if disp else None, disp[1] if disp else None]
-                linha += list(m["jornada"]) if self.jornada else [None] * 5
+                jornada = list(m["jornada"]) if self.jornada else [None] * 5
+                linha += jornada + [m.get("turnos")] if self.jornada else jornada + [None]   # + turnos_semana
                 linha += [dev for dev, _c, _t in m["slots"]]          # iot1..3_dispositivo_id
                 linhas.append(tuple(linha))
             return linhas
@@ -2064,3 +2065,20 @@ def test_notificador_manda_o_campo_excluir_e_loga_o_que_o_portal_excluiu():
     n.avisar([], None, None, [7])
     assert enviados == [{"apontamentos": [], "excluir": [7]}]
     assert any("excluiu o apontamento 7" in m and "SS 000046 cancelada" in m for _n, m in logs)
+
+
+# ---------------------------------------------------------------------- até 3 turnos por dia (25/11/2026)
+def test_turnos_do_portal_deixam_o_intervalo_entre_turnos_fora_de_turno():
+    from app.core.apontamentos_oee import intervalos_turno, montar_jornada, turnos_de
+    turnos = '{"1":{"1":["06:00","12:00"],"2":["13:00","18:00"],"3":["22:00","05:00"]}}'
+    assert turnos_de(turnos) == {1: [("06:00", "12:00"), ("13:00", "18:00"), ("22:00", "05:00")]}
+    jornada = montar_jornada('{"1":["06:00","04:59"]}', "1", "06:00", "04:59", turnos_semana=turnos)
+    # segunda 16/11/2026: 3 intervalos (o 3º vira o dia); 12:00–13:00 e 18:00–22:00 ficam fora
+    seg = T(0, dia=16)
+    dentro = intervalos_turno(jornada, seg, seg + 86400 - 1, FUSO)
+    assert [(datetime.fromtimestamp(a, FUSO).strftime("%d %H:%M"), datetime.fromtimestamp(b, FUSO).strftime("%d %H:%M"))
+            for a, b in dentro] == [("16 06:00", "16 12:00"), ("16 13:00", "16 18:00"), ("16 22:00", "17 05:00")]
+    # sem turnos_semana: vale a jornada antiga (1 turno)
+    antiga = montar_jornada('{"1":["06:00","14:00"]}', "1", "06:00", "14:00")
+    assert len(intervalos_turno(antiga, seg, seg + 86400 - 1, FUSO)) == 1
+    assert turnos_de("") == {} and turnos_de("xx") == {}
